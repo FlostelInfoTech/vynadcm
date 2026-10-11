@@ -1,0 +1,990 @@
+//! DICOMweb server core: framework-agnostic dispatch + in-memory store.
+//!
+//! [`dispatch`] routes an [`HttpRequest`] to an [`HttpResponse`] against any
+//! [`DicomWebStore`]. The `server` feature adds a hyper HTTP/1.1 front end
+//! ([`crate::hyper_server`]); embedders can also adapt `dispatch` to their
+//! own HTTP stack (as VynaLink does).
+
+use std::collections::HashMap;
+use std::sync::Mutex;
+use vyna_dcm_codec::{FileMeta, dataset_to_json, decode_pixels, read_part10, write_part10};
+use vyna_dcm_core::{DataSet, Tag, TransferSyntax, Value, Vr, lookup_keyword, tags};
+
+use crate::multipart::{
+    Part, decode_multipart, encode_multipart, new_boundary, parse_content_type,
+};
+
+/// Tags treated as bulk data (stripped from QIDO, `BulkDataURI` in metadata).
+pub const BULK_TAGS: [Tag; 5] = [
+    tags::PIXEL_DATA,
+    tags::FLOAT_PIXEL_DATA,
+    tags::DOUBLE_FLOAT_PIXEL_DATA,
+    tags::WAVEFORM_DATA,
+    tags::ENCAPSULATED_DOCUMENT,
+];
+
+/// Framework-agnostic HTTP request.
+#[derive(Clone, Debug)]
+pub struct HttpRequest {
+    /// Uppercase method (`GET`, `POST`, ...).
+    pub method: String,
+    /// Path without query (`/studies/...`).
+    pub path: String,
+    /// Raw query string (no leading `?`).
+    pub query: String,
+    /// Headers with lowercased names.
+    pub headers: HashMap<String, String>,
+    /// Body bytes.
+    pub body: Vec<u8>,
+}
+
+/// Framework-agnostic HTTP response.
+#[derive(Clone, Debug)]
+pub struct HttpResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Response headers.
+    pub headers: Vec<(String, String)>,
+    /// Body bytes.
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// JSON response.
+    #[must_use]
+    pub fn json(status: u16, value: &serde_json::Value) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type".into(), "application/dicom+json".into())],
+            body: serde_json::to_vec(value).unwrap_or_default(),
+        }
+    }
+
+    /// Plain-text response.
+    #[must_use]
+    pub fn text(status: u16, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type".into(), "text/plain".into())],
+            body: message.into().into_bytes(),
+        }
+    }
+
+    /// `multipart/related` response.
+    #[must_use]
+    pub fn multipart(parts: &[Part], root_type: &str) -> Self {
+        let (content_type, body) = encode_multipart(parts, &new_boundary(), root_type);
+        Self {
+            status: 200,
+            headers: vec![("content-type".into(), content_type)],
+            body,
+        }
+    }
+
+    /// Raw-bytes response.
+    #[must_use]
+    pub fn bytes(status: u16, content_type: impl Into<String>, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers: vec![("content-type".into(), content_type.into())],
+            body,
+        }
+    }
+}
+
+/// QIDO search scope resolved from the request path.
+#[derive(Clone, Debug)]
+pub struct QidoScope {
+    /// Response level: `STUDY`, `SERIES` or `IMAGE`.
+    pub level: &'static str,
+    /// Study filter from the path, when nested.
+    pub study: Option<String>,
+    /// Series filter from the path, when nested.
+    pub series: Option<String>,
+}
+
+/// Extracted bulk blob awaiting a `BulkDataURI` id.
+#[derive(Clone, Debug)]
+pub struct BulkBlob {
+    /// Source tag.
+    pub tag: Tag,
+    /// Source VR.
+    pub vr: Vr,
+    /// Blob bytes.
+    pub bytes: Vec<u8>,
+    /// Blob content type.
+    pub content_type: String,
+}
+
+/// Stored instance ids.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredIds {
+    /// Study Instance UID.
+    pub study: String,
+    /// Series Instance UID.
+    pub series: String,
+    /// SOP Instance UID.
+    pub instance: String,
+}
+
+/// DICOMweb storage backend.
+pub trait DicomWebStore: Send + Sync {
+    /// QIDO search with `(tag, match_value)` filters; empty match values
+    /// are return keys. Applies limit/offset.
+    fn search(
+        &self,
+        scope: &QidoScope,
+        filters: &[(Tag, String)],
+        limit: usize,
+        offset: usize,
+    ) -> Vec<DataSet>;
+
+    /// Full Part-10 bytes of an instance.
+    fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Vec<u8>>;
+
+    /// Metadata dataset (bulk elements removed) plus extracted blobs.
+    fn instance_metadata(
+        &self,
+        study: &str,
+        series: &str,
+        instance: &str,
+    ) -> Option<(DataSet, Vec<BulkBlob>)>;
+
+    /// Raw native-order frame bytes for 1-based frame numbers.
+    fn instance_frames(
+        &self,
+        study: &str,
+        series: &str,
+        instance: &str,
+        frames: &[u32],
+    ) -> Option<Vec<Vec<u8>>>;
+
+    /// Store one Part-10 file; `study_hint` (STOW URL) must match the file.
+    fn store_instance(
+        &self,
+        file: &[u8],
+        study_hint: Option<&str>,
+    ) -> std::result::Result<StoredIds, String>;
+
+    /// Register blobs, returning one id per blob for `BulkDataURI`s.
+    fn put_bulk(&self, blobs: Vec<(Vec<u8>, String)>) -> Vec<String>;
+
+    /// Resolve a bulk id to `(bytes, content_type)`.
+    fn bulk_data(&self, id: &str) -> Option<(Vec<u8>, String)>;
+}
+
+/// Thread-safe in-memory [`DicomWebStore`] (tests, tools, small archives).
+#[derive(Debug, Default)]
+pub struct MemoryStore {
+    inner: Mutex<MemoryInner>,
+}
+
+#[derive(Debug, Default)]
+struct MemoryInner {
+    instances: Vec<StoredInstance>,
+    bulk: HashMap<String, (Vec<u8>, String)>,
+    bulk_seq: u64,
+}
+
+#[derive(Clone, Debug)]
+struct StoredInstance {
+    study: String,
+    series: String,
+    instance: String,
+    file: Vec<u8>,
+    dataset: DataSet,
+    transfer_syntax: TransferSyntax,
+}
+
+impl MemoryStore {
+    /// Empty store.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Number of stored instances.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.inner.lock().unwrap().instances.len()
+    }
+
+    /// True when empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl DicomWebStore for MemoryStore {
+    fn search(
+        &self,
+        scope: &QidoScope,
+        filters: &[(Tag, String)],
+        limit: usize,
+        offset: usize,
+    ) -> Vec<DataSet> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let inner = self.inner.lock().unwrap();
+        let mut out = Vec::new();
+        // Study-level responses de-duplicate by Study Instance UID.
+        let mut seen_studies = std::collections::HashSet::new();
+        let mut seen_series = std::collections::HashSet::new();
+        for inst in inner.instances.iter().skip(offset) {
+            if let Some(s) = &scope.study
+                && inst.study != *s
+            {
+                continue;
+            }
+            if let Some(s) = &scope.series
+                && inst.series != *s
+            {
+                continue;
+            }
+            if scope.level == "STUDY" && !seen_studies.insert(inst.study.clone()) {
+                continue;
+            }
+            if scope.level == "SERIES"
+                && !seen_series.insert((inst.study.clone(), inst.series.clone()))
+            {
+                continue;
+            }
+            if !filters
+                .iter()
+                .all(|(t, m)| match_attribute(&inst.dataset, *t, m))
+            {
+                continue;
+            }
+            let mut ds = inst.dataset.clone();
+            strip_bulk(&mut ds);
+            out.push(ds);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
+    fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Vec<u8>> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .instances
+            .iter()
+            .find(|i| i.study == study && i.series == series && i.instance == instance)
+            .map(|i| i.file.clone())
+    }
+
+    fn instance_metadata(
+        &self,
+        study: &str,
+        series: &str,
+        instance: &str,
+    ) -> Option<(DataSet, Vec<BulkBlob>)> {
+        let inner = self.inner.lock().unwrap();
+        let inst = inner
+            .instances
+            .iter()
+            .find(|i| i.study == study && i.series == series && i.instance == instance)?;
+        let mut ds = inst.dataset.clone();
+        let blobs = extract_bulk(&mut ds);
+        Some((ds, blobs))
+    }
+
+    fn instance_frames(
+        &self,
+        study: &str,
+        series: &str,
+        instance: &str,
+        frames: &[u32],
+    ) -> Option<Vec<Vec<u8>>> {
+        let inner = self.inner.lock().unwrap();
+        let inst = inner
+            .instances
+            .iter()
+            .find(|i| i.study == study && i.series == series && i.instance == instance)?;
+        let pixels = decode_pixels(&inst.dataset, inst.transfer_syntax).ok()?;
+        let count: usize = inst
+            .dataset
+            .string(tags::NUMBER_OF_FRAMES)
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
+        if pixels.len() % count.max(1) != 0 {
+            return None;
+        }
+        let frame_len = pixels.len() / count.max(1);
+        let mut out = Vec::with_capacity(frames.len());
+        for f in frames {
+            if *f == 0 || *f as usize > count {
+                return None;
+            }
+            let start = (*f as usize - 1) * frame_len;
+            out.push(pixels[start..start + frame_len].to_vec());
+        }
+        Some(out)
+    }
+
+    fn store_instance(
+        &self,
+        file: &[u8],
+        study_hint: Option<&str>,
+    ) -> std::result::Result<StoredIds, String> {
+        let (meta, dataset) = read_part10(file).map_err(|e| e.to_string())?;
+        let study = dataset
+            .string(tags::STUDY_INSTANCE_UID)
+            .ok_or("missing Study Instance UID")?
+            .to_string();
+        let series = dataset
+            .string(tags::SERIES_INSTANCE_UID)
+            .ok_or("missing Series Instance UID")?
+            .to_string();
+        let instance = dataset
+            .string(tags::SOP_INSTANCE_UID)
+            .ok_or("missing SOP Instance UID")?
+            .to_string();
+        if let Some(hint) = study_hint
+            && hint != study
+        {
+            return Err(format!(
+                "STOW study {hint} does not match file study {study}"
+            ));
+        }
+        let ts = meta.transfer_syntax().map_err(|e| e.to_string())?;
+        let mut inner = self.inner.lock().unwrap();
+        // Replace on re-store (same SOP Instance UID).
+        inner.instances.retain(|i| i.instance != instance);
+        inner.instances.push(StoredInstance {
+            study: study.clone(),
+            series: series.clone(),
+            instance: instance.clone(),
+            file: file.to_vec(),
+            dataset,
+            transfer_syntax: ts,
+        });
+        Ok(StoredIds {
+            study,
+            series,
+            instance,
+        })
+    }
+
+    fn put_bulk(&self, blobs: Vec<(Vec<u8>, String)>) -> Vec<String> {
+        let mut inner = self.inner.lock().unwrap();
+        blobs
+            .into_iter()
+            .map(|(bytes, ct)| {
+                inner.bulk_seq += 1;
+                let id = format!("{:x}", inner.bulk_seq);
+                inner.bulk.insert(id.clone(), (bytes, ct));
+                id
+            })
+            .collect()
+    }
+
+    fn bulk_data(&self, id: &str) -> Option<(Vec<u8>, String)> {
+        self.inner.lock().unwrap().bulk.get(id).cloned()
+    }
+}
+
+/// Remove bulk elements, returning the extracted blobs.
+pub fn extract_bulk(ds: &mut DataSet) -> Vec<BulkBlob> {
+    let mut blobs = Vec::new();
+    for tag in BULK_TAGS {
+        if let Some(el) = ds.remove(tag) {
+            let bytes = match &el.value {
+                Value::Bytes(b) => Some(b.clone()),
+                Value::Fragments(f) => Some(f.joined()),
+                _ => None,
+            };
+            if let Some(bytes) = bytes {
+                let content_type = if tag == tags::ENCAPSULATED_DOCUMENT {
+                    "application/pdf".to_string()
+                } else {
+                    "application/octet-stream".to_string()
+                };
+                blobs.push(BulkBlob {
+                    tag,
+                    vr: el.vr,
+                    bytes,
+                    content_type,
+                });
+            } else {
+                ds.insert(el); // unexpected shape; leave in place
+            }
+        }
+    }
+    blobs
+}
+
+/// Remove bulk elements, discarding the bytes (QIDO responses).
+pub fn strip_bulk(ds: &mut DataSet) {
+    for tag in BULK_TAGS {
+        ds.remove(tag);
+    }
+}
+
+/// Case-insensitive keyword/tag matching for one QIDO filter.
+fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
+    if pattern.is_empty() {
+        return true; // universal match / return key
+    }
+    let Some(el) = ds.get(tag) else { return false };
+    let values: Vec<String> = match &el.value {
+        Value::Text(v) => v.clone(),
+        Value::PersonName(n) => n.iter().map(|p| p.to_dicom_string()).collect(),
+        Value::U16(v) => v.iter().map(ToString::to_string).collect(),
+        Value::U32(v) => v.iter().map(ToString::to_string).collect(),
+        Value::I16(v) => v.iter().map(ToString::to_string).collect(),
+        Value::I32(v) => v.iter().map(ToString::to_string).collect(),
+        _ => return false,
+    };
+    // Comma-separated list = OR; `a-b` = inclusive range; trailing `*` =
+    // prefix; otherwise exact (case-insensitive for PN).
+    for alt in pattern.split(',') {
+        let alt = alt.trim();
+        if alt.is_empty() {
+            continue;
+        }
+        if let Some((lo, hi)) = alt.split_once('-') {
+            if !lo.is_empty()
+                && !hi.is_empty()
+                && values.iter().any(|v| v.as_str() >= lo && v.as_str() <= hi)
+            {
+                return true;
+            }
+            continue;
+        }
+        if let Some(prefix) = alt.strip_suffix('*') {
+            if values.iter().any(|v| v.starts_with(prefix)) {
+                return true;
+            }
+            continue;
+        }
+        if el.vr == Vr::Pn {
+            if values.iter().any(|v| v.eq_ignore_ascii_case(alt)) {
+                return true;
+            }
+        } else if values.iter().any(|v| v == alt) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Route one request against a store. `public_base` is the externally
+/// visible base URL used for `BulkDataURI`s and RetrieveURLs.
+pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpRequest) -> HttpResponse {
+    let base = public_base.trim_end_matches('/');
+    let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
+    match (req.method.as_str(), segs.as_slice()) {
+        ("GET", ["studies"]) => qido(
+            store,
+            QidoScope {
+                level: "STUDY",
+                study: None,
+                series: None,
+            },
+            &req.query,
+        ),
+        ("GET", ["series"]) => qido(
+            store,
+            QidoScope {
+                level: "SERIES",
+                study: None,
+                series: None,
+            },
+            &req.query,
+        ),
+        ("GET", ["instances"]) => qido(
+            store,
+            QidoScope {
+                level: "IMAGE",
+                study: None,
+                series: None,
+            },
+            &req.query,
+        ),
+        ("GET", ["studies", study, "series"]) => qido(
+            store,
+            QidoScope {
+                level: "SERIES",
+                study: Some((*study).to_string()),
+                series: None,
+            },
+            &req.query,
+        ),
+        ("GET", ["studies", study, "series", series, "instances"]) => qido(
+            store,
+            QidoScope {
+                level: "IMAGE",
+                study: Some((*study).to_string()),
+                series: Some((*series).to_string()),
+            },
+            &req.query,
+        ),
+        ("GET", ["studies", study, "series", series, "instances", instance]) => {
+            match store.instance_file(study, series, instance) {
+                Some(file) => HttpResponse::multipart(
+                    &[Part::new("application/dicom", file)],
+                    "application/dicom",
+                ),
+                None => HttpResponse::text(404, "instance not found"),
+            }
+        }
+        (
+            "GET",
+            [
+                "studies",
+                study,
+                "series",
+                series,
+                "instances",
+                instance,
+                "metadata",
+            ],
+        ) => match store.instance_metadata(study, series, instance) {
+            Some((ds, blobs)) => {
+                let ids = store.put_bulk(
+                    blobs
+                        .iter()
+                        .map(|b| (b.bytes.clone(), b.content_type.clone()))
+                        .collect(),
+                );
+                let mut obj = dataset_to_json(&ds);
+                let map = obj.as_object_mut().unwrap();
+                for (blob, id) in blobs.iter().zip(ids) {
+                    let key = format!("{:04X}{:04X}", blob.tag.group(), blob.tag.element());
+                    map.insert(
+                        key,
+                        serde_json::json!({
+                            "vr": blob.vr.as_str(),
+                            "BulkDataURI": format!("{base}/bulk/{id}")
+                        }),
+                    );
+                }
+                HttpResponse::json(200, &serde_json::Value::Array(vec![obj]))
+            }
+            None => HttpResponse::text(404, "instance not found"),
+        },
+        (
+            "GET",
+            [
+                "studies",
+                study,
+                "series",
+                series,
+                "instances",
+                instance,
+                "frames",
+                list,
+            ],
+        ) => {
+            let frames: Vec<u32> = list.split(',').filter_map(|f| f.parse().ok()).collect();
+            if frames.is_empty() {
+                return HttpResponse::text(400, "bad frame list");
+            }
+            match store.instance_frames(study, series, instance, &frames) {
+                Some(raw) => {
+                    let parts: Vec<Part> = raw
+                        .into_iter()
+                        .map(|b| Part::new("application/octet-stream", b))
+                        .collect();
+                    HttpResponse::multipart(&parts, "application/octet-stream")
+                }
+                None => HttpResponse::text(404, "instance or frames not found"),
+            }
+        }
+        ("GET", ["bulk", id]) => match store.bulk_data(id) {
+            Some((bytes, ct)) => HttpResponse::bytes(200, ct, bytes),
+            None => HttpResponse::text(404, "bulk data not found"),
+        },
+        ("POST", ["studies"]) => stow(store, base, None, req),
+        ("POST", ["studies", study]) => stow(store, base, Some(study), req),
+        ("GET", _) => HttpResponse::text(404, "unknown DICOMweb resource"),
+        _ => HttpResponse::text(405, "method not allowed"),
+    }
+}
+
+fn qido<S: DicomWebStore>(store: &S, scope: QidoScope, query: &str) -> HttpResponse {
+    let params = parse_query(query);
+    let mut limit = 100usize;
+    let mut offset = 0usize;
+    let mut filters = Vec::new();
+    for (k, v) in &params {
+        match k.to_ascii_lowercase().as_str() {
+            "limit" => limit = v.parse().unwrap_or(100).min(1000),
+            "offset" => offset = v.parse().unwrap_or(0),
+            "includefield" | "fuzzymatching" => {} // accepted, matching stays exact/prefix
+            _ => {
+                if let Some(tag) = qido_key_to_tag(k) {
+                    filters.push((tag, v.clone()));
+                }
+            }
+        }
+    }
+    let matches = store.search(&scope, &filters, limit, offset);
+    let arr: Vec<serde_json::Value> = matches.iter().map(dataset_to_json).collect();
+    HttpResponse::json(200, &serde_json::Value::Array(arr))
+}
+
+fn qido_key_to_tag(key: &str) -> Option<Tag> {
+    if let Some(e) = lookup_keyword(key) {
+        return Some(e.tag);
+    }
+    // Case-insensitive keyword fallback.
+    if let Some(e) = vyna_dcm_core::ENTRIES
+        .iter()
+        .find(|e| e.keyword.eq_ignore_ascii_case(key))
+    {
+        return Some(e.tag);
+    }
+    // 8-hex-digit tag, with optional comma/space separators.
+    let hex: String = key.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() == 8 {
+        let g = u16::from_str_radix(&hex[0..4], 16).ok()?;
+        let e = u16::from_str_radix(&hex[4..8], 16).ok()?;
+        return Some(Tag::new(g, e));
+    }
+    None
+}
+
+/// Percent-decode a query string into pairs.
+pub fn parse_query(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (percent_decode(k), percent_decode(v)),
+            None => (percent_decode(p), String::new()),
+        })
+        .collect()
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(if b[i] == b'+' { b' ' } else { b[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn stow<S: DicomWebStore>(
+    store: &S,
+    base: &str,
+    study_hint: Option<&str>,
+    req: &HttpRequest,
+) -> HttpResponse {
+    let ct = req
+        .headers
+        .get("content-type")
+        .map(String::as_str)
+        .unwrap_or("");
+    let (mime, params) = parse_content_type(ct);
+    if mime != "multipart/related" {
+        return HttpResponse::text(400, "STOW needs multipart/related");
+    }
+    let Some(boundary) = params.get("boundary") else {
+        return HttpResponse::text(400, "STOW multipart without boundary");
+    };
+    let parts = match decode_multipart(&req.body, boundary) {
+        Ok(p) => p,
+        Err(e) => return HttpResponse::text(400, e.to_string()),
+    };
+    let mut stored: Vec<StoredIds> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for part in parts
+        .iter()
+        .filter(|p| p.content_type.eq_ignore_ascii_case("application/dicom"))
+    {
+        match store.store_instance(&part.body, study_hint) {
+            Ok(ids) => stored.push(ids),
+            Err(reason) => failures.push(reason),
+        }
+    }
+    if stored.is_empty() {
+        return HttpResponse::text(400, format!("nothing stored: {}", failures.join("; ")));
+    }
+    if !failures.is_empty() {
+        // Partial failure: 409 with a FailedSOPSequence-shaped body.
+        return HttpResponse::json(
+            409,
+            &serde_json::json!({
+                "00081198": {"vr": "SQ", "Value": []},
+                "00081190": {"vr": "UR", "Value": [format!("{base}/studies/{}", stored[0].study)]},
+                "error": failures.join("; "),
+            }),
+        );
+    }
+    HttpResponse::json(
+        200,
+        &serde_json::json!({
+            "00081190": {"vr": "UR", "Value": [format!("{base}/studies/{}", stored[0].study)]}
+        }),
+    )
+}
+
+/// Build a Part-10 test file (also used by doc examples).
+#[doc(hidden)]
+pub fn test_file(study: &str, series: &str, instance: &str, rows: u16, cols: u16) -> Vec<u8> {
+    let mut ds = DataSet::new();
+    ds.put_uid(tags::SOP_CLASS_UID, vyna_dcm_core::sop_class::CT_IMAGE);
+    ds.put_uid(tags::SOP_INSTANCE_UID, instance);
+    ds.put_uid(tags::STUDY_INSTANCE_UID, study);
+    ds.put_uid(tags::SERIES_INSTANCE_UID, series);
+    ds.put_text(tags::PATIENT_NAME, Vr::Pn, "Web^Test");
+    ds.put_text(tags::PATIENT_ID, Vr::Lo, "W123");
+    ds.put_text(tags::MODALITY, Vr::Cs, "CT");
+    ds.put_u16_single(tags::ROWS, rows);
+    ds.put_u16_single(tags::COLUMNS, cols);
+    ds.put_u16_single(tags::SAMPLES_PER_PIXEL, 1);
+    ds.put_u16_single(tags::BITS_ALLOCATED, 16);
+    ds.put_u16_single(tags::BITS_STORED, 12);
+    ds.put_u16_single(tags::HIGH_BIT, 11);
+    ds.put_u16_single(tags::PIXEL_REPRESENTATION, 0);
+    ds.put_bytes(
+        tags::PIXEL_DATA,
+        Vr::Ow,
+        vec![0u8; rows as usize * cols as usize * 2],
+    );
+    let meta = FileMeta::new(
+        vyna_dcm_core::sop_class::CT_IMAGE,
+        instance,
+        TransferSyntax::ExplicitVrLittleEndian,
+    );
+    write_part10(&meta, &ds).unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vyna_dcm_codec::dataset_from_json;
+
+    fn stored() -> MemoryStore {
+        let store = MemoryStore::new();
+        store
+            .store_instance(&test_file("1.2.3", "1.2.3.1", "1.2.3.1.1", 4, 4), None)
+            .unwrap();
+        store
+            .store_instance(&test_file("1.2.3", "1.2.3.2", "1.2.3.2.1", 2, 2), None)
+            .unwrap();
+        store
+    }
+
+    fn get(path: &str) -> HttpRequest {
+        let (path, query) = match path.split_once('?') {
+            Some((p, q)) => (p.to_string(), q.to_string()),
+            None => (path.to_string(), String::new()),
+        };
+        HttpRequest {
+            method: "GET".into(),
+            path,
+            query,
+            headers: HashMap::new(),
+            body: vec![],
+        }
+    }
+
+    #[test]
+    fn qido_search_and_filters() {
+        let store = stored();
+        // All studies.
+        let r = dispatch(&store, "http://x/wado", &get("/studies"));
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1); // de-duplicated by study
+        // Instances of series 1.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/1.2.3/series/1.2.3.1/instances"),
+        );
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        // PatientID filter hit + miss.
+        let r = dispatch(&store, "http://x/wado", &get("/studies?PatientID=W123"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let r = dispatch(&store, "http://x/wado", &get("/studies?PatientID=NOBODY"));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Prefix wildcard + range + limit.
+        let r = dispatch(&store, "http://x/wado", &get("/studies?PatientID=W*"));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let r = dispatch(&store, "http://x/wado", &get("/studies?limit=0"));
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // QIDO responses carry no pixel data.
+        let r = dispatch(&store, "http://x/wado", &get("/studies"));
+        assert!(!String::from_utf8_lossy(&r.body).contains("7FE00010"));
+    }
+
+    #[test]
+    fn wado_instance_metadata_and_bulk() {
+        let store = stored();
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1"),
+        );
+        assert_eq!(r.status, 200);
+        assert!(
+            r.headers
+                .iter()
+                .any(|(_, v)| v.contains("multipart/related"))
+        );
+
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/metadata"),
+        );
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let uri = v[0]["7FE00010"]["BulkDataURI"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(uri.starts_with("http://x/wado/bulk/"), "{uri}");
+        // The BulkDataURI resolves.
+        let path = uri.replace("http://x/wado", "");
+        let r = dispatch(&store, "http://x/wado", &get(&path));
+        assert_eq!(r.status, 200);
+        assert_eq!(r.body.len(), 4 * 4 * 2);
+
+        // Unknown instance 404s.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/9.9/series/9.9/instances/9.9"),
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn frames_and_stow() {
+        let store = stored();
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/1"),
+        );
+        assert_eq!(r.status, 200);
+
+        let file = test_file("9.9.9", "9.9.9.1", "9.9.9.1.1", 2, 2);
+        let (ct, body) = encode_multipart(
+            &[Part::new("application/dicom", file)],
+            "b1",
+            "application/dicom",
+        );
+        let req = HttpRequest {
+            method: "POST".into(),
+            path: "/studies".into(),
+            query: String::new(),
+            headers: [("content-type".into(), ct)].into(),
+            body,
+        };
+        let r = dispatch(&store, "http://x/wado", &req);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        assert!(String::from_utf8_lossy(&r.body).contains("00081190"));
+        assert_eq!(store.len(), 3);
+
+        // Study mismatch is rejected.
+        let file = test_file("8.8.8", "8.8.8.1", "8.8.8.1.1", 2, 2);
+        let (ct, body) = encode_multipart(
+            &[Part::new("application/dicom", file)],
+            "b2",
+            "application/dicom",
+        );
+        let req = HttpRequest {
+            method: "POST".into(),
+            path: "/studies/7.7.7".into(),
+            query: String::new(),
+            headers: [("content-type".into(), ct)].into(),
+            body,
+        };
+        assert_eq!(dispatch(&store, "http://x/wado", &req).status, 400);
+    }
+
+    #[test]
+    fn unknown_routes_404() {
+        let store = stored();
+        assert_eq!(dispatch(&store, "http://x", &get("/nope")).status, 404);
+        let mut bad = get("/studies");
+        bad.method = "DELETE".into();
+        assert_eq!(dispatch(&store, "http://x", &bad).status, 405);
+    }
+
+    #[test]
+    fn query_parsing() {
+        assert_eq!(
+            parse_query("a=1&b=&c"),
+            vec![
+                ("a".into(), "1".into()),
+                ("b".into(), "".into()),
+                ("c".into(), "".into())
+            ]
+        );
+        assert_eq!(
+            parse_query("n=Doe%5EJohn&x=a+b"),
+            vec![("n".into(), "Doe^John".into()), ("x".into(), "a b".into())]
+        );
+        assert_eq!(qido_key_to_tag("PatientID"), Some(tags::PATIENT_ID));
+        assert_eq!(qido_key_to_tag("00100020"), Some(tags::PATIENT_ID));
+        assert_eq!(qido_key_to_tag("patientid"), Some(tags::PATIENT_ID));
+        assert_eq!(qido_key_to_tag("Nope"), None);
+    }
+
+    #[test]
+    fn json_helper_round_trip() {
+        // Exercise dataset_from_json import path via metadata JSON.
+        let store = stored();
+        let r = dispatch(&store, "http://x/wado", &get("/studies?PatientID=W123"));
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let ds = dataset_from_json(&v[0]).unwrap();
+        assert_eq!(ds.string(tags::PATIENT_ID), Some("W123"));
+    }
+}

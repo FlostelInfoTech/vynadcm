@@ -1,0 +1,32 @@
+[package]
+name = "vyna-dcm-web"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "VynaDCM DICOMweb: WADO-RS, STOW-RS, QIDO-RS"
+
+[features]
+default = ["server"]
+server = ["hyper", "hyper-util", "http-body-util"]
+
+[dependencies]
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.1" }
+vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.1" }
+thiserror.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+tokio = { workspace = true, features = ["rt", "net", "macros"] }
+tracing.workspace = true
+uuid.workspace = true
+hyper = { version = "1", features = ["server", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "net"] }

@@ -1,0 +1,71 @@
+[package]
+name = "vyna-dcm"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "VynaDCM: from-scratch DICOM library for VynaECG and VynaLink"
+autobins = false
+
+[features]
+default = ["net", "web", "ecg", "cli"]
+net = ["vyna-dcm-net"]
+web = ["vyna-dcm-web"]
+ecg = ["vyna-dcm-ecg"]
+cli = ["clap"]
+
+[dependencies]
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.1" }
+vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.1" }
+vyna-dcm-net = { path = "../vyna-dcm-net", version = "0.1", optional = true }
+vyna-dcm-web = { path = "../vyna-dcm-web", version = "0.1", optional = true }
+vyna-dcm-ecg = { path = "../vyna-dcm-ecg", version = "0.1", optional = true }
+thiserror.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }
+tracing.workspace = true
+clap = { workspace = true, optional = true }
+
+[[bin]]
+name = "echoscu"
+path = "src/bin/echoscu.rs"
+required-features = ["cli", "net"]
+
+[[bin]]
+name = "echoscp"
+path = "src/bin/echoscp.rs"
+required-features = ["cli", "net"]
+
+[[bin]]
+name = "storescu"
+path = "src/bin/storescu.rs"
+required-features = ["cli", "net"]
+
+[[bin]]
+name = "storescp"
+path = "src/bin/storescp.rs"
+required-features = ["cli", "net"]
+
+[[bin]]
+name = "findscu"
+path = "src/bin/findscu.rs"
+required-features = ["cli", "net"]
+
+[[bin]]
+name = "dcmdump"
+path = "src/bin/dcmdump.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "dcm2json"
+path = "src/bin/dcm2json.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "json2dcm"
+path = "src/bin/json2dcm.rs"
+required-features = ["cli"]
+
+[dev-dependencies]

@@ -1,0 +1,16 @@
+[package]
+name = "vyna-dcm-ecg"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "VynaDCM ECG waveform helpers for VynaECG"
+
+[dependencies]
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.1" }
+vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.1" }
+thiserror.workspace = true
+
+[dev-dependencies]

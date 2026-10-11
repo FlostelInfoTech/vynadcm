@@ -1,0 +1,30 @@
+[package]
+name = "vyna-dcm-net"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "VynaDCM networking: DIMSE, associations, SCU/SCP services"
+
+[features]
+default = ["tls"]
+tls = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots"]
+
+[dependencies]
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.1" }
+vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.1" }
+thiserror.workspace = true
+bytes.workspace = true
+tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time"] }
+tracing.workspace = true
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "rt", "rt-multi-thread", "macros", "sync", "time"] }
+tracing.workspace = true
+rcgen.workspace = true
