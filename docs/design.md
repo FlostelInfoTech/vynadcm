@@ -145,6 +145,17 @@ spec adds component contracts, algorithms, sequences, and invariants.
   `recording_to_dataset`: full SOP instance (defaults: 12-lead class,
   generated UIDs via `EcgInstanceMeta::fill_uids`, Modality ECG).
 
+### 2.6 `vyna-dcm-iod` — IOD validation
+
+- `IODS`: 18 SOP Classes × merged module rows, generated from NEMA
+  PS3.3 by `docs/generate-iod.py` (macro expansion, strictest-type
+  merge; 1C/2C fold to if-present except 7 curated `CondRule`s).
+- `validate(ds, sop_uid, ts) -> Option<Report>`: Type 1/2 presence,
+  VR-vs-dictionary (primary or `alts`; explicit `UN` warns), VM
+  range check for countable values; findings in tag order.
+- `dcmvalidate` bin adds file-meta SOP UID consistency and exit
+  codes (0 clean, 1 errors, 2 unsupported SOP Class).
+
 ## 3. Key algorithms
 
 ### 3.1 Negotiation (`service::negotiate`)

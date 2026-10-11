@@ -6,6 +6,7 @@ members = [
     "crates/vyna-dcm-net",
     "crates/vyna-dcm-web",
     "crates/vyna-dcm-ecg",
+    "crates/vyna-dcm-iod",
     "crates/vyna-dcm",
 ]
 

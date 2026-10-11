@@ -16,7 +16,8 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | `vyna-dcm-net` | PDU/association, DIMSE SCU + SCP, MWL/MPPS/Storage-Commitment builders, TLS |
 | `vyna-dcm-web` | DICOMweb QIDO/WADO/STOW client + server, `multipart/related` codec |
 | `vyna-dcm-ecg` | 12-lead ECG model and Waveform Sequence mapping for VynaECG |
-| `vyna-dcm` | Facade re-exporting the above, plus 8 CLI tools and 3 examples |
+| `vyna-dcm-iod` | IOD validation: Type 1/2/3 presence, VR/VM checks, 18 SOP Classes |
+| `vyna-dcm` | Facade re-exporting the above, plus 9 CLI tools and 3 examples |
 
 ## Documentation
 
@@ -37,7 +38,7 @@ Requires Rust 1.98+ (edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace        # 111 unit + 6 doc tests
+cargo test --workspace        # 117 unit + 2 integration + 6 doc tests
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
@@ -75,6 +76,7 @@ cargo run -p vyna-dcm --example link_route -- 127.0.0.1:11115 127.0.0.1:11114 PA
 | `findscu` | C-FIND query, prints matches |
 | `dcmdump` | Part-10 file text dump |
 | `dcm2json` / `json2dcm` | Part-10 <-> DICOM JSON conversion |
+| `dcmvalidate` | IOD conformance check (exit 0 clean, 1 errors, 2 unsupported SOP) |
 
 Network tools need features `cli,net`; file tools need only `cli`.
 

@@ -9,7 +9,7 @@
 | Applies to | VynaDCM workspace v0.1.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
-implemented baseline (117 tests green, bundled JPEG codecs applied).
+implemented baseline (125 tests green, IOD validator applied).
 
 ## Contents
 
@@ -174,13 +174,29 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   items and build complete 12-Lead/General ECG SOP instances ready
   for C-STORE, Part-10, or STOW-RS.
 
-### 3.6 CLI tools (`vyna-dcm`, feature `cli`)
+### 3.6 IOD validation (`vyna-dcm-iod`)
+
+- **FR-IOD-01 (M)** Validate datasets against generated IOD tables
+  (18 SOP Classes: CR/CT/MR/MG/DX/US/SC/PT/NM/XA/VL/KO/PDF/ECG):
+  Type 1 presence + non-emptiness, Type 2 presence, Type 3
+  if-present checks, dictionary VR (or listed alternate) and VM
+  conformance, plus a curated set of Type-1C conditions
+  (multi-frame, color, lossy syntax, charset, offset tables).
+- **FR-IOD-02 (M)** Report machine-readable findings (severity,
+  tag, module, category) in tag order; unknown SOP Classes return
+  no report instead of guessing.
+- **FR-IOD-03 (S)** Scope honesty: sequence items, non-Mandatory
+  module presence, uncurated conditions, overlay groups, and value
+  *formats* are out of scope and documented as such.
+
+### 3.7 CLI tools (`vyna-dcm`, feature `cli`)
 
 - **FR-CLI-01 (M)** Network tools: `echoscu`, `echoscp`, `storescu`,
   `storescp`, `findscu` (incl. MWL model, `-k` keys, JSON output),
   each with AE titles, PDU/timeout tuning, and TLS options.
 - **FR-CLI-02 (M)** File tools: `dcmdump`, `dcm2json` (incl. file-meta
-  option), `json2dcm` (incl. transfer-syntax selection).
+  option), `json2dcm` (incl. transfer-syntax selection),
+  `dcmvalidate` (IOD check with SOP-Class override; exit 0/1/2).
 
 ## 4. Non-functional requirements
 
@@ -199,7 +215,7 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **NFR-06 (M)** Determinism: encoders emit canonical output so
   dataset/Part-10/JSON round-trips are stable.
 - **NFR-07 (M)** Quality gates for every change: unit + doc tests
-  green (currently 111 + 6), `cargo clippy --workspace --all-targets`
+  green (currently 117 + 2 + 6), `cargo clippy --workspace --all-targets`
   with zero warnings, `cargo fmt --check` clean.
 - **NFR-08 (S)** Documentation: public API documented
   (`missing_docs` enforced); this SRS, the design spec, integration
@@ -228,6 +244,7 @@ ATNA audit-trail emission.
 | FR-NET-08 | `tls_loopback_echo`, `rejects_empty_chain_and_key` |
 | FR-WEB-01…03 | `end_to_end_client_against_hyper`, dispatch/multipart tests (11) |
 | FR-ECG-01…03 | `vyna-dcm-ecg` tests (7); `ecg_write` example |
-| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `dcmdump`, `dcm2json`, `json2dcm`); `link_route` example |
+| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcmvalidate`); `link_route` example |
+| FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | NFR-04 | `rejects_garbage`, `rejects_non_part10`, `rejects_bad_json`, `rejects_missing_boundary`, unknown-route 404 tests |
 | NFR-07 | CI-equivalent gate run per change (see §4) |

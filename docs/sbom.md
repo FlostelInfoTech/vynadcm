@@ -9,14 +9,15 @@
 | Applies to | VynaDCM workspace v0.1.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue (201
-components); Unreleased — bundled JPEG codecs: 210 components (204
-third-party), incl. vendored `openjp2` (BSD-2-Clause, patched in-tree).
+components); Unreleased — bundled JPEG codecs + IOD validator: 211
+components (7 workspace, 204 third-party), incl. vendored `openjp2`
+(BSD-2-Clause, patched in-tree).
 
 ## 1. Artifact
 
 `docs/sbom.cyclonedx.json` is the authoritative bill of materials in
 [CycloneDX](https://cyclonedx.org/) 1.5 JSON format. It currently lists
-**6 workspace members** (proprietary) and **204 third-party crates**,
+**7 workspace members** (proprietary) and **204 third-party crates**,
 each with name, version, Package URL, SPDX license, and (for registry
 crates) the SHA-256 checksum from `Cargo.lock`. One third-party
 component, `openjp2` 0.6.1, is vendored under `vendor/` with a VynaDCM

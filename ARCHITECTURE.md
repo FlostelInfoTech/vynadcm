@@ -114,14 +114,23 @@ The physics convention follows PS3.3 C.10.9:
 `physical = sample × sensitivity × correction_factor + baseline`
 (sensitivity in physical units per LSB, usually mV).
 
+## vyna-dcm-iod — IOD validation
+
+- `iod_generated.rs` — 18 IOD tables (CR/CT/MR/MG/DX/US/SC/PT/NM/XA/
+  VL/KO/PDF/ECG) from NEMA PS3.3 via `docs/generate-iod.py` (89
+  modules, macro-expanded, strictest-type merge).
+- `lib.rs` — `validate(ds, sop_uid, ts)`: Type 1/2 presence, VR/VM
+  checks, 7 conditional rules; `Finding`/`Report` in tag order.
+
 ## vyna-dcm — facade, tools, examples
 
-- `lib.rs` — re-exports `core`/`codec` always; `net`/`web`/`ecg` behind
-  same-named features; common types (`DataSet`, `Tag`, `Vr`, `tags`,
-  codec entry points) at the root.
-- `src/bin/` — 8 CLIs (feature `cli`; network tools also require `net`):
+- `lib.rs` — re-exports `core`/`codec`/`iod` always; `net`/`web`/`ecg`
+  behind same-named features; common types (`DataSet`, `Tag`, `Vr`,
+  `tags`, codec entry points) at the root.
+- `src/bin/` — 9 CLIs (feature `cli`; network tools also require `net`):
   `echoscu`, `echoscp`, `storescu`, `storescp`, `findscu`, `dcmdump`,
-  `dcm2json`, `json2dcm` (`common.rs` holds shared arg parsing).
+  `dcm2json`, `json2dcm`, `dcmvalidate` (`common.rs` holds shared arg
+  parsing).
 - `examples/` — `ecg_write` (VynaECG pattern), `wado_fetch` (DICOMweb
   client), `link_route` (VynaLink store-and-forward chain: C-STORE in,
   routes to a downstream SCP).
@@ -142,7 +151,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Test layout
 
-111 unit tests live next to the code (`#[cfg(test)]` modules), 6 doc tests
+117 unit tests live next to the code (`#[cfg(test)]` modules) plus 2 integration tests (`tests/`), 6 doc tests
 on the crate roots. Network tests bind `127.0.0.1:0` (ephemeral ports)
 with in-process SCP peers — no fixed ports, no external services.
 Feature-gated tests (`tls`, `server`) compile out with their features.

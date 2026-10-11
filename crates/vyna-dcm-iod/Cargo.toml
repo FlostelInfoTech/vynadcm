@@ -1,0 +1,15 @@
+[package]
+name = "vyna-dcm-iod"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "VynaDCM IOD validation: Type 1/2/3 presence, VR and VM checking"
+
+[dependencies]
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.1" }
+
+[dev-dependencies]
+vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.1" }

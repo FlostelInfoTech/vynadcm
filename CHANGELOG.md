@@ -18,7 +18,13 @@ the workspace crate version (`Cargo.toml`).
   `.50` baseline, `.70` lossless, `.80`/`.81` JPEG-LS, `.90`/`.91`
   JPEG 2000 (pure Rust; `openjp2` vendored with a null-`dealloc`
   patch, see `vendor/openjp2/README.VYNA.md`). Multi-frame decode
-  via Basic Offset Table or one fragment per frame; 117 tests green.
+  via Basic Offset Table or one fragment per frame.
+- New `vyna-dcm-iod` crate: IOD validation for 18 SOP Classes
+  (Type 1/2/3 presence, VR/VM checks, 7 conditional rules) with
+  generated PS3.3 tables (`docs/generate-iod.py`) plus the
+  `dcmvalidate` CLI (exit 0/1/2); 125 tests green.
+- `TransferSyntax::is_lossy`, dictionary multi-VR alternates
+  (`DictEntry.alts`), and 11 new SOP Class UID constants.
 
 ## [0.1.0] — 2026-10-11
 

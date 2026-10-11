@@ -25,6 +25,9 @@ pub struct DictEntry {
     pub tag: Tag,
     /// Default (primary) value representation.
     pub vr: Vr,
+    /// Additional accepted VRs for multi-VR entries (e.g. `US or SS`);
+    /// empty for single-VR entries.
+    pub alts: &'static [Vr],
     /// Value multiplicity descriptor, e.g. `"1"`, `"1-n"`, `"2"`.
     pub vm: &'static str,
     /// CamelCase keyword, e.g. `"PatientName"`.
@@ -35,10 +38,13 @@ pub struct DictEntry {
     pub retired: bool,
 }
 
+/// Row constructor for the generated table (positional by design).
+#[allow(clippy::too_many_arguments)]
 pub(crate) const fn e(
     group: u16,
     element: u16,
     vr: Vr,
+    alts: &'static [Vr],
     vm: &'static str,
     keyword: &'static str,
     name: &'static str,
@@ -47,6 +53,7 @@ pub(crate) const fn e(
     DictEntry {
         tag: Tag::new(group, element),
         vr,
+        alts,
         vm,
         keyword,
         name,

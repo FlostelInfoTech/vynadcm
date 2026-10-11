@@ -134,6 +134,25 @@ impl TransferSyntax {
         matches!(self, TransferSyntax::DeflatedExplicitVrLittleEndian)
     }
 
+    /// Pixel data may have undergone lossy compression.
+    ///
+    /// True for the lossy JPEG/JPEG-LS/JPEG 2000/HTJ2K syntaxes. Part 2
+    /// reports true: a Part-2 codestream can be lossy and the transfer
+    /// syntax alone cannot prove otherwise, so guarded attributes (e.g.
+    /// Lossy Image Compression) are treated as required.
+    #[must_use]
+    pub const fn is_lossy(self) -> bool {
+        matches!(
+            self,
+            TransferSyntax::JpegBaseline8Bit
+                | TransferSyntax::JpegExtended12Bit
+                | TransferSyntax::JpegLsNearLossless
+                | TransferSyntax::Jpeg2000
+                | TransferSyntax::Jpeg2000Part2
+                | TransferSyntax::HtJpeg2000
+        )
+    }
+
     /// Pixel/waveform data is encapsulated in fragments.
     #[must_use]
     pub const fn is_encapsulated(self) -> bool {
@@ -209,5 +228,17 @@ mod tests {
         assert!(TransferSyntax::RleLossless.is_natively_decodable());
         assert!(!TransferSyntax::JpegBaseline8Bit.is_natively_decodable());
         assert!(TransferSyntax::ExplicitVrLittleEndian.is_uncompressed());
+        assert!(TransferSyntax::JpegBaseline8Bit.is_lossy());
+        assert!(TransferSyntax::JpegLsNearLossless.is_lossy());
+        assert!(TransferSyntax::Jpeg2000.is_lossy());
+        assert!(TransferSyntax::HtJpeg2000.is_lossy());
+        assert!(TransferSyntax::Jpeg2000Part2.is_lossy());
+        assert!(!TransferSyntax::JpegLossless.is_lossy());
+        assert!(!TransferSyntax::JpegLsLossless.is_lossy());
+        assert!(!TransferSyntax::Jpeg2000Lossless.is_lossy());
+        assert!(!TransferSyntax::Jpeg2000Part2Lossless.is_lossy());
+        assert!(!TransferSyntax::HtJpeg2000Lossless.is_lossy());
+        assert!(!TransferSyntax::RleLossless.is_lossy());
+        assert!(!TransferSyntax::ExplicitVrLittleEndian.is_lossy());
     }
 }

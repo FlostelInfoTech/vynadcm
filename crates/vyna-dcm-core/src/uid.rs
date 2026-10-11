@@ -61,6 +61,28 @@ pub mod sop_class {
     pub const CT_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.2";
     /// MR Image Storage.
     pub const MR_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.4";
+    /// Digital X-Ray Image Storage — For Presentation.
+    pub const DX_PRESENTATION: &str = "1.2.840.10008.5.1.4.1.1.1.1";
+    /// Digital X-Ray Image Storage — For Processing.
+    pub const DX_PROCESSING: &str = "1.2.840.10008.5.1.4.1.1.1.1.1";
+    /// Digital Mammography X-Ray Image Storage — For Presentation.
+    pub const MG_PRESENTATION: &str = "1.2.840.10008.5.1.4.1.1.1.2";
+    /// Digital Mammography X-Ray Image Storage — For Processing.
+    pub const MG_PROCESSING: &str = "1.2.840.10008.5.1.4.1.1.1.2.1";
+    /// Ultrasound Image Storage (single-frame).
+    pub const US_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.6.1";
+    /// Ultrasound Multi-frame Image Storage.
+    pub const US_MULTIFRAME: &str = "1.2.840.10008.5.1.4.1.1.3.1";
+    /// X-Ray Angiographic Image Storage.
+    pub const XA_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.12.1";
+    /// Nuclear Medicine Image Storage.
+    pub const NM_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.20";
+    /// Positron Emission Tomography Image Storage.
+    pub const PT_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.128";
+    /// VL Photographic Image Storage.
+    pub const VL_PHOTOGRAPHIC: &str = "1.2.840.10008.5.1.4.1.1.77.1.4";
+    /// Key Object Selection Document Storage.
+    pub const KEY_OBJECT_SELECTION: &str = "1.2.840.10008.5.1.4.1.1.88.59";
     /// Secondary Capture Image Storage.
     pub const SECONDARY_CAPTURE_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.7";
     /// 12-Lead ECG Waveform Storage.
@@ -172,6 +194,21 @@ mod tests {
         assert!(a.starts_with("2.25."));
         assert!(is_valid_uid(VYNA_IMPLEMENTATION_CLASS_UID));
         assert!(is_valid_uid(sop_class::MODALITY_WORKLIST_FIND));
+        for uid in [
+            sop_class::DX_PRESENTATION,
+            sop_class::DX_PROCESSING,
+            sop_class::MG_PRESENTATION,
+            sop_class::MG_PROCESSING,
+            sop_class::US_IMAGE,
+            sop_class::US_MULTIFRAME,
+            sop_class::XA_IMAGE,
+            sop_class::NM_IMAGE,
+            sop_class::PT_IMAGE,
+            sop_class::VL_PHOTOGRAPHIC,
+            sop_class::KEY_OBJECT_SELECTION,
+        ] {
+            assert!(is_valid_uid(uid), "{uid}");
+        }
         for uid in sop_class::DEFAULT_STORAGE_CLASSES
             .iter()
             .chain(sop_class::QUERY_CLASSES)

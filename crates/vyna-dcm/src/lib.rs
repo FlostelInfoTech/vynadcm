@@ -16,6 +16,7 @@ pub use vyna_dcm_codec as codec;
 pub use vyna_dcm_core as core;
 #[cfg(feature = "ecg")]
 pub use vyna_dcm_ecg as ecg;
+pub use vyna_dcm_iod as iod;
 #[cfg(feature = "net")]
 pub use vyna_dcm_net as net;
 #[cfg(feature = "web")]
@@ -31,3 +32,4 @@ pub use vyna_dcm_codec::{
 pub use vyna_dcm_core::{
     DataElement, DataSet, PersonName, Tag, TransferSyntax, Value, Vr, lookup_keyword, new_uid, tags,
 };
+pub use vyna_dcm_iod::{Finding, Iod, Report, Severity, find_iod, validate};

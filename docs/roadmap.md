@@ -59,12 +59,16 @@ lossy-error tests, independent-encoder cross-checks, truncated-input
 robustness, 117/117 green, clippy clean. `.51`, J2K Part 2, and
 HTJ2K stay out of scope.
 
-### P0.3 IOD validator (`dciodvfy` / `dcmvalidate`-like)
+### P0.3 IOD validator (`dciodvfy` / `dcmvalidate`-like) — DONE
 
-Type 1/2/3 presence and VR/VM checking for common SOP classes, as a
-library API plus a `dcmvalidate` CLI. Critical for an interface
-engine that must reject bad inbound data with reasons. Acceptance:
-validator flags missing Type-1 and mistyped attributes on fixtures.
+Shipped `vyna-dcm-iod` (`validate` + `Report`/`Finding`) with 18
+generated IOD tables (89 macro-expanded modules, strictest-type
+merge, 7 conditional rules) plus the `dcmvalidate` CLI with
+file-meta consistency checks. Accepted: per-IOD valid fixtures
+validate clean, negatives/conditions flag correctly,
+Part-10 round-trips green, 125/125 tests, clippy clean. Out of
+scope (documented): sequence items, value-type gating, value
+formats, overlays.
 
 ### P0.4 Encapsulated PDF helpers (`pdf2dcm` / `dcm2pdf`-like)
 

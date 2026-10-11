@@ -137,17 +137,25 @@ def parse_nema(xml_text: str) -> tuple[str, list]:
     return version, entries
 
 
-def primary_vr(vr_raw: str, tag) -> str:
-    v = vr_raw.strip()
-    if v in MULTI_VR:
-        return MULTI_VR[v]
-    if v == "See Note":  # FFFE delimiters: structural, no single VR
-        return "Un"
-    if v not in VALID_VRS:
-        raise SystemExit(f"unmapped VR {v!r} at tag {tag[0]:04X},{tag[1]:04X}")
+def vr_variant(v: str) -> str:
     return {"OB": "Ob", "OW": "Ow", "OF": "Of", "OD": "Od", "OL": "Ol",
             "OV": "Ov", "UN": "Un", "UR": "Ur", "UT": "Ut", "UV": "Uv"}.get(
         v, v.title().replace("_", ""))
+
+
+def primary_vr(vr_raw: str, tag) -> tuple[str, list]:
+    """Returns (primary variant, [alternate variants])."""
+    v = vr_raw.strip()
+    if v in MULTI_VR:
+        primary = MULTI_VR[v]
+        alts = [vr_variant(p) for p in v.split(" or ")]
+        alts = [a for a in alts if a != primary]
+        return primary, alts
+    if v == "See Note":  # FFFE delimiters: structural, no single VR
+        return "Un", []
+    if v not in VALID_VRS:
+        raise SystemExit(f"unmapped VR {v!r} at tag {tag[0]:04X},{tag[1]:04X}")
+    return vr_variant(v), []
 
 
 def emit_dictionary(version: str, entries, hand_idents: set):
@@ -160,7 +168,9 @@ def emit_dictionary(version: str, entries, hand_idents: set):
                           "vr": vr, "vm": vm, "retired": False}
     for en in merged.values():
         if "vr" not in en:
-            en["vr"] = primary_vr(en["vr_raw"], en["tag"])
+            en["vr"], en["alts"] = primary_vr(en["vr_raw"], en["tag"])
+        else:
+            en.setdefault("alts", [])
     print(f"merge: nema={len(entries)} supplement={len(SUPPLEMENT)} "
           f"total={len(merged)}")
 
@@ -196,8 +206,9 @@ def emit_dictionary(version: str, entries, hand_idents: set):
     for tag in sorted(merged):
         en = merged[tag]
         g, e = tag
+        alts = ", ".join(f"Vr::{a}" for a in en["alts"])
         lines.append(
-            f"    e(0x{g:04X}, 0x{e:04X}, Vr::{en['vr']}, "
+            f"    e(0x{g:04X}, 0x{e:04X}, Vr::{en['vr']}, &[{alts}], "
             f"{rust_str(en['vm'])}, {rust_str(en['keyword'])}, "
             f"{rust_str(en['name'])}, {str(en['retired']).lower()}),"
         )

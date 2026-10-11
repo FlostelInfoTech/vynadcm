@@ -22,7 +22,7 @@ library should read `docs/integration.md`.
 - [3. Connectivity: echoscu / echoscp](#3-connectivity-echoscu--echoscp)
 - [4. Storage: storescu / storescp](#4-storage-storescu--storescp)
 - [5. Query: findscu](#5-query-findscu)
-- [6. Files: dcmdump, dcm2json, json2dcm](#6-files-dcmdump-dcm2json-json2dcm)
+- [6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate](#6-files-dcmdump-dcm2json-json2dcm-dcmvalidate)
 - [7. TLS walkthrough](#7-tls-walkthrough)
 - [8. Worked examples](#8-worked-examples)
 - [9. Troubleshooting](#9-troubleshooting)
@@ -117,7 +117,7 @@ findscu --connect 127.0.0.1:11112 --model mwl \
   requests a return key.
 - `--json` prints matches as DICOM JSON; otherwise a text dump.
 
-## 6. Files: dcmdump, dcm2json, json2dcm
+## 6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate
 
 ```sh
 dcmdump file.dcm                        # text dump to stdout
@@ -125,7 +125,16 @@ dcm2json file.dcm > file.json           # Part-10 → DICOM JSON
 dcm2json --with-meta file.dcm > full.json  # include group 0002 meta
 json2dcm --output roundtrip.dcm file.json  # JSON → Part-10 (explicit LE)
 json2dcm --output implicit.dcm --transfer-syntax 1.2.840.10008.1.2 file.json
+dcmvalidate file.dcm                    # IOD conformance check
+dcmvalidate --sop-class 1.2.840.10008.5.1.4.1.1.2 file.dcm  # override SOP Class
 ```
+
+`dcmvalidate` checks 18 SOP Classes (CR/CT/MR/MG/DX/US/SC/PT/NM/XA/
+VL/KO/PDF/ECG) for Type 1/2 presence, VR/VM conformance, and
+conditional rules (multi-frame, color, lossy syntax, charset); it
+also verifies file-meta SOP UIDs match the dataset. Exit 0 means
+no errors (warnings allowed), 1 means errors, 2 means the SOP
+Class is not supported.
 
 Note: JSON round-trips normalize `DS` float formatting (`500` →
 `500.0`); values stay numerically identical.
