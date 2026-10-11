@@ -2,17 +2,17 @@
 
 Dependency direction (each layer only depends on layers below it):
 
-```
+```text
 vyna-dcm (facade: re-exports + bins + examples)
 ├── vyna-dcm-ecg ──┐
 ├── vyna-dcm-web ──┤
 └── vyna-dcm-net ──┴──> vyna-dcm-codec ──> vyna-dcm-core
 ```
 
-`core` is dependency-light (thiserror only, plus std). `codec` adds
-serde_json/flate2. `net`/`web` add tokio; TLS adds tokio-rustls/rustls;
-the web server adds hyper. There are no DICOM dependencies outside this
-workspace.
+`core` is dependency-light (thiserror + uuid, plus std). `codec` adds
+serde_json/flate2/base64. `net`/`web` add tokio; TLS adds
+tokio-rustls/rustls; the web client adds reqwest; the web server adds
+hyper. There are no DICOM dependencies outside this workspace.
 
 ## vyna-dcm-core — data model
 
@@ -39,9 +39,8 @@ workspace.
 
 - `decode.rs` / `encode.rs` — dataset codec for implicit/explicit VR
   little endian, explicit VR big endian (retired but supported), and
-  deflated;
-  resolves context-dependent VRs (`ox`/`px`/`xs`, US/SS) from decoded
-  siblings and the dictionary.
+  deflated; resolves context-dependent VRs (`ox`/`px`/`xs`, US/SS)
+  from decoded siblings and the dictionary.
 - `part10.rs` — Part-10 file format: preamble + `FileMeta` (group 0002)
   + dataset; `read_part10` / `write_part10`.
 - `rle.rs` — from-scratch RLE Lossless frame codec (`encode_frame` /
@@ -50,7 +49,7 @@ workspace.
   `dataset_from_json`, with `InlineBinary` for byte VRs.
 - `lib.rs` — `decode_pixels` / `decode_pixels_with`: native + RLE + raw
   deflated in-tree; JPEG/JPEG 2000 families decode through the `PixelCodec`
-  plug-in trait (`PixelCodecError` if none is installed).
+  plug-in trait (`Error::UnsupportedTransferSyntax` if none is installed).
 - `dump.rs` — `dump_dataset` human-readable text dump (backs `dcmdump`).
 
 ## vyna-dcm-net — DIMSE networking

@@ -18,7 +18,17 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | `vyna-dcm-ecg` | 12-lead ECG model and Waveform Sequence mapping for VynaECG |
 | `vyna-dcm` | Facade re-exporting the above, plus 8 CLI tools and 3 examples |
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) for the layer design and module map.
+## Documentation
+
+| Document | Description |
+|---|---|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | One-page layer design and module map |
+| [docs/requirements.md](docs/requirements.md) | Requirements specification (SRS) |
+| [docs/design.md](docs/design.md) | Design specification (SDS) |
+| [docs/integration.md](docs/integration.md) | Integration guide for VynaECG / VynaLink |
+| [docs/user-guide.md](docs/user-guide.md) | CLI reference and operator walkthroughs |
+| [docs/sbom.md](docs/sbom.md) | Software bill of materials (CycloneDX) |
+| [CHANGELOG.md](CHANGELOG.md) | Release notes |
 
 ## Quick start
 
@@ -36,6 +46,7 @@ Loopback C-ECHO with the bundled tools:
 ```sh
 cargo run -p vyna-dcm --bin echoscp -- --bind 127.0.0.1:11116 &
 cargo run -p vyna-dcm --bin echoscu -- --connect 127.0.0.1:11116
+kill %1  # stop the background server
 ```
 
 Convert a Part-10 file to DICOM JSON and back:
@@ -79,8 +90,8 @@ Every combination builds; without defaults the gated tests drop out
 
 ```toml
 # Minimal embed: model + codec only
-vyna-dcm = { version = "0.1", default-features = false }
-# VynaECG: + ECG mapping. VynaLink: + net (+ web for DICOMweb endpoints).
+vyna-dcm = { git = "https://gitlab.flostel.com/alexshao/VynaDCM", version = "0.1", default-features = false }
+# VynaECG: features = ["ecg", "net"]. VynaLink: features = ["net", "web"].
 ```
 
 ## Scope notes
