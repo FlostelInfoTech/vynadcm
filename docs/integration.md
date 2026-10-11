@@ -26,7 +26,7 @@ Operators should start with `docs/user-guide.md`.
 - [8. DICOMweb client](#8-dicomweb-client)
 - [9. DICOMweb server](#9-dicomweb-server)
 - [10. ECG end-to-end (VynaECG recipe)](#10-ecg-end-to-end-vynaecg-recipe)
-- [11. JPEG pixel decoding (plug-in)](#11-jpeg-pixel-decoding-plug-in)
+- [11. JPEG pixel codecs (bundled + overrides)](#11-jpeg-pixel-codecs-bundled--overrides)
 - [12. Cross-cutting notes](#12-cross-cutting-notes)
 
 ## 1. Adding the dependency
@@ -311,7 +311,35 @@ Read back with `recording_from_waveform_item(&waveform_item)` and
 convert with `lead.physical_samples()` (mV). Standard 12-lead labels
 and MDC codes: `STANDARD_12_LEAD`, `mdc_code_for_lead("II")`.
 
-## 11. JPEG pixel decoding (plug-in)
+## 11. JPEG pixel codecs (bundled + overrides)
+
+Six JPEG transfer syntaxes work out of the box — `.50` baseline,
+`.70` lossless, `.80`/`.81` JPEG-LS, `.90`/`.91` JPEG 2000 — with no
+plug-in. Native, RLE, and deflated syntaxes need no codec either:
+
+```rust
+use vyna_dcm::codec::{decode_pixels, encode_pixels};
+use vyna_dcm::TransferSyntax;
+
+// Fragments → raw native-order samples (all frames concatenated)…
+let raw = decode_pixels(&ds, TransferSyntax::JpegLsLossless).unwrap();
+// …and back to one fragment per frame.
+let frags = encode_pixels(&ds, TransferSyntax::JpegLsLossless, &raw, None).unwrap();
+```
+
+Tune the lossy knobs through `BundledCodec` (`jpeg.quality`,
+`jpeg_ls.near`, `jpeg_2000.lossy_ratio`) and pass it explicitly:
+
+```rust
+use vyna_dcm::codec::{BundledCodec, decode_pixels_with};
+
+let mut codec = BundledCodec::default();
+codec.jpeg.quality = 95;
+let raw = decode_pixels_with(&ds, ts, Some(&codec)).unwrap();
+```
+
+To replace a backend (e.g. with a hardware codec), implement
+`PixelCodec` and pass it instead:
 
 ```rust
 use vyna_dcm::codec::{PixelCodec, PixelCodecError, decode_pixels_with};
@@ -351,8 +379,8 @@ impl PixelCodec for MyJpeg {
 let raw = decode_pixels_with(&ds, ts, Some(&MyJpeg)).unwrap();
 ```
 
-Native, RLE, and deflated syntaxes need no plug-in
-(`decode_pixels(&ds, ts)`).
+With `None` instead of a codec, `decode_pixels_with` rejects
+JPEG-family syntaxes with `UnsupportedTransferSyntax`.
 
 ## 12. Cross-cutting notes
 

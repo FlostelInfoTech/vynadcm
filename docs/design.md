@@ -70,10 +70,19 @@ spec adds component contracts, algorithms, sequences, and invariants.
 - `read_part10` validates the 132-byte preamble + `DICM` magic, then
   decodes group 0002 as Explicit VR LE and the body per its transfer
   syntax; `write_part10` emits the same layout.
-- `decode_pixels(ds, ts)`: native bytes pass through; RLE goes to the
-  in-tree frame codec; JPEG families require `Some(&dyn PixelCodec)`,
-  else `Error::UnsupportedTransferSyntax` (likewise when the installed
-  codec declines the syntax).
+- `decode_pixels(ds, ts)`: native bytes pass through; RLE goes to
+  the in-tree frame codec; JPEG families go to the bundled backends
+  (`.50`, `.70`, `.80`/`.81`, `.90`/`.91`). `decode_pixels_with`
+  takes an explicit `PixelCodec` override (`None` rejects JPEG with
+  `Error::UnsupportedTransferSyntax`, as does a codec that declines
+  the syntax). Multi-frame JPEG framing prefers the Basic Offset
+  Table, else one fragment per frame.
+- `encode_pixels(ds, ts, raw, codec)`: the encode mirror — RLE
+  built in, JPEG families via the codec, one fragment per frame.
+  Bundled backends are pure Rust: `jpeg-decoder`/`jpeg-encoder`
+  (`.50`), `jpegli` (`.70`), `jpegls` (`.80`/`.81`), and a vendored
+  `openjp2` (`.90`/`.91`, see `vendor/openjp2/README.VYNA.md` for the
+  null-`dealloc` patch). `.51`, J2K Part 2, and HTJ2K stay unsupported.
 - `dataset_to_json` / `dataset_from_json`: PS3.18 F; byte VRs use
   `InlineBinary` (base64); `DS`/`IS` accept JSON numbers or strings.
   Known normalization: Part-10 → JSON → Part-10 rewrites DS lexical

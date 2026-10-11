@@ -48,14 +48,16 @@ Replaced the 266-entry curated table with the complete public registry
 creators / 8,860 entries) and the missing `SV` VR (35 variants).
 Accepted: registry/private spot tests, 96/96 green, clippy clean.
 
-### P0.2 Bundled JPEG / JPEG-LS / JPEG 2000 backend
+### P0.2 Bundled JPEG / JPEG-LS / JPEG 2000 backend — DONE
 
-Rivals decode in-tree (dcm4che via OpenCV natives, DCMTK
-`dcmjpeg`/`dcmjpls`, pydicom via pixel-handler plugins); VynaDCM has
-only the `PixelCodec` plug-in point. Ship a default backend on pure
-Rust crates, keeping the trait for overrides. Acceptance:
-baseline/lossless JPEG, JPEG-LS, and J2K vectors decode;
-`decode_pixels` works without an explicit codec.
+Shipped `BundledCodec` (`.50` via `jpeg-decoder`/`jpeg-encoder`,
+`.70` via `jpegli`, `.80`/`.81` via `jpegls`, `.90`/`.91` via
+vendored `openjp2` with a null-`dealloc` patch) plus `encode_pixels`
+and multi-frame decode; `decode_pixels` works without an explicit
+codec. Accepted: exact lossless round-trips, NEAR-bound and
+lossy-error tests, independent-encoder cross-checks, truncated-input
+robustness, 117/117 green, clippy clean. `.51`, J2K Part 2, and
+HTJ2K stay out of scope.
 
 ### P0.3 IOD validator (`dciodvfy` / `dcmvalidate`-like)
 

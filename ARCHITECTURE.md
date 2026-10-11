@@ -52,9 +52,12 @@ hyper. There are no DICOM dependencies outside this workspace.
   `decode_frame`).
 - `json.rs` — DICOM JSON Model (PS3.18 F): `dataset_to_json` /
   `dataset_from_json`, with `InlineBinary` for byte VRs.
-- `lib.rs` — `decode_pixels` / `decode_pixels_with`: native + RLE + raw
-  deflated in-tree; JPEG/JPEG 2000 families decode through the `PixelCodec`
-  plug-in trait (`Error::UnsupportedTransferSyntax` if none is installed).
+- `jpeg.rs` / `jpeg_lossless.rs` / `jpeg_ls.rs` / `jpeg_2000.rs` —
+  bundled `PixelCodec` backends (`.50`, `.70`, `.80`/`.81`, `.90`/`.91`).
+- `lib.rs` — `decode_pixels` / `decode_pixels_with` / `encode_pixels`:
+  native + RLE + raw deflated in-tree; JPEG families via the passed
+  `PixelCodec` (`BundledCodec::default()` covers all six bundled
+  syntaxes; `Error::UnsupportedTransferSyntax` if none is installed).
 - `dump.rs` — `dump_dataset` human-readable text dump (backs `dcmdump`).
 
 ## vyna-dcm-net — DIMSE networking
@@ -139,7 +142,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Test layout
 
-91 unit tests live next to the code (`#[cfg(test)]` modules), 5 doc tests
+111 unit tests live next to the code (`#[cfg(test)]` modules), 6 doc tests
 on the crate roots. Network tests bind `127.0.0.1:0` (ephemeral ports)
 with in-process SCP peers — no fixed ports, no external services.
 Feature-gated tests (`tls`, `server`) compile out with their features.

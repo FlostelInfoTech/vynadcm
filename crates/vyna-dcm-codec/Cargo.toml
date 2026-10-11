@@ -16,4 +16,11 @@ bytes.workspace = true
 flate2.workspace = true
 serde_json.workspace = true
 
+jpeg-decoder.workspace = true
+jpeg-encoder.workspace = true
+pure_jpegls.workspace = true
+pure_jpegli.workspace = true
+openjp2.workspace = true
+
 [dev-dependencies]
+pure_jpeg2k = "2"

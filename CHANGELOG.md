@@ -14,6 +14,11 @@ the workspace crate version (`Cargo.toml`).
   `lookup_private` and `Tag` reservation mechanics.
 - `Vr::Sv` (signed 64-bit) with decode/encode/JSON support;
   35 VR variants including retired `SI`.
+- Bundled JPEG pixel codecs (`BundledCodec` + `encode_pixels`):
+  `.50` baseline, `.70` lossless, `.80`/`.81` JPEG-LS, `.90`/`.91`
+  JPEG 2000 (pure Rust; `openjp2` vendored with a null-`dealloc`
+  patch, see `vendor/openjp2/README.VYNA.md`). Multi-frame decode
+  via Basic Offset Table or one fragment per frame; 117 tests green.
 
 ## [0.1.0] — 2026-10-11
 

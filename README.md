@@ -37,7 +37,7 @@ Requires Rust 1.98+ (edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace        # 91 unit + 5 doc tests
+cargo test --workspace        # 111 unit + 6 doc tests
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
@@ -97,11 +97,11 @@ vyna-dcm = { git = "https://gitlab.flostel.com/alexshao/VynaDCM", version = "0.1
 
 ## Scope notes
 
-- Pixel data: native (uncompressed), RLE Lossless, and Deflated are decoded
-  in-tree; all four uncompressed syntaxes (including retired Big Endian)
-  round-trip. JPEG / JPEG 2000 families are negotiated end-to-end but pixel
-  decoding goes through the `PixelCodec` plug-in trait — bring your own
-  decoder.
+- Pixel data: native (uncompressed), RLE Lossless, Deflated, and the JPEG
+  families (`.50`, `.70`, `.80`/`.81`, `.90`/`.91`, via the bundled
+  `BundledCodec`) are decoded and encoded in-tree; all four uncompressed
+  syntaxes (including retired Big Endian) round-trip. JPEG Extended
+  12-bit, J2K Part 2, and HTJ2K remain unsupported.
 - `vyna-dcm-ecg` covers resting 12-lead ECG (General ECG / 12-Lead SOP
   instances); it is a mapping helper, not an acquisition driver.
 - Part-10 → JSON → Part-10 normalizes DS float formatting (`500` →

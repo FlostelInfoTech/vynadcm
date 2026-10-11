@@ -83,6 +83,10 @@ def main() -> int:
             comp["hashes"] = [{"alg": "SHA-256", "content": digest}]
         if is_member:
             comp["description"] = "VynaDCM workspace member (proprietary)"
+        elif not digest and pkg.get("source") is None:
+            comp["description"] = (
+                f"Vendored path dependency (see vendor/{pkg['name']}/README.VYNA.md)"
+            )
         components.append(comp)
 
     root = next(p for p in meta["packages"] if p["name"] == "vyna-dcm")

@@ -9,7 +9,7 @@
 | Applies to | VynaDCM workspace v0.1.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
-implemented baseline (96 tests green, full-dictionary update applied).
+implemented baseline (117 tests green, bundled JPEG codecs applied).
 
 ## Contents
 
@@ -117,8 +117,12 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   (PS3.18 F), incl. `InlineBinary` for byte VRs and `DataFragment`
   for encapsulated data.
 - **FR-CODEC-07 (M)** Decode native, RLE, and deflated pixel data to
-  raw bytes; route JPEG/JPEG 2000 families through a `PixelCodec`
-  plug-in trait that errors cleanly when no decoder is installed.
+  raw bytes; decode and encode the JPEG families in-tree via the
+  bundled `BundledCodec` (`.50` baseline, `.70` lossless, `.80`/`.81`
+  JPEG-LS, `.90`/`.91` JPEG 2000, single- and multi-frame). The
+  `PixelCodec` trait stays as the override point and errors cleanly
+  when no codec is installed; `.51` (12-bit), J2K Part 2, and HTJ2K
+  remain unsupported.
 - **FR-CODEC-08 (S)** Render human-readable text dumps
   (`(GGGG,EEEE) VR [value] # keyword`).
 
@@ -195,7 +199,7 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **NFR-06 (M)** Determinism: encoders emit canonical output so
   dataset/Part-10/JSON round-trips are stable.
 - **NFR-07 (M)** Quality gates for every change: unit + doc tests
-  green (currently 91 + 5), `cargo clippy --workspace --all-targets`
+  green (currently 111 + 6), `cargo clippy --workspace --all-targets`
   with zero warnings, `cargo fmt --check` clean.
 - **NFR-08 (S)** Documentation: public API documented
   (`missing_docs` enforced); this SRS, the design spec, integration
@@ -203,8 +207,8 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 
 ## 5. Out of scope (v0.1)
 
-JPEG/JPEG 2000 pixel decoding in-tree (plug-in point provided);
-private-vendor dictionaries; media interchange (PS3.11/12); print
+JPEG Extended 12-bit (`.51`), JPEG 2000 Part 2, and HTJ2K pixel
+codecs; private-vendor dictionaries; media interchange (PS3.11/12); print
 management; image rendering/windowing; FIPS mode; C-MOVE destination
 auto-discovery (static directory only); IPv6-specific handling;
 ATNA audit-trail emission.
@@ -217,7 +221,7 @@ ATNA audit-trail emission.
 | FR-CODEC-01…04 | `round_trips_all_uncompressed_syntaxes`, `round_trips_part10`, `round_trips_implicit_and_deflated`, sequence/fragment tests |
 | FR-CODEC-05 | `packbits_known_vectors`, `packbits_round_trip`, `frame_round_trip_16bit`, `frame_round_trip_rgb_planar`, `frame_rejects_bad_headers` |
 | FR-CODEC-06 | `round_trips_json_model`, `rejects_bad_json` |
-| FR-CODEC-07 | native/RLE path covered indirectly via `frames_and_stow` (WADO frames); JPEG plug-in paths by `jpeg_without_codec_errors`, `jpeg_codec_declining_syntax_errors`, `jpeg_stub_codec_dispatches_frame` |
+| FR-CODEC-07 | native/RLE path covered indirectly via `frames_and_stow` (WADO frames); bundled JPEG paths by `baseline_*_roundtrip_is_close`, `lossless_roundtrips_exactly`, `near_lossless_honours_error_bound`, `flat_frames_roundtrip`, `lossy_roundtrip_is_close`, `cross_checks_against_independent_j2k`, `bundled_multi_frame_roundtrip`, `truncated_input_*`, plus the `PixelCodec` plug-in tests |
 | FR-CODEC-08 | `dump_contains_expected_lines` |
 | FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, PDU/DIMSE tests (20); live C-ECHO against third-party endpoint `0x0000` |
 | FR-NET-07 | worklist/MPPS/commitment tests |
