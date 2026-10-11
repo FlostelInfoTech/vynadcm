@@ -11,7 +11,7 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 
 | Crate | Purpose |
 |---|---|
-| `vyna-dcm-core` | Tags, 34 VRs, `DataSet`, 266-entry PS3.6 dictionary, UIDs, 16 transfer syntaxes |
+| `vyna-dcm-core` | Tags, 35 VRs, `DataSet`, full PS3.6 + private dictionaries, UIDs, 16 transfer syntaxes |
 | `vyna-dcm-codec` | Dataset codec, Part-10 files, from-scratch RLE, DICOM JSON, pixel helpers |
 | `vyna-dcm-net` | PDU/association, DIMSE SCU + SCP, MWL/MPPS/Storage-Commitment builders, TLS |
 | `vyna-dcm-web` | DICOMweb QIDO/WADO/STOW client + server, `multipart/related` codec |
@@ -28,6 +28,7 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | [docs/integration.md](docs/integration.md) | Integration guide for VynaECG / VynaLink |
 | [docs/user-guide.md](docs/user-guide.md) | CLI reference and operator walkthroughs |
 | [docs/sbom.md](docs/sbom.md) | Software bill of materials (CycloneDX) |
+| [docs/roadmap.md](docs/roadmap.md) | Ecosystem comparison and roadmap |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes |
 
 ## Quick start
@@ -36,7 +37,7 @@ Requires Rust 1.98+ (edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace        # 85 unit + 5 doc tests
+cargo test --workspace        # 91 unit + 5 doc tests
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```

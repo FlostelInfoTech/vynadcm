@@ -221,6 +221,7 @@ fn element_from_json(tag: Tag, obj: &Json) -> Result<DataElement> {
         Vr::Ul | Vr::Ol => Value::U32(ints(values, tag, u32::try_from)?),
         Vr::Sl => Value::I32(sints(values, tag, i32::try_from)?),
         Vr::Uv | Vr::Ov => Value::U64(ints(values, tag, Ok)?),
+        Vr::Sv => Value::I64(sints(values, tag, Ok)?),
         Vr::Fl | Vr::Of => Value::F32(json_floats(values, tag)?),
         Vr::Fd | Vr::Od => Value::F64(json_doubles(values, tag)?),
         Vr::Ob | Vr::Ow | Vr::Un => return Err(bad("byte VRs need InlineBinary")),
@@ -321,5 +322,14 @@ mod tests {
         assert!(dataset_from_json(&json!([1, 2])).is_err());
         assert!(dataset_from_json(&json!({"ZZZZ": {}})).is_err());
         assert!(dataset_from_json(&json!({"00100010": {"vr": "PN", "Value": [42]}})).is_err());
+    }
+
+    #[test]
+    fn parses_sv_values() {
+        let ds = dataset_from_json(&json!({"00720082": {"vr": "SV", "Value": [-5, 7]}})).unwrap();
+        match &ds.get(Tag::new(0x0072, 0x0082)).unwrap().value {
+            Value::I64(v) => assert_eq!(v, &[-5, 7]),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

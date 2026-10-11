@@ -5,6 +5,16 @@ the workspace crate version (`Cargo.toml`).
 
 ## [Unreleased]
 
+### Added
+
+- Full PS3.6 2026d dictionary (5,239 entries, retired flags,
+  generated `tags` constants) replacing the 266-entry curated table;
+  regenerate with `docs/generate-dictionary.py`.
+- Private dictionary (424 creators / 8,860 entries) with
+  `lookup_private` and `Tag` reservation mechanics.
+- `Vr::Sv` (signed 64-bit) with decode/encode/JSON support;
+  35 VR variants including retired `SI`.
+
 ## [0.1.0] — 2026-10-11
 
 Initial release: from-scratch DICOM workspace for VynaECG and VynaLink.

@@ -17,15 +17,20 @@ hyper. There are no DICOM dependencies outside this workspace.
 ## vyna-dcm-core — data model
 
 - `tag.rs` — `Tag(GGGG,EEEE)`, group/element accessors, delimiter tags.
-- `vr.rs` — `Vr` enum: all 34 Value Representations with text/binary
-  classification and fixed-width sizes.
+- `vr.rs` — `Vr` enum: all 35 Value Representations (34 standard +
+  retired `SI`) with text/binary classification and fixed-width sizes.
 - `value.rs` — `Value` (typed multi-value storage incl. sequences and
   pixel fragments), `DataElement`, `FragmentSequence`.
 - `dataset.rs` — `DataSet`: ordered element map with typed getters
   (`string`, `uint16`, `sequence`, …) and builders (`put_text`,
   `put_sequence`, …).
-- `dictionary.rs` — curated PS3.6 table: 266 `DictEntry`s (tag, VR, VM,
-  keyword, name) sorted for binary search, plus the `tags` constant module.
+- `dictionary.rs` + `dictionary_generated.rs` — full PS3.6 registry:
+  5,239 `DictEntry`s (tag, VR, VM, keyword, name, retired flag) sorted
+  for binary search, plus hand-written and generated `tags` constants.
+  Regenerate with `docs/generate-dictionary.py`.
+- `private_generated.rs` — private dictionary: 424 creators, 8,860
+  entries keyed by creator/group/suffix with wildcard fallbacks;
+  `lookup_private` + `Tag` reservation mechanics.
 - `transfer_syntax.rs` — `TransferSyntax`: 16 UIDs with wire properties
   (endianness, implicit/explicit VR, deflated, encapsulated). `Default` is
   Explicit VR Little Endian; Implicit VR LE is documented as the DICOM
@@ -134,7 +139,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Test layout
 
-85 unit tests live next to the code (`#[cfg(test)]` modules), 5 doc tests
+91 unit tests live next to the code (`#[cfg(test)]` modules), 5 doc tests
 on the crate roots. Network tests bind `127.0.0.1:0` (ephemeral ports)
 with in-process SCP peers — no fixed ports, no external services.
 Feature-gated tests (`tls`, `server`) compile out with their features.

@@ -11,6 +11,7 @@ updated with every release.
 | [Integration guide](integration.md) | VynaECG / VynaLink developers | Dependency setup, recipes, TLS, plug-ins (snippets compile-checked) |
 | [User guide](user-guide.md) | Operators, support | CLI reference, walkthroughs, troubleshooting |
 | [SBOM](sbom.md) | Compliance, security | Bill of materials ([CycloneDX JSON](sbom.cyclonedx.json)) + regeneration |
+| [Roadmap](roadmap.md) | Product, developers | Ecosystem comparison and prioritized plan |
 | [Architecture](../ARCHITECTURE.md) | Everyone | One-page layer and module map |
 
 Also at the repository root: [README](../README.md) (quick start),

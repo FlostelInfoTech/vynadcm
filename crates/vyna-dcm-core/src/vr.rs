@@ -1,4 +1,5 @@
-//! Value Representations (VR): the 34 two-letter DICOM data types.
+//! Value Representations (VR): the 34 standard two-letter DICOM data
+//! types plus retired `SI` (35 variants total).
 //!
 //! See NEMA PS3.5 §6.2. Explicit VR transfer syntaxes encode the VR on the
 //! wire; implicit VR transfer syntaxes derive it from the data dictionary.
@@ -37,6 +38,7 @@ pub enum Vr {
     Sq,
     Ss,
     St,
+    Sv,
     Tm,
     Uc,
     Ui,
@@ -49,8 +51,8 @@ pub enum Vr {
 }
 
 impl Vr {
-    /// All 34 VRs in alphabetical order.
-    pub const ALL: [Vr; 34] = [
+    /// All 35 VRs in alphabetical order (including retired `SI`).
+    pub const ALL: [Vr; 35] = [
         Vr::Ae,
         Vr::As,
         Vr::At,
@@ -76,6 +78,7 @@ impl Vr {
         Vr::Sq,
         Vr::Ss,
         Vr::St,
+        Vr::Sv,
         Vr::Tm,
         Vr::Uc,
         Vr::Ui,
@@ -116,6 +119,7 @@ impl Vr {
             Vr::Sq => "SQ",
             Vr::Ss => "SS",
             Vr::St => "ST",
+            Vr::Sv => "SV",
             Vr::Tm => "TM",
             Vr::Uc => "UC",
             Vr::Ui => "UI",
@@ -138,7 +142,7 @@ impl Vr {
     /// Parse from two raw bytes; `None` for unknown codes.
     #[must_use]
     pub const fn from_bytes(b: [u8; 2]) -> Option<Vr> {
-        // `const` compatible linear scan over the 34 codes.
+        // `const` compatible linear scan over the 35 codes.
         let mut i = 0;
         while i < Self::ALL.len() {
             let vr = Self::ALL[i];
@@ -222,7 +226,7 @@ impl Vr {
     pub const fn unit_size(self) -> usize {
         match self {
             Vr::At | Vr::Fl | Vr::Of | Vr::Sl | Vr::Ul => 4,
-            Vr::Fd | Vr::Od | Vr::Ov | Vr::Uv => 8,
+            Vr::Fd | Vr::Od | Vr::Ov | Vr::Sv | Vr::Uv => 8,
             Vr::Ow | Vr::Ss | Vr::Us => 2,
             Vr::Ol | Vr::Si => 4,
             Vr::Sq => 0,
@@ -251,7 +255,7 @@ mod tests {
 
     #[test]
     fn all_vrs_round_trip() {
-        assert_eq!(Vr::ALL.len(), 34);
+        assert_eq!(Vr::ALL.len(), 35);
         for vr in Vr::ALL {
             assert_eq!(Vr::from_bytes(vr.code()), Some(vr));
             assert_eq!(vr.to_string().parse::<Vr>().unwrap(), vr);

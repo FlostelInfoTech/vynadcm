@@ -552,6 +552,7 @@ fn decode_primitive(tag: Tag, vr: Vr, raw: &[u8], little: bool) -> Result<Value>
         Vr::Ul | Vr::Ol => Ok(Value::U32(numerics(raw, 4, little, u32_from, tag, vr)?)),
         Vr::Sl => Ok(Value::I32(numerics(raw, 4, little, i32_from, tag, vr)?)),
         Vr::Uv | Vr::Ov => Ok(Value::U64(numerics(raw, 8, little, u64_from, tag, vr)?)),
+        Vr::Sv => Ok(Value::I64(numerics(raw, 8, little, i64_from, tag, vr)?)),
         Vr::Fl | Vr::Of => Ok(Value::F32(numerics(raw, 4, little, f32_from, tag, vr)?)),
         Vr::Fd | Vr::Od => Ok(Value::F64(numerics(raw, 8, little, f64_from, tag, vr)?)),
         Vr::Ob | Vr::Ow | Vr::Un | Vr::Si => {
@@ -615,6 +616,9 @@ fn u64_from(c: &[u8], little: bool) -> u64 {
     } else {
         u64::from_be_bytes(b)
     }
+}
+fn i64_from(c: &[u8], little: bool) -> i64 {
+    u64_from(c, little) as i64
 }
 fn f32_from(c: &[u8], little: bool) -> f32 {
     f32::from_bits(u32_from(c, little))
@@ -755,5 +759,18 @@ mod tests {
         let bad = [0x28, 0x00, 0x10, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
         let err = decode_dataset(&bad, TransferSyntax::ImplicitVrLittleEndian).unwrap_err();
         assert!(matches!(err, Error::BadUndefinedLength { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn decodes_sv_values() {
+        // (0072,0082) SV len 16: [-5, 7] little-endian.
+        let mut bytes = vec![0x72, 0x00, 0x82, 0x00, b'S', b'V', 16, 0];
+        bytes.extend((-5i64).to_le_bytes());
+        bytes.extend(7i64.to_le_bytes());
+        let ds = explicit_le(&bytes).unwrap();
+        match &ds.get(Tag::new(0x0072, 0x0082)).unwrap().value {
+            Value::I64(v) => assert_eq!(v, &[-5, 7]),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

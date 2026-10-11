@@ -3,7 +3,7 @@
 //! Dependency-light foundation shared by every other crate:
 //!
 //! - [`Tag`] — `(GGGG,EEEE)` attribute identifiers
-//! - [`Vr`] — the 34 Value Representations
+//! - [`Vr`] — the 35 Value Representations (incl. retired `SI`)
 //! - [`DataElement`] / [`Value`] / [`DataSet`] — the in-memory dataset
 //! - [`dictionary`] — curated PS3.6 public dictionary + [`tags`] constants
 //! - [`TransferSyntax`] — transfer syntax UIDs and wire properties
@@ -26,8 +26,10 @@
 mod dataset;
 mod datetime;
 mod dictionary;
+mod dictionary_generated;
 mod error;
 mod person_name;
+mod private_generated;
 mod tag;
 mod transfer_syntax;
 mod uid;
@@ -41,6 +43,7 @@ pub use dictionary::{
 };
 pub use error::{Error, Result};
 pub use person_name::{NameComponents, PersonName};
+pub use private_generated::{PrivateEntry, lookup_private};
 pub use tag::{Tag, delimiter};
 pub use transfer_syntax::TransferSyntax;
 pub use uid::{

@@ -8,7 +8,8 @@
 | Status | Living draft — updated with every release |
 | Applies to | VynaDCM workspace v0.1.0 |
 
-Revision history: 0.1.0 (2026-10-11) — initial issue.
+Revision history: 0.1.0 (2026-10-11) — initial issue; full-dictionary
+(P0.1) update applied same day (generated tables, private dict, `SV`).
 
 ## Contents
 
@@ -49,10 +50,11 @@ spec adds component contracts, algorithms, sequences, and invariants.
 | Type | Contract |
 |---|---|
 | `Tag` | 32-bit `(group, element)`; `Copy`, ordered; `is_delimiter()` identifies item/sequence delimiters |
-| `Vr` | 34 variants; `is_text()`, fixed byte width where applicable |
+| `Vr` | 35 variants (34 standard + retired `SI`); `is_text()`, fixed byte width where applicable |
 | `Value` | Sum type: text/numbers (per VR width) / bytes / sequences / fragments / tags / person names; `is_empty()` for QIDO pruning |
 | `DataSet` | Insertion-ordered map; typed getters return `Option` (never panic); `put_*` builders; `PartialEq` for round-trip asserts |
-| `ENTRIES` / `tags` | 266 sorted entries; `lookup(Tag)`, `lookup_keyword(&str)`; unknown (incl. private) tags → `None` |
+| `ENTRIES` / `tags` | 5,239 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
+| Private dict | 424 creators / 8,860 entries via `lookup_private(creator, group, suffix)` with block + group-wildcard fallbacks; `Tag::{private_block, private_creator_element, private_suffix}` mechanics |
 | `TransferSyntax` | 16 UIDs; `is_encapsulated()`, `is_deflated()`, endianness/VR-explicitness; `Default` = Explicit VR LE |
 | `PersonName`, `Da`, `Tm` | `PersonName::parse` is infallible; `Da`/`Tm` validate (`Tm`: `HH[MM[SS[.FFFFFF]]]`, colons optional) |
 

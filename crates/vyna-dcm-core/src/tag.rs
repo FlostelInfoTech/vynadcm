@@ -55,6 +55,37 @@ impl Tag {
         self.is_private() && self.1 >= 0x0010 && self.1 <= 0x00FF
     }
 
+    /// Private reservation block (`0x10..=0xFF`) for data elements in odd
+    /// groups (element `>= 0x1000`); `None` otherwise.
+    #[must_use]
+    pub const fn private_block(self) -> Option<u8> {
+        if self.is_private() && self.1 >= 0x1000 {
+            Some((self.1 >> 8) as u8)
+        } else {
+            None
+        }
+    }
+
+    /// Private Creator element holding this data element's creator ID.
+    #[must_use]
+    pub const fn private_creator_element(self) -> Option<Tag> {
+        match self.private_block() {
+            Some(block) => Some(Tag::new(self.0, block as u16)),
+            None => None,
+        }
+    }
+
+    /// Suffix byte (low byte of the element) for private data elements;
+    /// the key into [`crate::lookup_private`]. `None` otherwise.
+    #[must_use]
+    pub const fn private_suffix(self) -> Option<u8> {
+        if self.is_private() && self.1 >= 0x1000 {
+            Some((self.1 & 0xFF) as u8)
+        } else {
+            None
+        }
+    }
+
     /// Group length element (`EEEE == 0x0000`, retired but still seen on wire).
     #[must_use]
     pub const fn is_group_length(self) -> bool {
@@ -131,6 +162,19 @@ pub mod delimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn private_reservation_mechanics() {
+        let t = Tag::new(0x0019, 0x1021);
+        assert_eq!(t.private_block(), Some(0x10));
+        assert_eq!(t.private_creator_element(), Some(Tag::new(0x0019, 0x0010)));
+        assert_eq!(t.private_suffix(), Some(0x21));
+        // Even groups, creator elements, and low elements have no block.
+        assert_eq!(Tag::new(0x0018, 0x1021).private_block(), None);
+        assert_eq!(Tag::new(0x0019, 0x0010).private_block(), None);
+        assert_eq!(Tag::new(0x0019, 0x0001).private_suffix(), None);
+        assert_eq!(Tag::new(0x0010, 0x0010).private_creator_element(), None);
+    }
 
     #[test]
     fn display_and_parse_round_trip() {

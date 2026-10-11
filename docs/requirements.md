@@ -9,7 +9,7 @@
 | Applies to | VynaDCM workspace v0.1.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
-implemented baseline (90 tests green).
+implemented baseline (96 tests green, full-dictionary update applied).
 
 ## Contents
 
@@ -42,7 +42,7 @@ waveform mapping, and operator CLI tools. Out of scope: §5.
   PS3.6 (dictionary), PS3.7 (message exchange), PS3.8 (network),
   PS3.10 (files), PS3.15 (security/TLS), PS3.18 (DICOMweb + JSON Model F)
 - `ARCHITECTURE.md`, `docs/design.md`, `docs/integration.md`,
-  `docs/user-guide.md`, `docs/sbom.md`
+  `docs/user-guide.md`, `docs/sbom.md`, `docs/roadmap.md`
 
 ### 1.4 Conventions
 
@@ -76,15 +76,21 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 
 - **FR-CORE-01 (M)** Tags: represent `(GGGG,EEEE)` tags with group /
   element accessors, command/delimiter identification, and ordering.
-- **FR-CORE-02 (M)** VRs: support all 34 DICOM Value Representations
+- **FR-CORE-02 (M)** VRs: support all 34 standard DICOM Value Representations
+  (plus retired `SI` for legacy files)
   with text/binary classification and fixed-width sizes.
 - **FR-CORE-03 (M)** Datasets: ordered element map with typed getters
   (text, numbers, UIDs, sequences, fragments) and builders; value
   multiplicity preserved.
-- **FR-CORE-04 (M)** Dictionary: ship a curated PS3.6 table (≥200
-  entries; currently 266) mapping tag → (VR, VM, keyword, name), sorted
-  for binary search, plus a `tags` constants module; private tags
-  resolve to “unknown”, never to a wrong public entry.
+- **FR-CORE-04 (M)** Dictionary: ship the full PS3.6 registry
+  (currently 5,239 entries from PS3.6 2026d plus the command group)
+  mapping tag → (VR, VM, keyword, name, retired flag), sorted for
+  binary search, plus `tags` constants; repeating (`xx`) groups stay
+  unlisted.
+- **FR-CORE-08 (M)** Private dictionary: resolve private elements by
+  creator ID, group, and suffix (currently 424 creators / 8,860
+  entries with wildcard fallbacks); unknown creators or suffixes
+  resolve to “unknown”, never to a wrong entry.
 - **FR-CORE-05 (M)** Transfer syntaxes: model 16 transfer syntax UIDs
   with wire properties (endianness, implicit/explicit VR, deflated,
   encapsulated); default to Explicit VR Little Endian.
@@ -189,7 +195,7 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **NFR-06 (M)** Determinism: encoders emit canonical output so
   dataset/Part-10/JSON round-trips are stable.
 - **NFR-07 (M)** Quality gates for every change: unit + doc tests
-  green (currently 85 + 5), `cargo clippy --workspace --all-targets`
+  green (currently 91 + 5), `cargo clippy --workspace --all-targets`
   with zero warnings, `cargo fmt --check` clean.
 - **NFR-08 (S)** Documentation: public API documented
   (`missing_docs` enforced); this SRS, the design spec, integration
@@ -207,7 +213,7 @@ ATNA audit-trail emission.
 
 | Requirement | Evidence |
 |---|---|
-| FR-CORE-01…07 | `vyna-dcm-core` unit tests (23), incl. dictionary/VR/UID/TM tests |
+| FR-CORE-01…08 | `vyna-dcm-core` unit tests (27), incl. dictionary/VR/UID/TM/private tests |
 | FR-CODEC-01…04 | `round_trips_all_uncompressed_syntaxes`, `round_trips_part10`, `round_trips_implicit_and_deflated`, sequence/fragment tests |
 | FR-CODEC-05 | `packbits_known_vectors`, `packbits_round_trip`, `frame_round_trip_16bit`, `frame_round_trip_rgb_planar`, `frame_rejects_bad_headers` |
 | FR-CODEC-06 | `round_trips_json_model`, `rejects_bad_json` |
