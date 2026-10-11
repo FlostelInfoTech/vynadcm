@@ -217,3 +217,100 @@ pub fn decode_pixels_with(
         }),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vyna_dcm_core::{DataElement, tags};
+
+    const TS_JPEG: TransferSyntax = TransferSyntax::JpegBaseline8Bit;
+
+    fn jpeg_dataset() -> DataSet {
+        DataSet::new()
+            .with(DataElement::u16_single(tags::ROWS, 2))
+            .with(DataElement::u16_single(tags::COLUMNS, 2))
+            .with(DataElement::u16_single(tags::SAMPLES_PER_PIXEL, 1))
+            .with(DataElement::u16_single(tags::BITS_ALLOCATED, 8))
+            .with(DataElement::new(
+                tags::PIXEL_DATA,
+                vyna_dcm_core::Vr::Ob,
+                vyna_dcm_core::Value::Fragments(FragmentSequence {
+                    basic_offset_table: vec![],
+                    fragments: vec![vec![0xFF, 0xD8, 0xFF, 0xD9]],
+                }),
+            ))
+    }
+
+    struct StubCodec {
+        syntaxes: Vec<TransferSyntax>,
+        frame: Vec<u8>,
+    }
+
+    impl PixelCodec for StubCodec {
+        fn syntaxes(&self) -> &[TransferSyntax] {
+            &self.syntaxes
+        }
+
+        fn decode_frame(
+            &self,
+            ts: TransferSyntax,
+            fragments: &FragmentSequence,
+            rows: u16,
+            columns: u16,
+            samples_per_pixel: u16,
+            bits_allocated: u16,
+        ) -> std::result::Result<Vec<u8>, PixelCodecError> {
+            assert_eq!(ts, TS_JPEG);
+            assert_eq!(
+                (rows, columns, samples_per_pixel, bits_allocated),
+                (2, 2, 1, 8)
+            );
+            assert_eq!(fragments.fragments.len(), 1);
+            Ok(self.frame.clone())
+        }
+
+        fn encode_frame(
+            &self,
+            _ts: TransferSyntax,
+            _raw: &[u8],
+            _rows: u16,
+            _columns: u16,
+            _samples_per_pixel: u16,
+            _bits_allocated: u16,
+        ) -> std::result::Result<FragmentSequence, PixelCodecError> {
+            Err(PixelCodecError::Codec("stub cannot encode".into()))
+        }
+    }
+
+    #[test]
+    fn jpeg_without_codec_errors() {
+        let err = decode_pixels(&jpeg_dataset(), TS_JPEG).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedTransferSyntax(ref u) if u == TS_JPEG.uid()),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn jpeg_codec_declining_syntax_errors() {
+        let codec = StubCodec {
+            syntaxes: vec![],
+            frame: vec![],
+        };
+        let err = decode_pixels_with(&jpeg_dataset(), TS_JPEG, Some(&codec)).unwrap_err();
+        assert!(
+            matches!(err, Error::UnsupportedTransferSyntax(ref u) if u == TS_JPEG.uid()),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn jpeg_stub_codec_dispatches_frame() {
+        let codec = StubCodec {
+            syntaxes: vec![TS_JPEG],
+            frame: vec![1, 2, 3, 4],
+        };
+        let raw = decode_pixels_with(&jpeg_dataset(), TS_JPEG, Some(&codec)).unwrap();
+        assert_eq!(raw, vec![1, 2, 3, 4]);
+    }
+}

@@ -36,7 +36,7 @@ Requires Rust 1.98+ (edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace        # 82 unit + 5 doc tests
+cargo test --workspace        # 85 unit + 5 doc tests
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```

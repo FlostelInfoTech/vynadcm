@@ -33,7 +33,7 @@ Initial release: from-scratch DICOM workspace for VynaECG and VynaLink.
 
 ### Quality
 
-- 82 unit + 5 doc tests green; `clippy --workspace --all-targets`
+- 85 unit + 5 doc tests green; `clippy --workspace --all-targets`
   zero warnings; `cargo fmt --check` clean; feature matrix verified.
 - Live wire interop: C-ECHO `0x0000` against a third-party endpoint.
 

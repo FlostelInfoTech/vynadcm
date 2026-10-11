@@ -134,7 +134,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Test layout
 
-82 unit tests live next to the code (`#[cfg(test)]` modules), 5 doc tests
+85 unit tests live next to the code (`#[cfg(test)]` modules), 5 doc tests
 on the crate roots. Network tests bind `127.0.0.1:0` (ephemeral ports)
 with in-process SCP peers — no fixed ports, no external services.
 Feature-gated tests (`tls`, `server`) compile out with their features.

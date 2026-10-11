@@ -9,7 +9,7 @@
 | Applies to | VynaDCM workspace v0.1.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
-implemented baseline (87 tests green).
+implemented baseline (90 tests green).
 
 ## Contents
 
@@ -189,7 +189,7 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **NFR-06 (M)** Determinism: encoders emit canonical output so
   dataset/Part-10/JSON round-trips are stable.
 - **NFR-07 (M)** Quality gates for every change: unit + doc tests
-  green (currently 82 + 5), `cargo clippy --workspace --all-targets`
+  green (currently 85 + 5), `cargo clippy --workspace --all-targets`
   with zero warnings, `cargo fmt --check` clean.
 - **NFR-08 (S)** Documentation: public API documented
   (`missing_docs` enforced); this SRS, the design spec, integration
@@ -211,7 +211,7 @@ ATNA audit-trail emission.
 | FR-CODEC-01…04 | `round_trips_all_uncompressed_syntaxes`, `round_trips_part10`, `round_trips_implicit_and_deflated`, sequence/fragment tests |
 | FR-CODEC-05 | `packbits_known_vectors`, `packbits_round_trip`, `frame_round_trip_16bit`, `frame_round_trip_rgb_planar`, `frame_rejects_bad_headers` |
 | FR-CODEC-06 | `round_trips_json_model`, `rejects_bad_json` |
-| FR-CODEC-07 | native/RLE path covered indirectly via `frames_and_stow` (WADO frames); JPEG plug-in error path has no dedicated test in v0.1 (known gap, slated for v0.2) |
+| FR-CODEC-07 | native/RLE path covered indirectly via `frames_and_stow` (WADO frames); JPEG plug-in paths by `jpeg_without_codec_errors`, `jpeg_codec_declining_syntax_errors`, `jpeg_stub_codec_dispatches_frame` |
 | FR-CODEC-08 | `dump_contains_expected_lines` |
 | FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, PDU/DIMSE tests (20); live C-ECHO against third-party endpoint `0x0000` |
 | FR-NET-07 | worklist/MPPS/commitment tests |
