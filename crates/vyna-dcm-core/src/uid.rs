@@ -61,6 +61,10 @@ pub mod sop_class {
     pub const CT_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.2";
     /// MR Image Storage.
     pub const MR_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.4";
+    /// Enhanced CT Image Storage.
+    pub const ENHANCED_CT_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.2.1";
+    /// Enhanced MR Image Storage.
+    pub const ENHANCED_MR_IMAGE: &str = "1.2.840.10008.5.1.4.1.1.4.1";
     /// Digital X-Ray Image Storage — For Presentation.
     pub const DX_PRESENTATION: &str = "1.2.840.10008.5.1.4.1.1.1.1";
     /// Digital X-Ray Image Storage — For Processing.
@@ -141,6 +145,19 @@ pub mod sop_class {
         CR_IMAGE,
         CT_IMAGE,
         MR_IMAGE,
+        ENHANCED_CT_IMAGE,
+        ENHANCED_MR_IMAGE,
+        DX_PRESENTATION,
+        DX_PROCESSING,
+        MG_PRESENTATION,
+        MG_PROCESSING,
+        US_IMAGE,
+        US_MULTIFRAME,
+        XA_IMAGE,
+        NM_IMAGE,
+        PT_IMAGE,
+        VL_PHOTOGRAPHIC,
+        KEY_OBJECT_SELECTION,
         SECONDARY_CAPTURE_IMAGE,
         TWELVE_LEAD_ECG_WAVEFORM,
         GENERAL_ECG_WAVEFORM,

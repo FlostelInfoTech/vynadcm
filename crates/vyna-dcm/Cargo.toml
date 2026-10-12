@@ -58,6 +58,16 @@ path = "src/bin/findscu.rs"
 required-features = ["cli", "net"]
 
 [[bin]]
+name = "findscp"
+path = "src/bin/findscp.rs"
+required-features = ["cli", "net"]
+
+[[bin]]
+name = "mwlscp"
+path = "src/bin/mwlscp.rs"
+required-features = ["cli", "net"]
+
+[[bin]]
 name = "dcmdump"
 path = "src/bin/dcmdump.rs"
 required-features = ["cli"]

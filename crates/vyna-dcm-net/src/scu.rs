@@ -4,7 +4,7 @@
 //! Every method returns the DIMSE status (transport/protocol problems are
 //! `Err`); use [`status::is_success`] et al. to classify statuses.
 
-use vyna_dcm_core::{DataSet, Tag};
+use vyna_dcm_core::{DataSet, Tag, TransferSyntax};
 
 use crate::{
     Error, Result,
@@ -186,14 +186,16 @@ impl Association {
     }
 
     /// C-GET: receive C-STORE sub-operations over this same association.
-    /// `on_store` gets `(sop_class_uid, sop_instance_uid, dataset)` and
-    /// returns the C-STORE-RSP status for each instance.
+    /// `on_store` gets `(sop_class_uid, sop_instance_uid, dataset,
+    /// transfer_syntax)` and returns the C-STORE-RSP status for each
+    /// instance. Encapsulated datasets arrive as-is (fragments); the
+    /// callback owns any conversion.
     pub async fn get_with(
         &mut self,
         sop_class_uid: &str,
         query: &DataSet,
         priority: u16,
-        mut on_store: impl FnMut(String, String, DataSet) -> u16,
+        mut on_store: impl FnMut(String, String, DataSet, TransferSyntax) -> u16,
     ) -> Result<MoveResult> {
         let ctx = self
             .context_for(sop_class_uid)
@@ -217,9 +219,11 @@ impl Association {
                         .affected_sop_instance_uid
                         .clone()
                         .unwrap_or_default();
-                    let s = match m.dataset {
-                        Some(ds) => on_store(class.clone(), inst.clone(), ds),
-                        None => status::PROCESSING_FAILURE,
+                    let s = match (m.dataset, self.context_by_id(m.context_id)) {
+                        (Some(ds), Some(st)) => {
+                            on_store(class.clone(), inst.clone(), ds, st.transfer_syntax)
+                        }
+                        _ => status::PROCESSING_FAILURE,
                     };
                     let rsp = Command::store_rsp(store_id, Some(class), Some(inst), s);
                     self.send(m.context_id, &rsp, None).await?;
@@ -720,7 +724,7 @@ mod tests {
                 vyna_dcm_core::sop_class::STUDY_ROOT_GET,
                 &DataSet::new(),
                 priority::MEDIUM,
-                |c, i, ds| {
+                |c, i, ds, _ts| {
                     got.push((c, i, ds));
                     status::SUCCESS
                 },

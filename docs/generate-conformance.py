@@ -401,7 +401,7 @@ for i, (name, _k, about, services, _s, _n) in enumerate(scp_tools, 1):
     add("")
     add(f"- Services handled: {', '.join(services)}.")
     add("")
-add("Acceptance policy (library defaults, shared by both SCPs): any")
+add("Acceptance policy (library defaults, shared by all SCP tools): any")
 add("proposed SOP Class is accepted (`accepted_sop_classes: None`); all")
 add(f"{len(ts_uid)} transfer syntaxes of Annex B are accepted; Called-AE")
 add("is not enforced unless `--strict-ae` is passed; no User Identity")

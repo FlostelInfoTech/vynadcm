@@ -58,8 +58,24 @@ async fn main() -> Result<()> {
     let mut count = 0u32;
     let dir = &args.output_dir;
     let r = assoc
-        .get_with(sop, &query, 0, |class: String, inst: String, ds| {
-            // Decoded datasets are syntax-agnostic; store Explicit LE.
+        .get_with(sop, &query, 0, |class: String, inst: String, ds, ts| {
+            // Encapsulated arrivals transcode to native; store Explicit LE.
+            let ds = if ts.is_encapsulated() {
+                match vyna_dcm::transcode_dataset(
+                    &ds,
+                    ts,
+                    TransferSyntax::ExplicitVrLittleEndian,
+                    &vyna_dcm::TranscodeOptions::default(),
+                ) {
+                    Ok(ds) => ds,
+                    Err(e) => {
+                        println!("transcode failed for {inst}: {e}");
+                        return 0xA900; // dataset does not match SOP class
+                    }
+                }
+            } else {
+                ds
+            };
             let meta = FileMeta::new(&class, &inst, TransferSyntax::ExplicitVrLittleEndian);
             let path = dir.join(format!("{}.dcm", safe_instance_filename(&inst)));
             match vyna_dcm::write_part10(&meta, &ds) {

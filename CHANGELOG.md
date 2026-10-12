@@ -100,6 +100,13 @@ the workspace crate version (`Cargo.toml`).
   tables validated with fragment-per-frame fallback (RLE and JPEG
   arms), subsampled (422) RLE refused instead of written
   non-standard; 256 tests green.
+- Query/Retrieve + Worklist SCP: `net::qrdb` (file-backed index,
+  C-FIND single/wildcard/range/list/sequence matching with level
+  grouping) plus `findscp` (QR FIND/MOVE/GET, `--route` AE table)
+  and `mwlscp` (worklist FIND) CLIs; `get_with` now reports each
+  instance's transfer syntax so `getscu` transcodes encapsulated
+  arrivals to native, and default C-GET storage proposals cover the
+  enhanced/common image classes; 267 tests green.
 
 ## [0.1.0] — 2026-10-11
 

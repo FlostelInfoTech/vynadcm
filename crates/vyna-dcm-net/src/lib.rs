@@ -39,6 +39,7 @@ mod association;
 pub mod dimse;
 mod error;
 pub mod pdu;
+pub mod qrdb;
 mod scu;
 pub mod service;
 #[cfg(feature = "tls")]

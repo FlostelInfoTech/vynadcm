@@ -144,7 +144,14 @@ spec adds component contracts, algorithms, sequences, and invariants.
   and emits pending/final responses with sub-operation counts. Without
   `move_config`, C-MOVE fails with Move Destination Unknown.
 - C-GET: same instance flow over the *same* association; a C-CANCEL
-  for the GET aborts delivery and answers CANCEL.
+  for the GET aborts delivery and answers CANCEL. `get_with` hands the
+  callback each instance's negotiated transfer syntax so receivers can
+  transcode encapsulated arrivals (`getscu` stores Explicit LE).
+- QR/MWL SCP (`qrdb.rs`): `QrIndex::scan` walks a directory of Part-10
+  files (pixels/overlays stripped, failures skipped); `dataset_matches`
+  implements single/wildcard/range/list/sequence matching with level
+  grouping; `QrScp`/`MwlScp` implement `Handlers` (FIND/MOVE/GET and
+  worklist FIND), MOVE/GET re-reading matched files in full.
 - `storage_commit` (`scu.rs`): N-ACTION request (action type 1),
   then a single `recv` for the same-association N-EVENT-REPORT
   (event type 1 only); acknowledges it SUCCESS and parses the

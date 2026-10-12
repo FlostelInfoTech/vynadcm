@@ -135,6 +135,24 @@ getscu --connect 127.0.0.1:11112 --output-dir ./got -k StudyInstanceUID=1.2.3
 - `-k/--key` works exactly as in `findscu`, including the derived
   Query/Retrieve Level.
 - The destination AE must be known to the *peer*, not to `movescu`.
+- `getscu` stores Explicit LE, transcoding encapsulated arrivals.
+
+### Serve: findscp / mwlscp
+
+```sh
+# Index a directory and serve QR FIND/MOVE/GET (all three models)
+findscp --bind 127.0.0.1:11112 ./store --route DEST=127.0.0.1:11113
+
+# Serve Modality Worklist FIND from worklist files
+mwlscp --bind 127.0.0.1:11112 ./worklist
+```
+
+- Both index Part-10 files recursively at startup (pixel data
+  stripped; unreadable files skipped with a warning) and match
+  single values, wildcards (`*`/`?`), UID lists, date/time and
+  numeric ranges, and nested sequence keys.
+- Without `--route` entries, C-MOVE fails cleanly with Move
+  Destination Unknown; C-FIND and C-GET still work.
 
 ### MPPS and Storage Commitment: mppsscu / stgcmtscu
 

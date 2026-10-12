@@ -25,6 +25,8 @@ Implementation Class UID
 | `stgcmtscu` | `VYNA_SCU` | SCU | N-ACTION + N-EVENT-REPORT (commitment) |
 | `echoscp` | `VYNA_SCP` | SCP | C-ECHO (all other services use rejecting defaults) |
 | `storescp` | `VYNA_SCP` | SCP | C-STORE |
+| `findscp` | `VYNA_SCP` | SCP | C-FIND, C-MOVE, C-GET |
+| `mwlscp` | `VYNA_SCP` | SCP | C-FIND |
 
 Application data flow is tool-to-peer over one TCP association per
 invocation: SCU tools connect, negotiate, perform their service, and
@@ -80,18 +82,31 @@ release/abort, and loop.
   - Study Root Q/R — GET (`1.2.840.10008.5.1.4.1.2.2.3`).
   - Patient Root Q/R — GET (`1.2.840.10008.5.1.4.1.2.1.3`).
   - Computed Radiography Image Storage (`1.2.840.10008.5.1.4.1.1.1`).
+  - Digital X-Ray Image Storage — For Presentation (`1.2.840.10008.5.1.4.1.1.1.1`).
+  - Digital X-Ray Image Storage — For Processing (`1.2.840.10008.5.1.4.1.1.1.1.1`).
+  - Digital Mammography X-Ray Image Storage — For Presentation (`1.2.840.10008.5.1.4.1.1.1.2`).
+  - Digital Mammography X-Ray Image Storage — For Processing (`1.2.840.10008.5.1.4.1.1.1.2.1`).
   - CT Image Storage (`1.2.840.10008.5.1.4.1.1.2`).
+  - Enhanced CT Image Storage (`1.2.840.10008.5.1.4.1.1.2.1`).
+  - Ultrasound Multi-frame Image Storage (`1.2.840.10008.5.1.4.1.1.3.1`).
   - MR Image Storage (`1.2.840.10008.5.1.4.1.1.4`).
+  - Enhanced MR Image Storage (`1.2.840.10008.5.1.4.1.1.4.1`).
+  - Ultrasound Image Storage (single-frame) (`1.2.840.10008.5.1.4.1.1.6.1`).
   - Secondary Capture Image Storage (`1.2.840.10008.5.1.4.1.1.7`).
   - 12-Lead ECG Waveform Storage (`1.2.840.10008.5.1.4.1.1.9.1.1`).
   - General ECG Waveform Storage (`1.2.840.10008.5.1.4.1.1.9.1.2`).
   - Ambulatory ECG Waveform Storage (`1.2.840.10008.5.1.4.1.1.9.1.3`).
   - Hemodynamic Waveform Storage (`1.2.840.10008.5.1.4.1.1.9.2.1`).
+  - X-Ray Angiographic Image Storage (`1.2.840.10008.5.1.4.1.1.12.1`).
+  - Nuclear Medicine Image Storage (`1.2.840.10008.5.1.4.1.1.20`).
+  - VL Photographic Image Storage (`1.2.840.10008.5.1.4.1.1.77.1.4`).
   - Basic Text SR Storage (`1.2.840.10008.5.1.4.1.1.88.11`).
   - Enhanced SR Storage (`1.2.840.10008.5.1.4.1.1.88.22`).
   - Comprehensive SR Storage (`1.2.840.10008.5.1.4.1.1.88.33`).
+  - Key Object Selection Document Storage (`1.2.840.10008.5.1.4.1.1.88.59`).
   - Encapsulated PDF Storage (`1.2.840.10008.5.1.4.1.1.104.1`).
   - Encapsulated CDA Storage (`1.2.840.10008.5.1.4.1.1.104.2`).
+  - Positron Emission Tomography Image Storage (`1.2.840.10008.5.1.4.1.1.128`).
 - Transfer syntaxes proposed: Explicit VR Little Endian and
   Implicit VR Little Endian.
 
@@ -121,7 +136,15 @@ release/abort, and loop.
 
 - Services handled: C-STORE.
 
-Acceptance policy (library defaults, shared by both SCPs): any
+#### 3.2.3 `findscp` — Serve C-FIND/C-MOVE/C-GET from a directory
+
+- Services handled: C-FIND, C-MOVE, C-GET.
+
+#### 3.2.4 `mwlscp` — Serve MWL C-FIND from a directory
+
+- Services handled: C-FIND.
+
+Acceptance policy (library defaults, shared by all SCP tools): any
 proposed SOP Class is accepted (`accepted_sop_classes: None`); all
 16 transfer syntaxes of Annex B are accepted; Called-AE
 is not enforced unless `--strict-ae` is passed; no User Identity
@@ -217,29 +240,31 @@ authentication unless the embedding application installs the
 | Storage Commitment Pull Model | `1.2.840.10008.1.20.2` | N-service (commitment) |
 | Modality Performed Procedure Step | `1.2.840.10008.3.1.2.3.3` | N-service (MPPS) |
 | Computed Radiography Image Storage | `1.2.840.10008.5.1.4.1.1.1` | Storage |
-| Digital X-Ray Image Storage — For Presentation | `1.2.840.10008.5.1.4.1.1.1.1` | Storage (defined; not in default proposals) |
-| Digital X-Ray Image Storage — For Processing | `1.2.840.10008.5.1.4.1.1.1.1.1` | Storage (defined; not in default proposals) |
-| Digital Mammography X-Ray Image Storage — For Presentation | `1.2.840.10008.5.1.4.1.1.1.2` | Storage (defined; not in default proposals) |
-| Digital Mammography X-Ray Image Storage — For Processing | `1.2.840.10008.5.1.4.1.1.1.2.1` | Storage (defined; not in default proposals) |
+| Digital X-Ray Image Storage — For Presentation | `1.2.840.10008.5.1.4.1.1.1.1` | Storage |
+| Digital X-Ray Image Storage — For Processing | `1.2.840.10008.5.1.4.1.1.1.1.1` | Storage |
+| Digital Mammography X-Ray Image Storage — For Presentation | `1.2.840.10008.5.1.4.1.1.1.2` | Storage |
+| Digital Mammography X-Ray Image Storage — For Processing | `1.2.840.10008.5.1.4.1.1.1.2.1` | Storage |
 | CT Image Storage | `1.2.840.10008.5.1.4.1.1.2` | Storage |
-| Ultrasound Multi-frame Image Storage | `1.2.840.10008.5.1.4.1.1.3.1` | Storage (defined; not in default proposals) |
+| Enhanced CT Image Storage | `1.2.840.10008.5.1.4.1.1.2.1` | Storage |
+| Ultrasound Multi-frame Image Storage | `1.2.840.10008.5.1.4.1.1.3.1` | Storage |
 | MR Image Storage | `1.2.840.10008.5.1.4.1.1.4` | Storage |
-| Ultrasound Image Storage (single-frame) | `1.2.840.10008.5.1.4.1.1.6.1` | Storage (defined; not in default proposals) |
+| Enhanced MR Image Storage | `1.2.840.10008.5.1.4.1.1.4.1` | Storage |
+| Ultrasound Image Storage (single-frame) | `1.2.840.10008.5.1.4.1.1.6.1` | Storage |
 | Secondary Capture Image Storage | `1.2.840.10008.5.1.4.1.1.7` | Storage |
 | 12-Lead ECG Waveform Storage | `1.2.840.10008.5.1.4.1.1.9.1.1` | Storage |
 | General ECG Waveform Storage | `1.2.840.10008.5.1.4.1.1.9.1.2` | Storage |
 | Ambulatory ECG Waveform Storage | `1.2.840.10008.5.1.4.1.1.9.1.3` | Storage |
 | Hemodynamic Waveform Storage | `1.2.840.10008.5.1.4.1.1.9.2.1` | Storage |
-| X-Ray Angiographic Image Storage | `1.2.840.10008.5.1.4.1.1.12.1` | Storage (defined; not in default proposals) |
-| Nuclear Medicine Image Storage | `1.2.840.10008.5.1.4.1.1.20` | Storage (defined; not in default proposals) |
-| VL Photographic Image Storage | `1.2.840.10008.5.1.4.1.1.77.1.4` | Storage (defined; not in default proposals) |
+| X-Ray Angiographic Image Storage | `1.2.840.10008.5.1.4.1.1.12.1` | Storage |
+| Nuclear Medicine Image Storage | `1.2.840.10008.5.1.4.1.1.20` | Storage |
+| VL Photographic Image Storage | `1.2.840.10008.5.1.4.1.1.77.1.4` | Storage |
 | Basic Text SR Storage | `1.2.840.10008.5.1.4.1.1.88.11` | Storage |
 | Enhanced SR Storage | `1.2.840.10008.5.1.4.1.1.88.22` | Storage |
 | Comprehensive SR Storage | `1.2.840.10008.5.1.4.1.1.88.33` | Storage |
-| Key Object Selection Document Storage | `1.2.840.10008.5.1.4.1.1.88.59` | Storage (defined; not in default proposals) |
+| Key Object Selection Document Storage | `1.2.840.10008.5.1.4.1.1.88.59` | Storage |
 | Encapsulated PDF Storage | `1.2.840.10008.5.1.4.1.1.104.1` | Storage |
 | Encapsulated CDA Storage | `1.2.840.10008.5.1.4.1.1.104.2` | Storage |
-| Positron Emission Tomography Image Storage | `1.2.840.10008.5.1.4.1.1.128` | Storage (defined; not in default proposals) |
+| Positron Emission Tomography Image Storage | `1.2.840.10008.5.1.4.1.1.128` | Storage |
 | RT Dose Storage | `1.2.840.10008.5.1.4.1.1.481.2` | Storage (defined; not in default proposals) |
 | RT Structure Set Storage | `1.2.840.10008.5.1.4.1.1.481.3` | Storage (defined; not in default proposals) |
 | RT Plan Storage | `1.2.840.10008.5.1.4.1.1.481.5` | Storage (defined; not in default proposals) |
