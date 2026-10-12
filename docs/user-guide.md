@@ -178,6 +178,20 @@ lossy history tags; lossless targets keep the UID. Quality knobs
 target and are rejected otherwise. Palette images and `.51`/J2K
 Part 2/HTJ2K are not supported.
 
+`dcmdir` builds a media index from files or directories (scanned
+recursively; unreadable finds are skipped with a warning while
+explicit files must parse), and `--list` prints one back:
+
+```sh
+dcmdir --output /media/USB/DICOMDIR --file-set-id CARDIO /media/USB
+dcmdir --list /media/USB/DICOMDIR
+```
+
+Every indexed file must sit under the output directory so its File
+ID stays relative; record types map from SOP Class (`IMAGE`, `RT
+DOSE`, `SR DOCUMENT`, …). Skipped records print with their reason
+rather than failing the import.
+
 Note: JSON round-trips normalize `DS` float formatting (`500` →
 `500.0`); values stay numerically identical.
 

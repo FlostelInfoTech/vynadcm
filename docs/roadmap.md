@@ -96,8 +96,14 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   422 length math. Accepted: 16 transcode tests incl. exact lossless
   matrix, 161/161 tests, clippy clean. Out of scope (documented):
   palette expansion, `YBR_PARTIAL_*`, SOP-constrains-syntax checks.
-- **DICOMDIR read/create** (`dcmdir`/`dcmgpdir`, pydicom filesets):
-  media import for VynaLink.
+- **DICOMDIR read/create** (`dcmdir`/`dcmgpdir`, pydicom filesets)
+  — DONE: shipped `read_dicomdir` (offset-exact link following,
+  skips reported) + `build_dicomdir` (grouped records, measured
+  two-pass offsets) plus the `dcmdir` create/`--list` CLI.
+  Accepted: every emitted link verified to point at an item tag,
+  10 dicomdir tests, 171/171 tests, clippy clean. Out of scope
+  (documented): `MRDR` following, pydicom cross-read (no
+  independent reader available here).
 - **WADO-URI client**: retired but still widely deployed on legacy
   PACS; complements the RS client.
 - **Missing SCU tools** (`movescu`, `getscu`, `mppsscu`,

@@ -42,6 +42,10 @@ the workspace crate version (`Cargo.toml`).
 - Fixes: `.50` color encodes now use DICOM-mandated 4:2:2 sampling
   (was 4:4:4/4:2:0 depending on quality); native/RLE pixel length
   math is `YBR_FULL_422`-aware.
+- DICOMDIR read/create (`read_dicomdir` + `build_dicomdir` +
+  `dcmdir` CLI): offset-exact links via measured item capture,
+  patient → study → series → instance trees, reported skips;
+  171 tests green.
 
 ## [0.1.0] — 2026-10-11
 

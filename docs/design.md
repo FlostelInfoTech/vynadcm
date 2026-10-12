@@ -90,6 +90,13 @@ spec adds component contracts, algorithms, sequences, and invariants.
   in tests). Target photometrics (`.50`→422, `.90`→RCT, `.91`→ICT),
   ≤64 KiB refragmentation with offset tables, lossy flag/ratio/method
   history, fresh SOP UID on lossy targets.
+- `dicomdir::{read_dicomdir, build_dicomdir}`: media directory
+  read/create. Both sides use measured sequence-item offsets
+  (`decode/encode_dataset_capture_items`, inert unless asked):
+  the reader follows next/lower links with loop/dangling checks
+  and reports skips; the writer groups patient → study → series,
+  copies record keys, and stamps offsets in a layout-stable second
+  pass (Explicit LE, `MRDR` not followed).
 - `dataset_to_json` / `dataset_from_json`: PS3.18 F; byte VRs use
   `InlineBinary` (base64); `DS`/`IS` accept JSON numbers or strings.
   Known normalization: Part-10 → JSON → Part-10 rewrites DS lexical

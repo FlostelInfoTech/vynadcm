@@ -127,6 +127,14 @@ pub mod sop_class {
     pub const STORAGE_COMMITMENT_PUSH: &str = "1.2.840.10008.1.20.1";
     /// Storage Commitment Pull Model.
     pub const STORAGE_COMMITMENT_PULL: &str = "1.2.840.10008.1.20.2";
+    /// Media Storage Directory Storage (DICOMDIR).
+    pub const MEDIA_STORAGE_DIRECTORY: &str = "1.2.840.10008.1.3.10";
+    /// RT Dose Storage.
+    pub const RT_DOSE: &str = "1.2.840.10008.5.1.4.1.1.481.2";
+    /// RT Structure Set Storage.
+    pub const RT_STRUCTURE_SET: &str = "1.2.840.10008.5.1.4.1.1.481.3";
+    /// RT Plan Storage.
+    pub const RT_PLAN: &str = "1.2.840.10008.5.1.4.1.1.481.5";
 
     /// All storage SOP classes this library proposes by default.
     pub const DEFAULT_STORAGE_CLASSES: &[&str] = &[

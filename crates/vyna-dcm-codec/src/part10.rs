@@ -148,9 +148,8 @@ pub fn read_part10(bytes: &[u8]) -> Result<(FileMeta, DataSet)> {
     Ok((meta, dataset))
 }
 
-/// Write a Part-10 file: preamble + `DICM` + meta + dataset.
-pub fn write_part10(meta: &FileMeta, dataset: &DataSet) -> Result<Vec<u8>> {
-    let ts = meta.transfer_syntax()?;
+/// Encode the file-meta section: group length element + meta elements.
+fn encode_meta_section(meta: &FileMeta) -> Result<Vec<u8>> {
     let meta_ds = meta.to_dataset();
     // Encode once to measure, then prepend the group length.
     let mut meta_body = encode_dataset(&meta_ds, TransferSyntax::ExplicitVrLittleEndian)?;
@@ -161,6 +160,18 @@ pub fn write_part10(meta: &FileMeta, dataset: &DataSet) -> Result<Vec<u8>> {
     meta_full.extend_from_slice(&[0x04, 0x00]);
     meta_full.extend_from_slice(&group_len.to_le_bytes());
     meta_full.append(&mut meta_body);
+    Ok(meta_full)
+}
+
+/// Length of the encoded file-meta section (for DICOMDIR offsets).
+pub(crate) fn meta_section_len(meta: &FileMeta) -> Result<usize> {
+    encode_meta_section(meta).map(|v| v.len())
+}
+
+/// Write a Part-10 file: preamble + `DICM` + meta + dataset.
+pub fn write_part10(meta: &FileMeta, dataset: &DataSet) -> Result<Vec<u8>> {
+    let ts = meta.transfer_syntax()?;
+    let meta_full = encode_meta_section(meta)?;
 
     let data = encode_dataset(dataset, ts)?;
     let mut out = Vec::with_capacity(PREFIX_LEN + meta_full.len() + data.len());

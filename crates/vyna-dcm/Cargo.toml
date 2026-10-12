@@ -95,4 +95,9 @@ name = "dcm2dcm"
 path = "src/bin/dcm2dcm.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "dcmdir"
+path = "src/bin/dcmdir.rs"
+required-features = ["cli"]
+
 [dev-dependencies]

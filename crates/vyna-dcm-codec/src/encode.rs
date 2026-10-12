@@ -22,8 +22,49 @@ pub const DEFAULT_FRAGMENT_LEN: usize = 65536;
 
 /// Encode a whole dataset in `ts`.
 pub fn encode_dataset(ds: &DataSet, ts: TransferSyntax) -> Result<Vec<u8>> {
+    encode_dataset_inner(ds, ts, &mut ItemCapture::default())
+}
+
+/// Item-tag offsets captured for one sequence tag (DICOMDIR links).
+#[derive(Default)]
+struct ItemCapture {
+    /// Sequence tag to capture (`None` captures nothing).
+    tag: Option<Tag>,
+    /// Item-tag offsets in encode order (relative to the output).
+    offsets: Vec<usize>,
+}
+
+impl ItemCapture {
+    fn record(&mut self, seq_tag: Tag, at: usize) {
+        if self.tag == Some(seq_tag) {
+            self.offsets.push(at);
+        }
+    }
+}
+
+/// Encode a dataset, capturing item-tag offsets of every sequence
+/// element with `seq_tag`. Offsets are relative to the returned bytes
+/// (to the inflated bytes when deflated).
+pub(crate) fn encode_dataset_capture_items(
+    ds: &DataSet,
+    ts: TransferSyntax,
+    seq_tag: Tag,
+) -> Result<(Vec<u8>, Vec<usize>)> {
+    let mut capture = ItemCapture {
+        tag: Some(seq_tag),
+        offsets: Vec::new(),
+    };
+    let bytes = encode_dataset_inner(ds, ts, &mut capture)?;
+    Ok((bytes, capture.offsets))
+}
+
+fn encode_dataset_inner(
+    ds: &DataSet,
+    ts: TransferSyntax,
+    capture: &mut ItemCapture,
+) -> Result<Vec<u8>> {
     if ts.is_deflated() {
-        let plain = encode_dataset(ds, TransferSyntax::ExplicitVrLittleEndian)?;
+        let plain = encode_dataset_inner(ds, TransferSyntax::ExplicitVrLittleEndian, capture)?;
         let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
         enc.write_all(&plain)
             .map_err(|e| Error::Deflate(e.to_string()))?;
@@ -44,6 +85,7 @@ pub fn encode_dataset(ds: &DataSet, ts: TransferSyntax) -> Result<Vec<u8>> {
             explicit,
             ts.is_encapsulated(),
             &mut out,
+            capture,
         )?;
     }
     Ok(out)
@@ -59,6 +101,7 @@ fn encode_element(
     explicit: bool,
     encapsulated: bool,
     out: &mut Vec<u8>,
+    capture: &mut ItemCapture,
 ) -> Result<()> {
     put_tag(out, tag, little);
     let unencodable = |message: String| Error::Unencodable { tag, vr, message };
@@ -93,9 +136,10 @@ fn encode_element(
             // Implicit VR sequences are always undefined-length.
             put_u32(out, UNDEFINED_LENGTH, little);
             for item in items {
+                capture.record(tag, out.len());
                 put_tag(out, delimiter::ITEM, little);
                 put_u32(out, UNDEFINED_LENGTH, little);
-                let bytes = encode_dataset_in(item, little, false)?;
+                let bytes = encode_dataset_in(item, little, false, capture)?;
                 out.extend_from_slice(&bytes);
                 put_tag(out, delimiter::ITEM_DELIMITATION, little);
                 put_u32(out, 0, little);
@@ -109,13 +153,24 @@ fn encode_element(
             return Ok(());
         }
         let mut body = Vec::new();
+        // Item positions are measured against the body, then rebased
+        // past the tag + value-length header once it is written.
+        let capturing = capture.tag == Some(tag);
+        let mut rel = Vec::new();
         for item in items {
+            if capturing {
+                rel.push(body.len());
+            }
             put_tag(&mut body, delimiter::ITEM, little);
-            let bytes = encode_dataset_in(item, little, true)?;
+            let bytes = encode_dataset_in(item, little, true, capture)?;
             put_u32(&mut body, bytes.len() as u32, little);
             body.extend_from_slice(&bytes);
         }
         put_vr_len(out, vr, true, little, body.len() as u32);
+        let base = out.len();
+        for r in rel {
+            capture.record(tag, base + r);
+        }
         out.extend_from_slice(&body);
         return Ok(());
     }
@@ -139,13 +194,20 @@ fn encode_element(
     Ok(())
 }
 
-fn encode_dataset_in(ds: &DataSet, little: bool, explicit: bool) -> Result<Vec<u8>> {
+fn encode_dataset_in(
+    ds: &DataSet,
+    little: bool,
+    explicit: bool,
+    capture: &mut ItemCapture,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for (tag, el) in ds.iter() {
         if tag.is_group_length() {
             continue;
         }
-        encode_element(tag, el.vr, &el.value, little, explicit, false, &mut out)?;
+        encode_element(
+            tag, el.vr, &el.value, little, explicit, false, &mut out, capture,
+        )?;
     }
     Ok(out)
 }

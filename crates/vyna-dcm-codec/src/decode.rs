@@ -47,6 +47,65 @@ pub(crate) fn decode_up_to(
     ts: TransferSyntax,
     stop_before: Option<Tag>,
 ) -> Result<(DataSet, usize)> {
+    decode_up_to_capture(bytes, ts, stop_before, &mut ItemCapture::default())
+}
+
+/// Item-tag offsets captured for one sequence tag (DICOMDIR links).
+#[derive(Default)]
+struct ItemCapture {
+    /// Sequence tag to capture (`None` captures nothing).
+    tag: Option<Tag>,
+    /// Item-tag offsets in decode order (relative to `bytes`).
+    offsets: Vec<usize>,
+}
+
+impl ItemCapture {
+    fn record(&mut self, seq_tag: Tag, at: usize) {
+        if self.tag == Some(seq_tag) {
+            self.offsets.push(at);
+        }
+    }
+}
+
+/// Decode a dataset, capturing item-tag offsets of every sequence
+/// element with `seq_tag`. Offsets are relative to `bytes` (to the
+/// inflated bytes when deflated).
+pub(crate) fn decode_dataset_capture_items(
+    bytes: &[u8],
+    ts: TransferSyntax,
+    seq_tag: Tag,
+) -> Result<(DataSet, Vec<usize>)> {
+    if ts.is_deflated() {
+        let mut dec = ZlibDecoder::new(bytes);
+        let mut inflated = Vec::new();
+        dec.read_to_end(&mut inflated)
+            .map_err(|e| Error::Deflate(e.to_string()))?;
+        return decode_dataset_capture_items(
+            &inflated,
+            TransferSyntax::ExplicitVrLittleEndian,
+            seq_tag,
+        );
+    }
+    let mut capture = ItemCapture {
+        tag: Some(seq_tag),
+        offsets: Vec::new(),
+    };
+    let (ds, used) = decode_up_to_capture(bytes, ts, None, &mut capture)?;
+    if used != bytes.len() {
+        return Err(Error::Truncated {
+            offset: used,
+            what: "trailing bytes after dataset",
+        });
+    }
+    Ok((ds, capture.offsets))
+}
+
+fn decode_up_to_capture(
+    bytes: &[u8],
+    ts: TransferSyntax,
+    stop_before: Option<Tag>,
+    capture: &mut ItemCapture,
+) -> Result<(DataSet, usize)> {
     let mut r = Reader {
         buf: bytes,
         pos: 0,
@@ -56,7 +115,7 @@ pub(crate) fn decode_up_to(
         explicit: ts.is_explicit_vr() || ts.is_encapsulated(),
         encapsulated: ts.is_encapsulated(),
     };
-    let ds = decode_elements(&mut r, bytes.len(), 0, stop_before)?;
+    let ds = decode_elements(&mut r, bytes.len(), 0, stop_before, capture)?;
     Ok((ds, r.pos))
 }
 
@@ -115,6 +174,7 @@ fn decode_elements(
     end: usize,
     depth: usize,
     stop_before: Option<Tag>,
+    capture: &mut ItemCapture,
 ) -> Result<DataSet> {
     if depth > MAX_DEPTH {
         return Err(Error::BadSequence {
@@ -139,7 +199,7 @@ fn decode_elements(
             break;
         }
         let (vr, len) = read_header(r, tag, elem_offset, &ds)?;
-        let value = read_value(r, tag, vr, len, elem_offset, depth)?;
+        let value = read_value(r, tag, vr, len, elem_offset, depth, capture)?;
         ds.insert(DataElement::new(tag, vr, value));
     }
     Ok(ds)
@@ -224,13 +284,20 @@ fn read_value(
     len: u32,
     offset: usize,
     depth: usize,
+    capture: &mut ItemCapture,
 ) -> Result<Value> {
     if len == UNDEFINED_LENGTH {
-        return read_undefined(r, tag, vr, offset, depth);
+        return read_undefined(r, tag, vr, offset, depth, capture);
     }
     let len = len as usize;
     if vr == Vr::Sq {
-        return Ok(Value::Sequence(read_defined_items(r, r.pos + len, depth)?));
+        return Ok(Value::Sequence(read_defined_items(
+            r,
+            r.pos + len,
+            depth,
+            tag,
+            capture,
+        )?));
     }
     let raw = r.take(len, "element value")?.to_vec();
     decode_primitive(tag, vr, &raw, r.little)
@@ -242,9 +309,12 @@ fn read_undefined(
     vr: Vr,
     offset: usize,
     depth: usize,
+    capture: &mut ItemCapture,
 ) -> Result<Value> {
     match vr {
-        Vr::Sq => Ok(Value::Sequence(read_undefined_items(r, depth)?)),
+        Vr::Sq => Ok(Value::Sequence(read_undefined_items(
+            r, depth, tag, capture,
+        )?)),
         Vr::Ob | Vr::Ow => {
             // Encapsulated syntaxes: BOT item + fragments. Native
             // syntaxes: concatenated item bytes (retired but seen).
@@ -254,10 +324,12 @@ fn read_undefined(
             // Try sequence first (implicit-VR unknown sequences arrive as
             // UN); fall back to concatenated item bytes.
             let save = r.pos;
-            match read_undefined_items(r, depth) {
+            let captured = capture.offsets.len();
+            match read_undefined_items(r, depth, tag, capture) {
                 Ok(items) => Ok(Value::Sequence(items)),
                 Err(_) => {
                     r.pos = save;
+                    capture.offsets.truncate(captured);
                     Ok(Value::Bytes(read_concatenated_items(r)?))
                 }
             }
@@ -271,7 +343,13 @@ fn read_undefined(
 }
 
 /// Read `(FFFE,E000)` items of a defined-length sequence.
-fn read_defined_items(r: &mut Reader<'_>, end: usize, depth: usize) -> Result<Vec<DataSet>> {
+fn read_defined_items(
+    r: &mut Reader<'_>,
+    end: usize,
+    depth: usize,
+    seq_tag: Tag,
+    capture: &mut ItemCapture,
+) -> Result<Vec<DataSet>> {
     if depth + 1 > MAX_DEPTH {
         return Err(Error::BadSequence {
             offset: r.pos,
@@ -294,9 +372,10 @@ fn read_defined_items(r: &mut Reader<'_>, end: usize, depth: usize) -> Result<Ve
                 message: format!("expected item tag, found {tag}"),
             });
         }
+        capture.record(seq_tag, at);
         let len = r.u32("item length")?;
         if len == UNDEFINED_LENGTH {
-            items.push(read_until_item_delimiter(r, depth + 1)?);
+            items.push(read_until_item_delimiter(r, depth + 1, capture)?);
         } else {
             let item_end = r.pos + len as usize;
             if item_end > end {
@@ -312,7 +391,13 @@ fn read_defined_items(r: &mut Reader<'_>, end: usize, depth: usize) -> Result<Ve
                 explicit: r.explicit,
                 encapsulated: r.encapsulated,
             };
-            items.push(decode_elements(&mut sub, item_end, depth + 1, None)?);
+            items.push(decode_elements(
+                &mut sub,
+                item_end,
+                depth + 1,
+                None,
+                capture,
+            )?);
             r.pos = item_end;
         }
     }
@@ -320,7 +405,12 @@ fn read_defined_items(r: &mut Reader<'_>, end: usize, depth: usize) -> Result<Ve
 }
 
 /// Read items until `(FFFE,E0DD)` sequence delimitation.
-fn read_undefined_items(r: &mut Reader<'_>, depth: usize) -> Result<Vec<DataSet>> {
+fn read_undefined_items(
+    r: &mut Reader<'_>,
+    depth: usize,
+    seq_tag: Tag,
+    capture: &mut ItemCapture,
+) -> Result<Vec<DataSet>> {
     if depth + 1 > MAX_DEPTH {
         return Err(Error::BadSequence {
             offset: r.pos,
@@ -347,9 +437,10 @@ fn read_undefined_items(r: &mut Reader<'_>, depth: usize) -> Result<Vec<DataSet>
                 message: format!("expected item tag, found {tag}"),
             });
         }
+        capture.record(seq_tag, at);
         let len = r.u32("item length")?;
         if len == UNDEFINED_LENGTH {
-            items.push(read_until_item_delimiter(r, depth + 1)?);
+            items.push(read_until_item_delimiter(r, depth + 1, capture)?);
         } else {
             let item_end = r.pos + len as usize;
             if item_end > r.buf.len() {
@@ -365,14 +456,24 @@ fn read_undefined_items(r: &mut Reader<'_>, depth: usize) -> Result<Vec<DataSet>
                 explicit: r.explicit,
                 encapsulated: r.encapsulated,
             };
-            items.push(decode_elements(&mut sub, item_end, depth + 1, None)?);
+            items.push(decode_elements(
+                &mut sub,
+                item_end,
+                depth + 1,
+                None,
+                capture,
+            )?);
             r.pos = item_end;
         }
     }
 }
 
 /// Read elements until `(FFFE,E00D)` item delimitation.
-fn read_until_item_delimiter(r: &mut Reader<'_>, depth: usize) -> Result<DataSet> {
+fn read_until_item_delimiter(
+    r: &mut Reader<'_>,
+    depth: usize,
+    capture: &mut ItemCapture,
+) -> Result<DataSet> {
     if depth > MAX_DEPTH {
         return Err(Error::BadSequence {
             offset: r.pos,
@@ -400,7 +501,7 @@ fn read_until_item_delimiter(r: &mut Reader<'_>, depth: usize) -> Result<DataSet
             });
         }
         let (vr, len) = read_header(r, tag, at, &ds)?;
-        let value = read_value(r, tag, vr, len, at, depth)?;
+        let value = read_value(r, tag, vr, len, at, depth, capture)?;
         ds.insert(DataElement::new(tag, vr, value));
     }
 }

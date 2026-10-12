@@ -18,7 +18,7 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | `vyna-dcm-ecg` | 12-lead ECG model and Waveform Sequence mapping for VynaECG |
 | `vyna-dcm-iod` | IOD validation: Type 1/2/3 presence, VR/VM checks, 18 SOP Classes |
 | `vyna-dcm-pdf` | Encapsulated PDF SOP-instance builders and extractors |
-| `vyna-dcm` | Facade re-exporting the above, plus 13 CLI tools and 3 examples |
+| `vyna-dcm` | Facade re-exporting the above, plus 14 CLI tools and 3 examples |
 
 ## Documentation
 
@@ -39,7 +39,7 @@ Requires Rust 1.98+ (edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace        # 152 unit + 2 integration + 7 doc tests
+cargo test --workspace        # 162 unit + 2 integration + 7 doc tests
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
@@ -82,6 +82,7 @@ cargo run -p vyna-dcm --example link_route -- 127.0.0.1:11115 127.0.0.1:11114 PA
 | `dcm2pdf` | Extract the PDF from an Encapsulated PDF file |
 | `dcmodify` | Modify/insert/erase tags in a Part-10 file |
 | `dcm2dcm` | Transcode pixel data to another transfer syntax |
+| `dcmdir` | Create or list a DICOMDIR media directory |
 
 Network tools need features `cli,net`; file tools need only `cli`.
 

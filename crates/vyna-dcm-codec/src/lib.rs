@@ -24,6 +24,7 @@
 #![warn(missing_docs)]
 
 mod decode;
+pub mod dicomdir;
 mod dump;
 mod encode;
 mod error;
@@ -36,9 +37,14 @@ mod part10;
 pub mod rle;
 pub mod transcode;
 
-pub(crate) use decode::decode_up_to;
 pub use decode::{UNDEFINED_LENGTH, decode_dataset};
+pub(crate) use decode::{decode_dataset_capture_items, decode_up_to};
+pub use dicomdir::{
+    DEFAULT_FILE_SET_ID, DicomDir, DirEntry, DirFile, DirInstance, DirPatient, DirSeries, DirStudy,
+    SkippedRecord, build_dicomdir, read_dicomdir, record_type_for_sop_class,
+};
 pub use dump::dump_dataset;
+pub(crate) use encode::encode_dataset_capture_items;
 pub use encode::{DEFAULT_FRAGMENT_LEN, encode_dataset, fragment_payload};
 pub use error::{Error, Result};
 pub use jpeg::JpegCodec;
@@ -46,6 +52,7 @@ pub use jpeg_2000::Jpeg2000Codec;
 pub use jpeg_lossless::JpegLosslessCodec;
 pub use jpeg_ls::JpegLsCodec;
 pub use json::{dataset_from_json, dataset_to_json};
+pub(crate) use part10::meta_section_len;
 pub use part10::{FileMeta, META_VERSION, PREFIX_LEN, read_part10, write_part10};
 pub use transcode::{TranscodeOptions, transcode_dataset};
 pub use vyna_dcm_core::TransferSyntax;

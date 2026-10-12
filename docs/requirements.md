@@ -9,8 +9,8 @@
 | Applies to | VynaDCM workspace v0.1.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
-implemented baseline (161 tests green, IOD validator + PDF helpers
-+ tag editor + transcoder applied).
+implemented baseline (171 tests green, IOD validator + PDF helpers
++ tag editor + transcoder + DICOMDIR applied).
 
 ## Contents
 
@@ -134,6 +134,12 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   tables when needed, lossy history + fresh SOP UID on lossy
   targets, same-syntax no-op. Palette expansion and `YBR_PARTIAL_*`
   stay out of scope.
+- **FR-CODEC-10 (M)** DICOMDIR media directories: read files into a
+  patient → study → series → instance tree by following the offset
+  links exactly (`read_dicomdir`; loops and dangling offsets are
+  errors, unusable records are reported, never silently dropped),
+  and write them from referenced datasets (`build_dicomdir`) with
+  measured two-pass offsets. `MRDR` following stays out of scope.
 
 ### 3.3 DIMSE networking (`vyna-dcm-net`)
 
@@ -227,6 +233,8 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   `dcmodify` (tag modify/insert/erase with VR-aware values,
   file-meta UID sync, in-place or `--output`; exit 0/1),
   `dcm2dcm` (transcode with syntax names/UIDs and quality knobs;
+  exit 0/1),
+  `dcmdir` (create a DICOMDIR from files/dirs, or `--list` one;
   exit 0/1).
 
 ## 4. Non-functional requirements
@@ -246,7 +254,7 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **NFR-06 (M)** Determinism: encoders emit canonical output so
   dataset/Part-10/JSON round-trips are stable.
 - **NFR-07 (M)** Quality gates for every change: unit + doc tests
-  green (currently 152 + 2 + 7), `cargo clippy --workspace --all-targets`
+  green (currently 162 + 2 + 7), `cargo clippy --workspace --all-targets`
   with zero warnings, `cargo fmt --check` clean.
 - **NFR-08 (S)** Documentation: public API documented
   (`missing_docs` enforced); this SRS, the design spec, integration
@@ -271,12 +279,13 @@ ATNA audit-trail emission.
 | FR-CODEC-07 | native/RLE path covered indirectly via `frames_and_stow` (WADO frames); bundled JPEG paths by `baseline_*_roundtrip_is_close`, `lossless_roundtrips_exactly`, `near_lossless_honours_error_bound`, `flat_frames_roundtrip`, `lossy_roundtrip_is_close`, `cross_checks_against_independent_j2k`, `bundled_multi_frame_roundtrip`, `truncated_input_*`, plus the `PixelCodec` plug-in tests |
 | FR-CODEC-08 | `dump_contains_expected_lines` |
 | FR-CODEC-09 | `mono8_lossless_matrix_is_exact`, `mono16_and_bigendian_roundtrip_exact`, `rgb_*`, `ybr422_*`, `ybr_full_*`, `lossy_source_keeps_history_*`, `multiframe_*`, `bad_inputs_rejected`, `baseline_rgb_odd_sizes_roundtrip`, CLI `dcm2dcm` matrix runs |
+| FR-CODEC-10 | `roundtrip_tree` (every link points at an item tag), `empty_dir_roundtrip`, `record_type_mapping`, `entry_validation`, `rejects_non_directory`, `walker_*` (skips, loops, dangling, deleted), `capture_points_at_item_tags`, CLI `dcmdir` create+list runs |
 | FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, PDU/DIMSE tests (20); live C-ECHO against third-party endpoint `0x0000` |
 | FR-NET-07 | worklist/MPPS/commitment tests |
 | FR-NET-08 | `tls_loopback_echo`, `rejects_empty_chain_and_key` |
 | FR-WEB-01…03 | `end_to_end_client_against_hyper`, dispatch/multipart tests (11) |
 | FR-ECG-01…03 | `vyna-dcm-ecg` tests (7); `ecg_write` example |
-| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`); `link_route` example |
+| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
 | FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
 | NFR-04 | `rejects_garbage`, `rejects_non_part10`, `rejects_bad_json`, `rejects_missing_boundary`, unknown-route 404 tests |

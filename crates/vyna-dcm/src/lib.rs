@@ -29,8 +29,9 @@ pub use vyna_dcm_web as web;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub use vyna_dcm_codec::{
-    FileMeta, TranscodeOptions, dataset_from_json, dataset_to_json, decode_dataset, decode_pixels,
-    dump_dataset, encode_dataset, read_part10, transcode_dataset, write_part10,
+    DicomDir, DirEntry, FileMeta, TranscodeOptions, build_dicomdir, dataset_from_json,
+    dataset_to_json, decode_dataset, decode_pixels, dump_dataset, encode_dataset, read_dicomdir,
+    read_part10, transcode_dataset, write_part10,
 };
 pub use vyna_dcm_core::{
     DataElement, DataSet, PersonName, Tag, TransferSyntax, Value, Vr, lookup_keyword, new_uid, tags,
