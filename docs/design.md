@@ -195,6 +195,39 @@ spec adds component contracts, algorithms, sequences, and invariants.
 - `pdf2dcm` bin self-validates before writing (exit 0/1);
   `dcm2pdf` bin extracts (exit 0/1).
 
+### 2.8 `vyna-dcm-deid` — de-identification
+
+- `Action::{Dummy, Zero, Remove, RemapUid, ShiftDate}` per-element
+  actions; `BASIC_PROFILE` is a 174-tag curated table (6/19/49/20/80
+  split). Unlisted tags keep; sequences recurse; odd groups
+  (private) and `0x6000..=0x60FF` (overlays) remove by rule.
+- `Deidentifier`: dummies (`ANONYMIZED` defaults, PN-aware), one UID
+  map per instance (consistent across files), optional whole-day
+  `DA`/`DT` offset (Hinnant round-trip; time-of-day kept), dummy
+  dates without an offset so Type 1 dates stay valid.
+- `apply` refuses `YES` Burned In Annotation before mutating and
+  returns a `DeidReport` (counts + kept-value warnings); the
+  longitudinal-temporal flag is set factually (`MODIFIED` with an
+  offset, `REMOVED` without) only when a shiftable date was seen.
+- `deidentify` bin mirrors `dcmodify`'s meta-sync and temp+rename
+  in-place writes; multi-file plans resolve in `plan_outputs`.
+
+### 2.9 `vyna-dcm-atna` — audit emission
+
+- `message.rs`: `AuditMessage` builders (activity, begin-transfer,
+  transferred, query, deleted, export/import, custom) rendering
+  RFC 3881 XML with full escaping; participant roles 110150–152,
+  study objects with base64 `(class, instance)` details, patient
+  objects; code triples pinned by tests.
+- `syslog.rs`: `SyslogTarget` URL parsing (`udp`/`tcp`/`tls`,
+  default ports 514/6514), RFC 5424 frames at facility audit(13)
+  with outcome-mapped severity, octet-counting for TCP/TLS,
+  blocking `SyslogSender` (TLS: WebPKI + optional PEM CA,
+  hostname verification, shared ring provider install).
+- Bins share `AuditArgs` (`--audit-server/--audit-source/
+  --audit-ca`); `emit_best_effort` never fails the clinical path;
+  `outcome_for_status` maps DIMSE statuses to 0/4/12.
+
 ## 3. Key algorithms
 
 ### 3.1 Negotiation (`service::negotiate`)

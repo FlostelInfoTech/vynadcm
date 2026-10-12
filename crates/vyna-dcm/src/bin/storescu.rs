@@ -6,7 +6,9 @@ mod common;
 use std::path::PathBuf;
 
 use clap::Parser;
-use common::{ConnArgs, anyhowish::Result};
+use common::{
+    AuditArgs, ConnArgs, anyhowish::Result, emit_best_effort, host_of, outcome_for_status,
+};
 use vyna_dcm::{TransferSyntax, read_part10, tags};
 
 /// C-STORE SCU.
@@ -21,6 +23,8 @@ struct Args {
     /// DIMSE priority (0 medium, 1 high, 2 low).
     #[arg(long, default_value_t = 0)]
     priority: u16,
+    #[command(flatten)]
+    audit: AuditArgs,
 }
 
 #[tokio::main]
@@ -52,21 +56,49 @@ async fn main() -> Result<()> {
     }
 
     let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+    let audit = args.audit.sender(&args.conn.calling)?;
+    let peer_ip = host_of(&args.conn.connect).to_string();
     let mut assoc = args.conn.connect(&class_refs, &syntaxes).await?;
     let mut failed = 0;
     for (file, class, inst, ds) in &jobs {
         // The association re-encodes into the negotiated transfer syntax;
         // compressed pixel data without a matching context fails loudly.
-        match assoc.store(ds, class, inst, args.priority).await {
+        let status = match assoc.store(ds, class, inst, args.priority).await {
             Ok(status) => {
                 println!("{}: C-STORE-RSP {status:#06X}", file.display());
                 if status != 0 {
                     failed += 1;
                 }
+                Some(status)
             }
             Err(e) => {
                 println!("{}: C-STORE failed: {e}", file.display());
                 failed += 1;
+                None
+            }
+        };
+        if let Some(audit) = &audit {
+            match ds.string(tags::STUDY_INSTANCE_UID) {
+                Some(study) => {
+                    let mut msg = vyna_dcm::AuditMessage::instances_transferred(
+                        ds.string(tags::PATIENT_ID),
+                        study,
+                        &[(class.as_str(), inst.as_str())],
+                        &args.conn.calling,
+                        None,
+                        &args.conn.called,
+                        Some(&peer_ip),
+                        &audit.source,
+                    );
+                    msg.outcome = status
+                        .map(outcome_for_status)
+                        .unwrap_or(vyna_dcm::Outcome::MajorFailure);
+                    emit_best_effort(Some(&audit.sender), &msg, "storescu");
+                }
+                None => eprintln!(
+                    "storescu: skipping audit for {}: no Study UID",
+                    file.display()
+                ),
             }
         }
     }
@@ -77,4 +109,27 @@ async fn main() -> Result<()> {
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_flags_parse() {
+        let args = Args::try_parse_from([
+            "storescu",
+            "--connect",
+            "127.0.0.1:11112",
+            "--audit-server",
+            "tcp://127.0.0.1:6514",
+            "a.dcm",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.audit.audit_server.as_deref(),
+            Some("tcp://127.0.0.1:6514")
+        );
+        assert!(args.audit.sender("VYNA_SCU").unwrap().is_some());
+    }
 }

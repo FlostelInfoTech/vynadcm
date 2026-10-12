@@ -222,14 +222,36 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **FR-PDF-03 (S)** Scope honesty: Encapsulated CDA, PDF/A or magic
   enforcement, and sequence-item validation stay out of scope.
 
-### 3.8 CLI tools (`vyna-dcm`, feature `cli`)
+### 3.8 De-identification (`vyna-dcm-deid`)
+
+- **FR-DEID-01 (M)** PS3.15 Annex E action semantics (dummy, zero,
+  remove, UID remap, date shift) over a curated 174-tag basic
+  profile: patient/staff/institution/device identity,
+  visit/admission/order/trial data, icon/annotation free text, all
+  instance UIDs, and clinical dates. Sequences recurse; private
+  groups and overlay planes are removed by rule (private retention
+  optional); UID maps stay consistent per run; dates shift
+  (longitudinal) or fall back to a fixed dummy; times, clinical
+  content, anatomy, and technique are kept. Burned-in `YES`
+  refuses the run; the longitudinal-temporal flag is set factually.
+- **FR-DEID-02 (M)** `deidentify` CLI: multi-file batches with
+  `--output-dir` / `--output` / `--in-place`, `--date-offset`,
+  `--patient-id` / `--patient-name`, `--retain-private-tags`,
+  file-meta UID sync, per-file summaries, exit 0/1.
+- **FR-DEID-03 (S)** Scope honesty: curated subset (not a full E.1
+  transcription), no coded profile claims, no free-text scrubbing,
+  no charset conversion, no UID-map persistence, no pixel redaction.
+
+### 3.9 CLI tools (`vyna-dcm`, feature `cli`)
 
 - **FR-CLI-01 (M)** Network tools: `echoscu`, `echoscp`, `storescu`,
   `storescp`, `findscu` (incl. MWL model, `-k` keys, JSON output),
   `movescu` (C-MOVE to a `--dest` AE), `getscu` (C-GET into
   `--output-dir`), `mppsscu` (MPPS N-CREATE + N-SET), `stgcmtscu`
-  (Storage Commitment N-ACTION + report wait), each with AE titles,
-  PDU/timeout tuning, and TLS options.
+  (Storage Commitment N-ACTION + report wait), `auditsend` (one
+  ATNA message per invocation), each with AE titles, PDU/timeout
+  tuning, and TLS options; `storescp`/`storescu`/`findscu` also
+  take `--audit-server` for wired emission.
 - **FR-CLI-02 (M)** File tools: `dcmdump`, `dcm2json` (incl. file-meta
   option), `json2dcm` (incl. transfer-syntax selection),
   `dcmvalidate` (IOD check with SOP-Class override; exit 0/1/2),
@@ -240,7 +262,29 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   `dcm2dcm` (transcode with syntax names/UIDs and quality knobs;
   exit 0/1),
   `dcmdir` (create a DICOMDIR from files/dirs, or `--list` one;
-  exit 0/1).
+  exit 0/1),
+  `deidentify` (basic-profile de-identification with date offset,
+  dummy overrides, and batch outputs; exit 0/1).
+
+### 3.10 ATNA audit trail (`vyna-dcm-atna`)
+
+- **FR-ATNA-01 (M)** DICOM audit messages (PS3.15 A.5 / RFC 3881
+  XML, fully escaped): Application Activity, Begin Transferring,
+  Instances Transferred, Query, Study Deleted, Export, Import,
+  plus custom triples; participant roles, study/patient objects
+  with base64 instance details, outcomes 0/4/8/12.
+- **FR-ATNA-02 (M)** Syslog delivery to `udp://`, `tcp://`
+  (octet-counting), and `tls://` (WebPKI + optional private CA,
+  hostname verification) ARRs; facility audit(13) with
+  outcome-mapped severity; `--dry-run` XML preview.
+- **FR-ATNA-03 (M)** Wired emission: `storescp` (actor-start +
+  per-store), `storescu` (per-store with failure outcomes),
+  `findscu` (per-query) via shared `--audit-server` /
+  `--audit-source` / `--audit-ca` flags; best-effort (transport
+  failures warn, never break the clinical path).
+- **FR-ATNA-04 (S)** Scope honesty: code triples pinned by tests
+  per PS3.15/DCMR; peer socket IPs not plumbed (AE titles only
+  from handlers); movescu/getscu/mppsscu/stgcmtscu not yet wired.
 
 ## 4. Non-functional requirements
 
@@ -293,5 +337,7 @@ ATNA audit-trail emission.
 | FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `movescu`, `getscu`, `mppsscu`, `stgcmtscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
 | FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
+| FR-DEID-01…03 | `every_action_fires`, `shift_keeps_longitudinal_intervals`, `datetimes_shift_or_dummy_by_vr`, `burned_in_annotation_refuses_before_mutation`, `uid_maps_stay_consistent_across_datasets`, `shifts_cross_month_year_and_leap_day`, profile self-checks, CLI `output_plans_*` + `process_file_round_trip`, `deidentified_ecg_validates_with_identical_samples` |
+| FR-ATNA-01…04 | `event_code_triples_are_pinned`, `transferred_xml_has_shape_and_roles`, `values_escape`, `urls_parse_with_scheme_defaults`, UDP/TCP/TLS loopbacks (+ untrusted rejection), CLI `flow_messages_*` + `subcommands_parse`, wired `audit_flags_parse` ×3, `statuses_map_to_outcomes`, live UDP/TCP/TLS ARR-stub runs |
 | NFR-04 | `rejects_garbage`, `rejects_non_part10`, `rejects_bad_json`, `rejects_missing_boundary`, unknown-route 404 tests |
 | NFR-07 | CI-equivalent gate run per change (see §4) |

@@ -55,6 +55,25 @@ the workspace crate version (`Cargo.toml`).
   the `-k` query builder and filename sanitizer with
   `findscu`/`storescp`; new `Association::storage_commit`
   request-with-report helper; 191 tests green.
+- Generated DICOM Conformance Statement
+  (`docs/generate-conformance.py` → `docs/conformance.md`,
+  PS3.2 structure, per-tool AE specs, SOP/transfer-syntax annexes)
+  with extraction asserts and a `conformance_fresh` gate test;
+  192 tests green.
+- New `vyna-dcm-deid` crate: basic-profile de-identification
+  (`Deidentifier` with dummy/zero/remove/UID-remap/date-shift
+  actions over a curated 174-tag table, sequence recursion,
+  private/overlay rules, burned-in refusal, factual
+  longitudinal-temporal flag) plus the batch `deidentify` CLI
+  (`--output-dir`/`--output`/`--in-place`, `--date-offset`, dummy
+  overrides); de-identified ECG instances stay IOD-valid with
+  identical samples; 211 tests green.
+- New `vyna-dcm-atna` crate: ATNA audit-trail emission (RFC 3881
+  message builders for activity/transfer/query/delete/
+  export/import/custom events, `udp`/`tcp`/`tls` syslog delivery
+  with hostname verification) plus the `auditsend` CLI and wired
+  `storescp`/`storescu`/`findscu` emission (best-effort,
+  status-mapped outcomes); 233 tests green.
 
 ## [0.1.0] — 2026-10-11
 

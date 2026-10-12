@@ -4,7 +4,10 @@
 mod common;
 
 use clap::Parser;
-use common::{ConnArgs, anyhowish::Result, build_qr_query};
+use common::{
+    AuditArgs, ConnArgs, anyhowish::Result, build_qr_query, emit_best_effort, host_of,
+    outcome_for_status,
+};
 use vyna_dcm::core::sop_class;
 use vyna_dcm::dump_dataset;
 
@@ -24,6 +27,8 @@ struct Args {
     /// Print matches as DICOM JSON instead of text dump.
     #[arg(long, default_value_t = false)]
     json: bool,
+    #[command(flatten)]
+    audit: AuditArgs,
 }
 
 #[tokio::main]
@@ -63,6 +68,19 @@ async fn main() -> Result<()> {
         })
         .await?;
     println!("C-FIND complete: {count} match(es), status {status:#06X}");
+    if let Some(audit) = args.audit.sender(&args.conn.calling)? {
+        let mut msg = vyna_dcm::AuditMessage::query(
+            query.string(vyna_dcm::tags::PATIENT_ID),
+            query.string(vyna_dcm::tags::STUDY_INSTANCE_UID),
+            &args.conn.calling,
+            None,
+            &args.conn.called,
+            Some(host_of(&args.conn.connect)),
+            &audit.source,
+        );
+        msg.outcome = outcome_for_status(status);
+        emit_best_effort(Some(&audit.sender), &msg, "findscu");
+    }
     assoc.release().await?;
     if status != 0 {
         return Err(common::anyhowish::Error::msg(format!(
@@ -113,5 +131,26 @@ mod tests {
     fn bad_keys_fail() {
         assert!(build_qr_query(&keys(&["NoEquals"]), false).is_err());
         assert!(build_qr_query(&keys(&["BogusKey=x"]), false).is_err());
+    }
+
+    #[test]
+    fn audit_flags_parse() {
+        let args = Args::try_parse_from([
+            "findscu",
+            "--connect",
+            "127.0.0.1:11112",
+            "--audit-server",
+            "udp://127.0.0.1:514",
+        ])
+        .unwrap();
+        assert!(args.audit.sender("VYNA_SCU").unwrap().is_some());
+    }
+
+    #[test]
+    fn statuses_map_to_outcomes() {
+        use vyna_dcm::Outcome;
+        assert_eq!(outcome_for_status(0x0000), Outcome::Success);
+        assert_eq!(outcome_for_status(0xB000), Outcome::MinorFailure);
+        assert_eq!(outcome_for_status(0xA900), Outcome::MajorFailure);
     }
 }

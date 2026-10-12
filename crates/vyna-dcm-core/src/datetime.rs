@@ -198,6 +198,50 @@ pub fn is_valid_dt(s: &str) -> bool {
     true
 }
 
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+#[must_use]
+pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Civil date for days since 1970-01-01: `(year, month, day)`.
+#[must_use]
+pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Current UTC time as RFC 3339 with milliseconds (`…SS.mmmZ`).
+#[must_use]
+pub fn utc_now_rfc3339() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let (y, m, d) = civil_from_days((now.as_secs() / 86400) as i64);
+    let sod = now.as_secs() % 86400;
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60,
+        now.subsec_millis()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +274,25 @@ mod tests {
         assert_eq!(Tm::parse("13:45:23").unwrap().format(), "134523");
         assert!(Tm::parse("246000").is_none());
         assert!(Tm::parse("136").is_none());
+    }
+
+    #[test]
+    fn civil_math_round_trips() {
+        assert_eq!(civil_from_days(0), (1970, 1, 1));
+        assert_eq!(civil_from_days(10957), (2000, 1, 1));
+        for days in [0, 1, -1, 19723, 730485, -719468] {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
+    }
+
+    #[test]
+    fn rfc3339_clock_has_shape() {
+        let s = utc_now_rfc3339();
+        assert_eq!(s.len(), 24);
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[10..11], "T");
+        assert!(s[..10].bytes().filter(|b| *b == b'-').count() == 2);
     }
 
     #[test]

@@ -18,7 +18,9 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | `vyna-dcm-ecg` | 12-lead ECG model and Waveform Sequence mapping for VynaECG |
 | `vyna-dcm-iod` | IOD validation: Type 1/2/3 presence, VR/VM checks, 18 SOP Classes |
 | `vyna-dcm-pdf` | Encapsulated PDF SOP-instance builders and extractors |
-| `vyna-dcm` | Facade re-exporting the above, plus 18 CLI tools and 3 examples |
+| `vyna-dcm-deid` | Basic-profile de-identification for research exports |
+| `vyna-dcm-atna` | ATNA audit-trail emission over syslog |
+| `vyna-dcm` | Facade re-exporting the above, plus 20 CLI tools and 3 examples |
 
 ## Documentation
 
@@ -30,6 +32,7 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | [docs/integration.md](docs/integration.md) | Integration guide for VynaECG / VynaLink |
 | [docs/user-guide.md](docs/user-guide.md) | CLI reference and operator walkthroughs |
 | [docs/sbom.md](docs/sbom.md) | Software bill of materials (CycloneDX) |
+| [docs/conformance.md](docs/conformance.md) | DICOM Conformance Statement (generated) |
 | [docs/roadmap.md](docs/roadmap.md) | Ecosystem comparison and roadmap |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes |
 
@@ -87,6 +90,8 @@ cargo run -p vyna-dcm --example link_route -- 127.0.0.1:11115 127.0.0.1:11114 PA
 | `dcmodify` | Modify/insert/erase tags in a Part-10 file |
 | `dcm2dcm` | Transcode pixel data to another transfer syntax |
 | `dcmdir` | Create or list a DICOMDIR media directory |
+| `deidentify` | De-identify Part-10 files (basic profile) |
+| `auditsend` | Send one ATNA audit message |
 
 Network tools need features `cli,net`; file tools need only `cli`.
 

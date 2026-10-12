@@ -8,6 +8,8 @@ members = [
     "crates/vyna-dcm-ecg",
     "crates/vyna-dcm-iod",
     "crates/vyna-dcm-pdf",
+    "crates/vyna-dcm-deid",
+    "crates/vyna-dcm-atna",
     "crates/vyna-dcm",
 ]
 

@@ -26,6 +26,7 @@ library should read `docs/integration.md`.
 - [7. TLS walkthrough](#7-tls-walkthrough)
 - [8. Worked examples](#8-worked-examples)
 - [9. Troubleshooting](#9-troubleshooting)
+- [10. ATNA audit trail](#10-atna-audit-trail)
 
 ## 1. Installation
 
@@ -97,6 +98,7 @@ storescu --connect 127.0.0.1:11113 study1.dcm study2.dcm
   2 = low; default 0).
 - Statuses: `0x0000` stored; `0xA700` out of resources (disk write
   failed); `0xA900` encode failure.
+- Both take `--audit-server` for ATNA emission (see §10).
 
 ## 5. Query: findscu
 
@@ -227,6 +229,24 @@ ID stays relative; record types map from SOP Class (`IMAGE`, `RT
 DOSE`, `SR DOCUMENT`, …). Skipped records print with their reason
 rather than failing the import.
 
+`deidentify` applies the basic profile for research exports (names
+and IDs dummied, dates shifted or dummied, UIDs remapped
+consistently, private groups and overlays removed; times, clinical
+content, and pixels kept):
+
+```sh
+deidentify study/*.dcm --output-dir anon/ --date-offset 30
+deidentify one.dcm --output one.anon.dcm --patient-id SUBJ-7
+deidentify old.dcm --in-place   # rewrite via a temp file
+```
+
+- `--date-offset DAYS` keeps longitudinal intervals across the whole
+  batch (one UID map per run); without it, dates become `19000101`.
+- `--patient-id` / `--patient-name` override the `ANONYMIZED`
+  dummies; `--retain-private-tags` keeps private groups.
+- Files with Burned In Annotation `YES` are refused (pixels are
+  never altered); file-meta UIDs follow the remapped dataset.
+
 Note: JSON round-trips normalize `DS` float formatting (`500` →
 `500.0`); values stay numerically identical.
 
@@ -273,3 +293,33 @@ every received instance to a downstream PACS.
 | TLS handshake failure | CA / hostname mismatch | `--tls-ca`, `--tls-server-name`; check PEM validity |
 | `json2dcm` missing UID errors | JSON lacks SOP Class/Instance UIDs | Source dataset must carry both UIDs |
 | Slow/blocked reads | Peer idle, tight timeout | Raise `--timeout-secs` (SCP default 300 s) |
+
+## 10. ATNA audit trail
+
+`storescp` (actor-start + per-store), `storescu` (per-store), and
+`findscu` (per-query) emit DICOM audit messages when given an audit
+server; outcomes follow the DIMSE status, and emission failures warn
+without breaking the transfer:
+
+```sh
+storescp --bind 127.0.0.1:11112 --directory /data/incoming \
+  --audit-server udp://arr.example:514
+storescu --connect 127.0.0.1:11112 \
+  --audit-server tls://arr.example --audit-ca hospital-ca.pem file.dcm
+```
+
+`auditsend` emits any single event (useful for ARR connectivity
+checks and scripts); `--dry-run` prints the XML instead:
+
+```sh
+auditsend --server udp://127.0.0.1:514 transferred --study 1.2.3 \
+  --source-ae SRC --dest-ae DST --sop 1.2.840.10008.5.1.4.1.1.2:1.2.3.1
+auditsend --server tls://arr.example --ca hospital-ca.pem --dry-run \
+  query --source-ae QRY --dest-ae PACS --patient E123
+```
+
+- `--audit-source` overrides the Audit Source ID (default: our AE);
+  TLS verifies hostnames against WebPKI plus `--audit-ca`.
+- Events: `start`, `stop`, `transferred`, `begin-transfer`,
+  `query`, `deleted`, `export`, `import`, `custom`;
+  `--outcome success|minor|serious|major` (default success).

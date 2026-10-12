@@ -121,15 +121,38 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   through our SCP framework (no post-response hook exists, so the
   report leg is verified by scripted loopback instead), and C-GET
   Role Selection proposals against strict archives.
-- **DICOM Conformance Statement**: hospitals routinely require one
-  for procurement; generate from implemented capabilities.
+- **DICOM Conformance Statement** — DONE: shipped
+  `docs/generate-conformance.py` emitting PS3.2-structured
+  `docs/conformance.md` (per-tool AE specs, association/TLS/media/
+  web/charset/security sections, SOP + transfer-syntax annexes with
+  UIDs). Accepted: every claim extracted from sources with
+  fail-loud drift asserts, deterministic `--check` mode wired into
+  a `conformance_fresh` gate test, 192/192 tests, clippy clean.
+  Out of scope (documented): SCU-side Role Selection proposals
+  (the SCP already echoes proposed roles).
 
 ## 5. Priority 2: deployment and robustness
 
-- **De-identification profiles** (PS3.15 E, dcm4che `deidentify`):
-  research/AI exports of ECGs.
-- **ATNA audit-trail emission** (dcm4che `audit`/syslog): hospital
-  compliance logging.
+- **De-identification profiles** (PS3.15 E, dcm4che `deidentify`)
+  — DONE: shipped `vyna-dcm-deid` (`Deidentifier` + 174-tag
+  `BASIC_PROFILE` with dummy/zero/remove/UID-remap/date-shift
+  actions, sequence recursion, private/overlay rules, burned-in
+  refusal) plus the batch `deidentify` CLI. Accepted: 14 engine
+  unit tests + doc test, 3 CLI tests, ECG stays IOD-valid with
+  identical samples post-run, 211/211 tests, clippy clean. Out of
+  scope (documented): full E.1 transcription, coded profile
+  claims, free-text scrubbing, charset conversion, UID-map
+  persistence, pixel redaction.
+- **ATNA audit-trail emission** (dcm4che `audit`/syslog) — DONE:
+  shipped `vyna-dcm-atna` (RFC 3881 message builders with pinned
+  code triples, `udp`/`tcp`/`tls` syslog delivery) plus the
+  `auditsend` CLI and wired `storescp`/`storescu`/`findscu`
+  emission (best-effort, status-mapped outcomes). Accepted: 11
+  lib unit tests + doc test (incl. TLS loopback and untrusted
+  rejection), 8 CLI/wiring tests, live UDP/TCP/TLS ARR-stub runs
+  with XML well-formedness check, 233/233 tests, clippy clean.
+  Out of scope (documented): peer socket IPs in handler audits,
+  movescu/getscu/mppsscu/stgcmtscu wiring, ARR (server) side.
 - **Specific Character Set conversion** (DCMTK `oficonv`-like):
   correct text decoding for CJK patient names.
 - **XML presentation** (`dcm2xml`/`xml2dcm`): debugging and transforms.

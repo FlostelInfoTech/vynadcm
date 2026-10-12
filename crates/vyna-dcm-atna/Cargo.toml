@@ -1,0 +1,24 @@
+[package]
+name = "vyna-dcm-atna"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "VynaDCM ATNA audit-trail emission: DICOM audit messages over syslog"
+
+[features]
+default = ["tls"]
+tls = ["rustls", "rustls-pemfile", "webpki-roots"]
+
+[dependencies]
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.1" }
+thiserror.workspace = true
+base64.workspace = true
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+webpki-roots = { workspace = true, optional = true }
+
+[dev-dependencies]
+rcgen.workspace = true

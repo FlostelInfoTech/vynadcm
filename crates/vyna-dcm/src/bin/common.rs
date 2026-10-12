@@ -212,6 +212,91 @@ fn read_opt(path: &Option<PathBuf>) -> anyhowish::Result<Option<Vec<u8>>> {
         .map_err(anyhowish::Error::from)
 }
 
+/// Audit emission arguments (ATNA) shared by the audited tools.
+#[derive(clap::Args, Debug, Default)]
+pub struct AuditArgs {
+    /// Audit server as udp://host:port, tcp://host:port, tls://host:port.
+    /// Audit emission is disabled when omitted.
+    #[arg(long)]
+    pub audit_server: Option<String>,
+    /// Audit Source ID (defaults to our AE title).
+    #[arg(long)]
+    pub audit_source: Option<String>,
+    /// Extra CA certificate (PEM) for tls:// audit verification.
+    #[arg(long)]
+    pub audit_ca: Option<PathBuf>,
+}
+
+impl AuditArgs {
+    /// Build a syslog sender, or `None` when auditing is disabled.
+    pub fn sender(&self, default_source: &str) -> anyhowish::Result<Option<SenderWithId>> {
+        let Some(url) = &self.audit_server else {
+            return Ok(None);
+        };
+        let target: vyna_dcm::SyslogTarget = url
+            .parse()
+            .map_err(|e: vyna_dcm::atna::Error| e.to_string())?;
+        let source = self
+            .audit_source
+            .clone()
+            .unwrap_or_else(|| default_source.to_string());
+        let mut sender = vyna_dcm::SyslogSender::new(target, source.clone());
+        if let Some(ca) = &self.audit_ca {
+            sender = sender
+                .with_ca_pem(std::fs::read(ca).map_err(|e| format!("{}: {e}", ca.display()))?);
+        }
+        Ok(Some(SenderWithId { sender, source }))
+    }
+}
+
+/// A syslog sender plus its audit source ID.
+#[derive(Clone, Debug)]
+pub struct SenderWithId {
+    /// The sender.
+    pub sender: vyna_dcm::SyslogSender,
+    /// Audit Source ID for emitted messages.
+    pub source: String,
+}
+
+/// Emit an audit message without ever failing the caller: transport
+/// problems print a warning and the clinical path continues.
+pub fn emit_best_effort(
+    sender: Option<&vyna_dcm::SyslogSender>,
+    msg: &vyna_dcm::AuditMessage,
+    tool: &str,
+) {
+    if let Some(sender) = sender
+        && let Err(e) = sender.emit(msg)
+    {
+        eprintln!("{tool}: audit emission failed (continuing): {e}");
+    }
+}
+
+/// Map a DIMSE status to an audit outcome.
+#[must_use]
+pub fn outcome_for_status(status: u16) -> vyna_dcm::Outcome {
+    use vyna_dcm::net::dimse::status;
+    if status::is_success(status) {
+        vyna_dcm::Outcome::Success
+    } else if status::is_warning(status) {
+        vyna_dcm::Outcome::MinorFailure
+    } else {
+        vyna_dcm::Outcome::MajorFailure
+    }
+}
+
+/// Host part of a `host:port` address (bracketed IPv6 handled).
+#[must_use]
+pub fn host_of(addr: &str) -> &str {
+    if let Some(bracketed) = addr.strip_prefix('[') {
+        return bracketed.split(']').next().unwrap_or(addr);
+    }
+    match addr.rsplit_once(':') {
+        Some((host, _)) if !host.contains(':') => host,
+        _ => addr,
+    }
+}
+
 /// Minimal error-aggregation alias so the tools stay dependency-light.
 /// (A tiny local `anyhow`-shaped helper; see below.)
 pub mod anyhowish {

@@ -8,6 +8,8 @@ vyna-dcm (facade: re-exports + bins + examples)
 ├── vyna-dcm-web ──┤
 ├── vyna-dcm-iod ──┤
 ├── vyna-dcm-pdf ──┤
+├── vyna-dcm-deid ─┤
+├── vyna-dcm-atna ─┤
 └── vyna-dcm-net ──┴──> vyna-dcm-codec ──> vyna-dcm-core
 ```
 
@@ -134,16 +136,31 @@ The physics convention follows PS3.3 C.10.9:
   `pdf_to_dataset` (validatable SOP instance), `pdf_from_dataset`
   (`ExtractedPdf`: byte-exact bytes + metadata), `file_meta_for_dataset`.
 
+## vyna-dcm-deid — de-identification
+
+- `profile.rs` — `Action` enum + 174-tag `BASIC_PROFILE` (PS3.15 E
+  semantics; curated subset, Type-disciplined).
+- `engine.rs` — `Deidentifier` (dummies, UID map, date offset,
+  private retention) + `DeidReport`; `dates.rs` holds the
+  dependency-free calendar shift.
+
+## vyna-dcm-atna — audit emission
+
+- `message.rs` — `AuditMessage` builders rendering RFC 3881 XML;
+  `syslog.rs` — `SyslogTarget` URLs + blocking `SyslogSender`
+  (UDP/TCP/TLS). Sync leaf: no tokio; TLS via rustls directly.
+
 ## vyna-dcm — facade, tools, examples
 
-- `lib.rs` — re-exports `core`/`codec`/`iod`/`pdf` always;
+- `lib.rs` — re-exports `core`/`codec`/`iod`/`pdf`/`deid`/`atna` always;
   `net`/`web`/`ecg` behind same-named features; common types
   (`DataSet`, `Tag`, `Vr`, `tags`, codec entry points) at the root.
-- `src/bin/` — 18 CLIs (feature `cli`; network tools also require `net`):
+- `src/bin/` — 20 CLIs (feature `cli`; network tools also require `net`):
   `echoscu`, `echoscp`, `storescu`, `storescp`, `findscu`, `movescu`,
   `getscu`, `mppsscu`, `stgcmtscu`, `dcmdump`,
   `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`,
-  `dcm2dcm`, `dcmdir` (`common.rs` holds shared arg parsing).
+  `dcm2dcm`, `dcmdir`, `deidentify`, `auditsend` (`common.rs` holds
+  shared arg parsing, incl. `AuditArgs`).
 - `examples/` — `ecg_write` (VynaECG pattern), `wado_fetch` (DICOMweb
   client), `link_route` (VynaLink store-and-forward chain: C-STORE in,
   routes to a downstream SCP).
