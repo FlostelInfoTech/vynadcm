@@ -98,12 +98,16 @@ Async (tokio) upper layer + DIMSE, usable as SCU, SCP, or both.
 - `service.rs` — SCP side: `propose` (odd context IDs), `negotiate`
   (AE/title/TS gating via `AcceptorOptions`), `accept` + `dispatch` to
   the `Handlers` trait, C-MOVE destination routing through
-  `ScpMoveConfig`, C-GET delivery with C-CANCEL abort.
+  `ScpMoveConfig`, C-FIND/C-MOVE/C-GET C-CANCEL honoring (mid-stream
+  polls + pushback), SCP-initiated `ScpFollowUp` N-EVENT-REPORTs.
 - `worklist.rs` — MWL/MPPS dataset builders and Storage Commitment
-  request/result helpers (`CommitmentResult`).
+  request/result helpers (`CommitmentResult`); `MppsScp` persists
+  N-CREATE/N-SET steps as Part-10 by MPPS UID (backs `mppsscp`).
 - `qrdb.rs` — file-backed QR/MWL index (`QrIndex::scan`) with
   C-FIND matching and level grouping; `QrScp`/`MwlScp` handlers
-  (FIND/MOVE/GET + worklist FIND) backing `findscp`/`mwlscp`.
+  (FIND/MOVE/GET + worklist FIND) backing `findscp`/`mwlscp`, and
+  `StgCommitScp` (commitment verdicts from holdings) backing
+  `stgcmtscp`.
 - `tls.rs` (feature `tls`) — `TlsAcceptor`/`TlsConnector` over
   tokio-rustls; `Association::request_over` runs DIMSE on any stream.
 

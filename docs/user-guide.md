@@ -59,13 +59,15 @@ and `stgcmtscu` share these flags:
 | `--tls-cert/--tls-key <pem>` | — | Client certificate + key (mutual TLS) |
 | `--tls-server-name <name>` | connect host | TLS server name indication |
 
-SCP tools (`echoscp`, `storescp`) share the listener flags:
-`--bind` (default `127.0.0.1:11112`), `--ae-title` (default
-`VYNA_SCP`), `--max-pdu` (default `262144`), `--timeout-secs`
-(default `300`), `--strict-ae` (reject mismatched Called-AE), and
-`--tls-cert` / `--tls-key` / `--tls-client-ca` (TLS is enabled when
-cert+key are present; client CA switches on mutual TLS).
-`storescp` adds `--directory` (default `.`) for received files.
+SCP tools (`echoscp`, `storescp`, `findscp`, `mwlscp`, `mppsscp`,
+`stgcmtscp`) share the listener flags: `--bind` (default
+`127.0.0.1:11112`), `--ae-title` (default `VYNA_SCP`), `--max-pdu`
+(default `262144`), `--timeout-secs` (default `300`), `--strict-ae`
+(reject mismatched Called-AE), and `--tls-cert` / `--tls-key` /
+`--tls-client-ca` (TLS is enabled when cert+key are present; client
+CA switches on mutual TLS). `storescp` adds `--directory` (default
+`.`) for received files; the other directory SCPs take the
+directory as a positional argument.
 
 Exit codes: `0` on success; nonzero with an error message on
 connection, negotiation, or DIMSE failures.
@@ -383,6 +385,10 @@ every received instance to a downstream PACS.
 | TLS handshake failure | CA / hostname mismatch | `--tls-ca`, `--tls-server-name`; check PEM validity |
 | `json2dcm` missing UID errors | JSON lacks SOP Class/Instance UIDs | Source dataset must carry both UIDs |
 | Slow/blocked reads | Peer idle, tight timeout | Raise `--timeout-secs` (SCP default 300 s) |
+| C-FIND ends `0xFE00` | Requested `--cancel` | Not an error; exits 0 with the matches so far |
+| `stgcmtscu` FAILED lines | SCP doesn't hold those instances (0x0112) | Check the `stgcmtscp` directory contents |
+| `--exec` hook silent | Template typo or hook exit ≠ 0 | Templates validate at startup; failures warn in the SCP log only |
+| `img2dcm` "needs 8 bits" | 16-bit source vs 8-bit-only JPEG Baseline | Use a lossless target or an 8-bit source |
 
 ## 10. ATNA audit trail
 
