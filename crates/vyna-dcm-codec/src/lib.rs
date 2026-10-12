@@ -34,6 +34,7 @@ pub mod jpeg_ls;
 mod json;
 mod part10;
 pub mod rle;
+pub mod transcode;
 
 pub(crate) use decode::decode_up_to;
 pub use decode::{UNDEFINED_LENGTH, decode_dataset};
@@ -46,6 +47,7 @@ pub use jpeg_lossless::JpegLosslessCodec;
 pub use jpeg_ls::JpegLsCodec;
 pub use json::{dataset_from_json, dataset_to_json};
 pub use part10::{FileMeta, META_VERSION, PREFIX_LEN, read_part10, write_part10};
+pub use transcode::{TranscodeOptions, transcode_dataset};
 pub use vyna_dcm_core::TransferSyntax;
 
 use vyna_dcm_core::{DataSet, FragmentSequence};
@@ -74,6 +76,22 @@ pub(crate) fn samples_from_bytes(
         Err(PixelCodecError::Geometry(format!(
             "bits allocated {bits_allocated} outside the 1..=16 range"
         )))
+    }
+}
+
+/// Stored frame length: `YBR_FULL_422` packs 2 bytes per pixel on
+/// the wire; every other photometric stores the decoded length.
+/// (Decoders return RGB for 422 JPEG data, so only native and RLE
+/// paths — which preserve stored bytes — use this.)
+pub(crate) fn stored_frame_len(ds: &DataSet, rows: u16, columns: u16, decoded_len: usize) -> usize {
+    use vyna_dcm_core::tags;
+    let is_422 = ds
+        .string(tags::PHOTOMETRIC_INTERPRETATION)
+        .is_some_and(|s| s.trim() == "YBR_FULL_422");
+    if is_422 {
+        rows as usize * columns as usize * 2
+    } else {
+        decoded_len
     }
 }
 
@@ -283,6 +301,8 @@ pub fn decode_pixels_with(
         .unwrap_or(1);
     let frame_len = rows as usize * columns as usize * samples as usize * bytes_per_sample;
     let expected = frame_len * frames;
+    let stored_len = stored_frame_len(ds, rows, columns, frame_len);
+    let stored_expected = stored_len * frames;
 
     let el = ds.get(tags::PIXEL_DATA).ok_or_else(|| Error::BadValue {
         tag: tags::PIXEL_DATA,
@@ -292,11 +312,11 @@ pub fn decode_pixels_with(
 
     match (&el.value, ts) {
         (Value::Bytes(b), ts) if ts.is_uncompressed() => {
-            if b.len() != expected {
+            if b.len() != stored_expected {
                 return Err(Error::BadValue {
                     tag: tags::PIXEL_DATA,
                     vr: el.vr,
-                    message: format!("pixel data {} bytes, expected {expected}", b.len()),
+                    message: format!("pixel data {} bytes, expected {stored_expected}", b.len()),
                 });
             }
             Ok(b.clone())
@@ -311,12 +331,12 @@ pub fn decode_pixels_with(
                 // each fragment holds exactly one frame.
                 if frames == 1 {
                     let joined = f.joined();
-                    return rle::decode_frame(&joined, frame_len);
+                    return rle::decode_frame(&joined, stored_len);
                 }
                 if f.fragments.len() == frames {
-                    let mut out = Vec::with_capacity(expected);
+                    let mut out = Vec::with_capacity(stored_expected);
                     for frag in &f.fragments {
-                        out.extend(rle::decode_frame(frag, frame_len)?);
+                        out.extend(rle::decode_frame(frag, stored_len)?);
                     }
                     return Ok(out);
                 }
@@ -328,13 +348,13 @@ pub fn decode_pixels_with(
             let joined = f.joined();
             let mut offsets = f.basic_offset_table.clone();
             offsets.push(joined.len() as u32);
-            let mut out = Vec::with_capacity(expected);
+            let mut out = Vec::with_capacity(stored_expected);
             for w in offsets.windows(2) {
                 let (a, b) = (w[0] as usize, w[1] as usize);
                 if b < a || b > joined.len() {
                     return Err(Error::Rle("basic offset table out of range".into()));
                 }
-                out.extend(rle::decode_frame(&joined[a..b], frame_len)?);
+                out.extend(rle::decode_frame(&joined[a..b], stored_len)?);
             }
             Ok(out)
         }
@@ -455,21 +475,29 @@ pub fn encode_pixels(
         .and_then(|s| s.parse().ok())
         .unwrap_or(1);
     let frame_len = rows as usize * columns as usize * samples as usize * bytes_per_sample;
-    if raw.len() != frame_len * frames {
+    // RLE preserves stored bytes (possibly subsampled); JPEG encoders
+    // take decoded RGB/mono.
+    let rle_frame_len = stored_frame_len(ds, rows, columns, frame_len);
+    let want_frame_len = if ts == TransferSyntax::RleLossless {
+        rle_frame_len
+    } else {
+        frame_len
+    };
+    if raw.len() != want_frame_len * frames {
         return Err(Error::BadValue {
             tag: tags::PIXEL_DATA,
             vr: Vr::Ow,
             message: format!(
                 "raw is {} bytes, expected {}",
                 raw.len(),
-                frame_len * frames
+                want_frame_len * frames
             ),
         });
     }
     if ts == TransferSyntax::RleLossless {
         let mut fragments = Vec::with_capacity(frames);
         for n in 0..frames {
-            let frame = &raw[n * frame_len..(n + 1) * frame_len];
+            let frame = &raw[n * rle_frame_len..(n + 1) * rle_frame_len];
             fragments.push(rle::encode_frame(frame, bytes_per_sample)?);
         }
         return Ok(FragmentSequence {

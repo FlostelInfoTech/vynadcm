@@ -7,7 +7,7 @@
 use std::io::Cursor;
 
 use jpeg_decoder::{Decoder, PixelFormat};
-use jpeg_encoder::{ColorType, Encoder};
+use jpeg_encoder::{ColorType, Encoder, SamplingFactor};
 use vyna_dcm_core::{FragmentSequence, TransferSyntax};
 
 use crate::{PixelCodec, PixelCodecError};
@@ -127,7 +127,15 @@ impl PixelCodec for JpegCodec {
             )));
         }
         let mut out = Vec::new();
-        Encoder::new(&mut out, self.quality.clamp(1, 100))
+        let mut encoder = Encoder::new(&mut out, self.quality.clamp(1, 100));
+        if samples_per_pixel == 3 {
+            // DICOM mandates 4:2:2 chroma for Baseline color (the crate
+            // defaults to 4:4:4 at q90+ and 4:2:0 below); average matches
+            // libjpeg's downsampling.
+            encoder.set_sampling_factor(SamplingFactor::R_4_2_2);
+            encoder.set_chroma_subsampling_method(jpeg_encoder::ChromaSubsamplingMethod::Average);
+        }
+        encoder
             .encode(raw, columns, rows, color)
             .map_err(|e| PixelCodecError::Codec(format!("jpeg encode failed: {e}")))?;
         Ok(FragmentSequence {
@@ -201,7 +209,48 @@ mod tests {
         let back = codec
             .decode_frame(TransferSyntax::JpegBaseline8Bit, &frags, rows, cols, 3, 8)
             .unwrap();
-        assert!(mean_abs_diff(&raw, &back) < 10.0);
+        let err = mean_abs_diff(&raw, &back);
+        // 4:2:2 subsampling costs chroma detail on this adversarial
+        // pattern (per-pixel chroma swings); real images do better.
+        assert!(err < 14.0, "mean abs err {err} too high at q90");
+        assert_sof0_sampling(&frags.fragments.concat(), &[0x21, 0x11, 0x11]);
+    }
+
+    #[test]
+    fn baseline_rgb_odd_sizes_roundtrip() {
+        let codec = JpegCodec::default();
+        let (rows, cols) = (17, 33);
+        let raw = pattern(cols, rows, 3);
+        let frags = codec
+            .encode_frame(TransferSyntax::JpegBaseline8Bit, &raw, rows, cols, 3, 8)
+            .unwrap();
+        let back = codec
+            .decode_frame(TransferSyntax::JpegBaseline8Bit, &frags, rows, cols, 3, 8)
+            .unwrap();
+        assert_eq!(back.len(), raw.len());
+        let err = mean_abs_diff(&raw, &back);
+        assert!(err < 16.0, "mean abs err {err} too high at q90");
+        assert_sof0_sampling(&frags.fragments.concat(), &[0x21, 0x11, 0x11]);
+    }
+
+    /// Assert the SOF0 component sampling factors of a JPEG bitstream
+    /// (e.g. `21 11 11` for 4:2:2 color (luma H=2, V=1)).
+    fn assert_sof0_sampling(jpeg: &[u8], want: &[u8]) {
+        let mut pos = jpeg
+            .windows(2)
+            .position(|w| w == [0xFF, 0xC0])
+            .expect("no SOF0 marker")
+            + 4; // marker + length
+        pos += 1 + 2 + 2; // precision + height + width
+        let ncomp = jpeg[pos] as usize;
+        pos += 1;
+        assert_eq!(ncomp, want.len(), "component count");
+        let mut got = Vec::with_capacity(ncomp);
+        for _ in 0..ncomp {
+            got.push(jpeg[pos + 1]); // H/V sampling nibbles
+            pos += 3;
+        }
+        assert_eq!(got, want);
     }
 
     #[test]

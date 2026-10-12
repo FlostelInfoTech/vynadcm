@@ -164,6 +164,20 @@ UIDs follow the dataset (erasing them refuses to write), and
 `--transfer-syntax UID` overrides the preserved encoding.
 Sequences can be erased but not set from the CLI.
 
+`dcm2dcm` transcodes pixel data between syntaxes (names or UIDs):
+
+```sh
+dcm2dcm ct.dcm ct.rle.dcm --transfer-syntax rle
+dcm2dcm sc.dcm sc.jpg.dcm --transfer-syntax jpeg-baseline --quality 90
+dcm2dcm us.dcm us.j2k.dcm --transfer-syntax jpeg2000 --lossy-ratio 8
+```
+
+Lossy targets (`.50`/`.81`/`.91`) get a fresh SOP Instance UID and
+lossy history tags; lossless targets keep the UID. Quality knobs
+(`--quality`, `--near`, `--lossy-ratio`) only pair with their own
+target and are rejected otherwise. Palette images and `.51`/J2K
+Part 2/HTJ2K are not supported.
+
 Note: JSON round-trips normalize `DS` float formatting (`500` →
 `500.0`); values stay numerically identical.
 

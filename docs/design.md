@@ -83,6 +83,13 @@ spec adds component contracts, algorithms, sequences, and invariants.
   (`.50`), `jpegli` (`.70`), `jpegls` (`.80`/`.81`), and a vendored
   `openjp2` (`.90`/`.91`, see `vendor/openjp2/README.VYNA.md` for the
   null-`dealloc` patch). `.51`, J2K Part 2, and HTJ2K stay unsupported.
+- `transcode_dataset(ds, src, dst, opts)`: decode → normalize
+  (big-endian swap, planar de-interleave, BT.601 YBR→RGB) →
+  re-encode; native/RLE length math is `YBR_FULL_422`-aware (2
+  bytes/pixel stored). `.50` color forces 4:2:2 sampling (SOF-checked
+  in tests). Target photometrics (`.50`→422, `.90`→RCT, `.91`→ICT),
+  ≤64 KiB refragmentation with offset tables, lossy flag/ratio/method
+  history, fresh SOP UID on lossy targets.
 - `dataset_to_json` / `dataset_from_json`: PS3.18 F; byte VRs use
   `InlineBinary` (base64); `DS`/`IS` accept JSON numbers or strings.
   Known normalization: Part-10 → JSON → Part-10 rewrites DS lexical

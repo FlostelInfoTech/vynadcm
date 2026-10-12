@@ -90,4 +90,9 @@ name = "dcmodify"
 path = "src/bin/dcmodify.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "dcm2dcm"
+path = "src/bin/dcm2dcm.rs"
+required-features = ["cli"]
+
 [dev-dependencies]

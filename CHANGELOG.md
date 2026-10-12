@@ -35,6 +35,13 @@ the workspace crate version (`Cargo.toml`).
   VR-aware values (`\` multi-values, `@path` binary input), guarded
   groups, file-meta UID sync, safe in-place replacement, and an
   optional transfer-syntax override; 144 tests green.
+- Pixel transcoding (`transcode_dataset` + `dcm2dcm` CLI): native /
+  RLE / bundled-JPEG matrix with planar/YBR normalization,
+  per-target photometrics, ≤64 KiB refragmentation, lossy history,
+  and fresh SOP UIDs on lossy targets; 161 tests green.
+- Fixes: `.50` color encodes now use DICOM-mandated 4:2:2 sampling
+  (was 4:4:4/4:2:0 depending on quality); native/RLE pixel length
+  math is `YBR_FULL_422`-aware.
 
 ## [0.1.0] — 2026-10-11
 

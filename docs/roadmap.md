@@ -88,8 +88,14 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   in-place or `--output`, transfer-syntax override). Accepted:
   7 CLI unit tests + edit→`dcmvalidate`→fix loop, 144/144 tests,
   clippy clean. Out of scope (documented): sequence setting.
-- **Transcode CLI/API** (`dcmconv`/`dcm2dcm`-like): decode + re-encode
-  across transfer syntaxes (needs P0.2 for compressed targets).
+- **Transcode CLI/API** (`dcmconv`/`dcm2dcm`-like) — DONE: shipped
+  `transcode_dataset` (11-syntax matrix incl. big endian, RGB
+  normalization, per-target photometrics, refragmentation, lossy
+  history + fresh UID on lossy targets) plus the `dcm2dcm` CLI with
+  quality knobs; also fixed `.50` color to 4:2:2 sampling and native
+  422 length math. Accepted: 16 transcode tests incl. exact lossless
+  matrix, 161/161 tests, clippy clean. Out of scope (documented):
+  palette expansion, `YBR_PARTIAL_*`, SOP-constrains-syntax checks.
 - **DICOMDIR read/create** (`dcmdir`/`dcmgpdir`, pydicom filesets):
   media import for VynaLink.
 - **WADO-URI client**: retired but still widely deployed on legacy

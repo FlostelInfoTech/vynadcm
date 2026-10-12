@@ -56,6 +56,8 @@ hyper. There are no DICOM dependencies outside this workspace.
   `dataset_from_json`, with `InlineBinary` for byte VRs.
 - `jpeg.rs` / `jpeg_lossless.rs` / `jpeg_ls.rs` / `jpeg_2000.rs` —
   bundled `PixelCodec` backends (`.50`, `.70`, `.80`/`.81`, `.90`/`.91`).
+- `transcode.rs` — `transcode_dataset` across the native/RLE/JPEG
+  matrix (RGB normalization, per-target photometrics, lossy history).
 - `lib.rs` — `decode_pixels` / `decode_pixels_with` / `encode_pixels`:
   native + RLE + raw deflated in-tree; JPEG families via the passed
   `PixelCodec` (`BundledCodec::default()` covers all six bundled
@@ -135,10 +137,10 @@ The physics convention follows PS3.3 C.10.9:
 - `lib.rs` — re-exports `core`/`codec`/`iod`/`pdf` always;
   `net`/`web`/`ecg` behind same-named features; common types
   (`DataSet`, `Tag`, `Vr`, `tags`, codec entry points) at the root.
-- `src/bin/` — 12 CLIs (feature `cli`; network tools also require `net`):
+- `src/bin/` — 13 CLIs (feature `cli`; network tools also require `net`):
   `echoscu`, `echoscp`, `storescu`, `storescp`, `findscu`, `dcmdump`,
-  `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`
-  (`common.rs` holds shared arg parsing).
+  `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`,
+  `dcm2dcm` (`common.rs` holds shared arg parsing).
 - `examples/` — `ecg_write` (VynaECG pattern), `wado_fetch` (DICOMweb
   client), `link_route` (VynaLink store-and-forward chain: C-STORE in,
   routes to a downstream SCP).
@@ -159,7 +161,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Test layout
 
-135 unit tests live next to the code (`#[cfg(test)]` modules, incl. CLI
+152 unit tests live next to the code (`#[cfg(test)]` modules, incl. CLI
 parsers) plus 2 integration tests (`tests/`), 7 doc tests
 on the crate roots. Network tests bind `127.0.0.1:0` (ephemeral ports)
 with in-process SCP peers — no fixed ports, no external services.
