@@ -31,6 +31,10 @@ the workspace crate version (`Cargo.toml`).
   extractor (`pdf_from_dataset` → byte-exact `ExtractedPdf`),
   plus the `pdf2dcm` (with IOD self-check) and `dcm2pdf` CLIs;
   137 tests green.
+- `dcmodify` CLI: tag modify/insert/erase with keyword/numeric tags,
+  VR-aware values (`\` multi-values, `@path` binary input), guarded
+  groups, file-meta UID sync, safe in-place replacement, and an
+  optional transfer-syntax override; 144 tests green.
 
 ## [0.1.0] — 2026-10-11
 

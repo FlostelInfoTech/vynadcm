@@ -22,7 +22,7 @@ library should read `docs/integration.md`.
 - [3. Connectivity: echoscu / echoscp](#3-connectivity-echoscu--echoscp)
 - [4. Storage: storescu / storescp](#4-storage-storescu--storescp)
 - [5. Query: findscu](#5-query-findscu)
-- [6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate, pdf2dcm, dcm2pdf](#6-files-dcmdump-dcm2json-json2dcm-dcmvalidate-pdf2dcm-dcm2pdf)
+- [6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify](#6-files-dcmdump-dcm2json-json2dcm-dcmvalidate-pdf2dcm-dcm2pdf-dcmodify)
 - [7. TLS walkthrough](#7-tls-walkthrough)
 - [8. Worked examples](#8-worked-examples)
 - [9. Troubleshooting](#9-troubleshooting)
@@ -117,7 +117,7 @@ findscu --connect 127.0.0.1:11112 --model mwl \
   requests a return key.
 - `--json` prints matches as DICOM JSON; otherwise a text dump.
 
-## 6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate, pdf2dcm, dcm2pdf
+## 6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify
 
 ```sh
 dcmdump file.dcm                        # text dump to stdout
@@ -145,6 +145,24 @@ input file name, and `--transfer-syntax explicit|implicit|deflated`
 (default `explicit`) picks the dataset encoding. The instance is
 validated against its IOD before writing, so a zero exit means the
 file is C-STORE-able; `dcm2pdf` extracts the bytes back exactly.
+
+`dcmodify` edits tags in place (or to `--output`): `-m TAG=VALUE`
+changes an existing element keeping its VR, `-i TAG[:VR]=VALUE`
+adds one (`:VR` needed only when the tag has no dictionary entry),
+`-e TAG` removes one. Tags accept `(0010,0010)`, `0010,0010`,
+`00100010`, or keywords; `\` separates multi-values, empty values
+blank the element, and `@path` feeds file bytes to binary VRs:
+
+```sh
+dcmodify file.dcm -o anon.dcm -m PatientName="Smith^John" -m PatientID= -e AccessionNumber
+dcmodify file.dcm -i SeriesDescription=Edited -i "(0009,1001):LO=private"
+dcmvalidate anon.dcm   # check the edited file still conforms
+```
+
+Edits apply as erases, then modifies, then inserts; file-meta SOP
+UIDs follow the dataset (erasing them refuses to write), and
+`--transfer-syntax UID` overrides the preserved encoding.
+Sequences can be erased but not set from the CLI.
 
 Note: JSON round-trips normalize `DS` float formatting (`500` →
 `500.0`); values stay numerically identical.

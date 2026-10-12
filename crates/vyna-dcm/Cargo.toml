@@ -85,4 +85,9 @@ name = "dcm2pdf"
 path = "src/bin/dcm2pdf.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "dcmodify"
+path = "src/bin/dcmodify.rs"
+required-features = ["cli"]
+
 [dev-dependencies]

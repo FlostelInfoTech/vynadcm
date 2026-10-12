@@ -82,8 +82,12 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
 
 ## 4. Priority 1: interface-engine depth
 
-- **Tag-editor CLI** (`dcmodify`-like): modify/insert/remove tags in
-  files; the dataset API already supports it.
+- **Tag-editor CLI** (`dcmodify`-like) — DONE: shipped the
+  `dcmodify` bin (modify/insert/erase, keyword/numeric tags,
+  VR-aware values, `@path` binary input, file-meta UID sync,
+  in-place or `--output`, transfer-syntax override). Accepted:
+  7 CLI unit tests + edit→`dcmvalidate`→fix loop, 144/144 tests,
+  clippy clean. Out of scope (documented): sequence setting.
 - **Transcode CLI/API** (`dcmconv`/`dcm2dcm`-like): decode + re-encode
   across transfer syntaxes (needs P0.2 for compressed targets).
 - **DICOMDIR read/create** (`dcmdir`/`dcmgpdir`, pydicom filesets):

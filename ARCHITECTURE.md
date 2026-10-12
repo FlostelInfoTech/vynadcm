@@ -135,9 +135,9 @@ The physics convention follows PS3.3 C.10.9:
 - `lib.rs` — re-exports `core`/`codec`/`iod`/`pdf` always;
   `net`/`web`/`ecg` behind same-named features; common types
   (`DataSet`, `Tag`, `Vr`, `tags`, codec entry points) at the root.
-- `src/bin/` — 11 CLIs (feature `cli`; network tools also require `net`):
+- `src/bin/` — 12 CLIs (feature `cli`; network tools also require `net`):
   `echoscu`, `echoscp`, `storescu`, `storescp`, `findscu`, `dcmdump`,
-  `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`
+  `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`
   (`common.rs` holds shared arg parsing).
 - `examples/` — `ecg_write` (VynaECG pattern), `wado_fetch` (DICOMweb
   client), `link_route` (VynaLink store-and-forward chain: C-STORE in,
@@ -159,7 +159,8 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Test layout
 
-128 unit tests live next to the code (`#[cfg(test)]` modules) plus 2 integration tests (`tests/`), 7 doc tests
+135 unit tests live next to the code (`#[cfg(test)]` modules, incl. CLI
+parsers) plus 2 integration tests (`tests/`), 7 doc tests
 on the crate roots. Network tests bind `127.0.0.1:0` (ephemeral ports)
 with in-process SCP peers — no fixed ports, no external services.
 Feature-gated tests (`tls`, `server`) compile out with their features.
