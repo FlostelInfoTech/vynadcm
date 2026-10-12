@@ -6,6 +6,7 @@
 //! - [`rle`] — from-scratch RLE Lossless pixel codec
 //! - [`dataset_to_json`] / [`dataset_from_json`] — DICOM JSON Model (PS3.18 F)
 //! - [`dataset_to_xml`] / [`dataset_from_xml`] — Native DICOM Model XML (PS3.19 A)
+//! - [`frame_to_png`] / [`inject_png`] — single-frame PNG export/import
 //! - [`dump_dataset`] — human-readable text dump
 //! - [`PixelCodec`] — plug-in trait for JPEG/JPEG 2000 families
 //! - [`BundledCodec`] — built-in [`PixelCodec`] for all bundled JPEG syntaxes
@@ -30,6 +31,7 @@ pub mod dicomdir;
 mod dump;
 mod encode;
 mod error;
+mod img;
 pub mod jpeg;
 pub mod jpeg_2000;
 pub mod jpeg_lossless;
@@ -50,6 +52,7 @@ pub use dump::dump_dataset;
 pub(crate) use encode::encode_dataset_capture_items;
 pub use encode::{DEFAULT_FRAGMENT_LEN, encode_dataset, fragment_payload};
 pub use error::{Error, Result};
+pub use img::{frame_to_png, inject_png};
 pub use jpeg::JpegCodec;
 pub use jpeg_2000::Jpeg2000Codec;
 pub use jpeg_lossless::JpegLosslessCodec;
@@ -104,6 +107,35 @@ pub(crate) fn stored_frame_len(ds: &DataSet, rows: u16, columns: u16, decoded_le
     } else {
         decoded_len
     }
+}
+
+/// Whether a basic offset table is usable for JPEG-family framing:
+/// one entry per frame, starting at 0, strictly increasing, and each
+/// pointing at a codestream start (`FF D8` for JPEG/JPEG-LS, `FF 4F`
+/// SOC for JPEG 2000). Bogus tables fall back to fragment-per-frame
+/// (see [`rle::bot_usable`]).
+fn jpeg_bot_usable(joined: &[u8], bot: &[u32], frames: usize, ts: TransferSyntax) -> bool {
+    if bot.len() != frames || frames == 0 || bot[0] != 0 {
+        return false;
+    }
+    for w in bot.windows(2) {
+        if w[1] <= w[0] {
+            return false;
+        }
+    }
+    let magic: &[u8] = match ts {
+        TransferSyntax::Jpeg2000Lossless
+        | TransferSyntax::Jpeg2000
+        | TransferSyntax::Jpeg2000Part2Lossless
+        | TransferSyntax::Jpeg2000Part2
+        | TransferSyntax::HtJpeg2000Lossless
+        | TransferSyntax::HtJpeg2000 => &[0xFF, 0x4F],
+        _ => &[0xFF, 0xD8],
+    };
+    bot.iter().all(|o| {
+        let o = *o as usize;
+        o + 2 <= joined.len() && joined[o..o + 2] == *magic
+    })
 }
 
 /// u16 samples back to native-order bytes.
@@ -333,41 +365,47 @@ pub fn decode_pixels_with(
             Ok(b.clone())
         }
         (Value::Fragments(f), TransferSyntax::RleLossless) => {
-            // RLE: one or more segments per frame; without frame offsets,
-            // treat each fragment run as one frame when BOT is present,
-            // else decode the whole stream as a single frame.
-            if frames == 1 || f.basic_offset_table.is_empty() {
-                // Concatenate fragments: single-frame fast path. Multi-frame
-                // without BOT is ambiguous; decode frame-by-frame only when
-                // each fragment holds exactly one frame.
-                if frames == 1 {
-                    let joined = f.joined();
-                    return rle::decode_frame(&joined, stored_len);
-                }
-                if f.fragments.len() == frames {
+            // Single frame: the joined stream is the frame.
+            if frames == 1 {
+                let joined = f.joined();
+                return rle::decode_frame(&joined, samples as usize, bytes_per_sample, stored_len);
+            }
+            // BOT present and usable: slice the joined stream per frame.
+            if !f.basic_offset_table.is_empty() {
+                let joined = f.joined();
+                if rle::bot_usable(&joined, &f.basic_offset_table, frames) {
+                    let mut offsets = f.basic_offset_table.clone();
+                    offsets.push(joined.len() as u32);
                     let mut out = Vec::with_capacity(stored_expected);
-                    for frag in &f.fragments {
-                        out.extend(rle::decode_frame(frag, stored_len)?);
+                    for w in offsets.windows(2) {
+                        let (a, b) = (w[0] as usize, w[1] as usize);
+                        out.extend(rle::decode_frame(
+                            &joined[a..b],
+                            samples as usize,
+                            bytes_per_sample,
+                            stored_len,
+                        )?);
                     }
                     return Ok(out);
                 }
-                return Err(Error::Rle(
-                    "multi-frame RLE without basic offset table and ambiguous framing".into(),
-                ));
+                // Else fall through: bogus tables (item headers counted
+                // in the offsets) decode fragment-per-frame instead.
             }
-            // BOT present: slice the joined stream per frame.
-            let joined = f.joined();
-            let mut offsets = f.basic_offset_table.clone();
-            offsets.push(joined.len() as u32);
-            let mut out = Vec::with_capacity(stored_expected);
-            for w in offsets.windows(2) {
-                let (a, b) = (w[0] as usize, w[1] as usize);
-                if b < a || b > joined.len() {
-                    return Err(Error::Rle("basic offset table out of range".into()));
+            if f.fragments.len() == frames {
+                let mut out = Vec::with_capacity(stored_expected);
+                for frag in &f.fragments {
+                    out.extend(rle::decode_frame(
+                        frag,
+                        samples as usize,
+                        bytes_per_sample,
+                        stored_len,
+                    )?);
                 }
-                out.extend(rle::decode_frame(&joined[a..b], stored_len)?);
+                return Ok(out);
             }
-            Ok(out)
+            Err(Error::Rle(
+                "multi-frame RLE without a usable basic offset table and ambiguous framing".into(),
+            ))
         }
         (Value::Fragments(f), ts) => {
             let codec =
@@ -375,35 +413,21 @@ pub fn decode_pixels_with(
             if !codec.syntaxes().contains(&ts) {
                 return Err(Error::UnsupportedTransferSyntax(ts.uid().to_string()));
             }
-            // JPEG family framing: the basic offset table wins when present;
+            // JPEG family framing: the basic offset table wins when present
+            // and usable (each entry must point at a codestream start);
             // otherwise one fragment per frame, with a single frame allowed
             // to span several concatenated fragments.
             let blobs: Vec<Vec<u8>> = if frames == 1 {
                 vec![f.joined()]
-            } else if !f.basic_offset_table.is_empty() {
+            } else if !f.basic_offset_table.is_empty()
+                && jpeg_bot_usable(&f.joined(), &f.basic_offset_table, frames, ts)
+            {
                 let joined = f.joined();
                 let mut offsets = f.basic_offset_table.clone();
                 offsets.push(joined.len() as u32);
-                if offsets.len() != frames + 1 {
-                    return Err(Error::BadValue {
-                        tag: tags::PIXEL_DATA,
-                        vr: el.vr,
-                        message: format!(
-                            "basic offset table holds {} frames, dataset says {frames}",
-                            offsets.len() - 1
-                        ),
-                    });
-                }
                 let mut blobs = Vec::with_capacity(frames);
                 for w in offsets.windows(2) {
                     let (a, b) = (w[0] as usize, w[1] as usize);
-                    if b < a || b > joined.len() {
-                        return Err(Error::BadValue {
-                            tag: tags::PIXEL_DATA,
-                            vr: el.vr,
-                            message: "basic offset table out of range".into(),
-                        });
-                    }
                     blobs.push(joined[a..b].to_vec());
                 }
                 blobs
@@ -506,10 +530,25 @@ pub fn encode_pixels(
         });
     }
     if ts == TransferSyntax::RleLossless {
+        // Subsampled storage (YBR_FULL_422) has no RLE segment form:
+        // planes must be equal-length full samples.
+        if rle_frame_len != frame_len {
+            return Err(Error::BadValue {
+                tag: tags::PIXEL_DATA,
+                vr: Vr::Ow,
+                message: format!(
+                    "RLE needs full samples, have {rle_frame_len} stored bytes for a {frame_len}-byte frame (convert photometric first)"
+                ),
+            });
+        }
         let mut fragments = Vec::with_capacity(frames);
         for n in 0..frames {
             let frame = &raw[n * rle_frame_len..(n + 1) * rle_frame_len];
-            fragments.push(rle::encode_frame(frame, bytes_per_sample)?);
+            fragments.push(rle::encode_frame(
+                frame,
+                samples as usize,
+                bytes_per_sample,
+            )?);
         }
         return Ok(FragmentSequence {
             basic_offset_table: vec![],
@@ -740,6 +779,40 @@ mod tests {
         ));
         let back = decode_pixels_with(&framed, ts, Some(&codec)).unwrap();
         assert_eq!(back, raw);
+    }
+
+    #[test]
+    fn rle_falls_back_on_bogus_bot() {
+        use crate::rle;
+        use vyna_dcm_core::{FragmentSequence, Value, Vr};
+        // Two distinct 4x4 16-bit frames, one fragment each.
+        let f0 = rle::encode_frame(&[1u8; 32], 1, 2).unwrap();
+        let f1 = rle::encode_frame(&[2u8; 32], 1, 2).unwrap();
+        let ds = geometry_ds(4, 4, 2);
+        let mut framed = ds.clone();
+        framed.insert(DataElement::new(
+            tags::PIXEL_DATA,
+            Vr::Ob,
+            Value::Fragments(FragmentSequence {
+                basic_offset_table: vec![0, f0.len() as u32 + 8], // header-counted, bogus
+                fragments: vec![f0, f1],
+            }),
+        ));
+        let back = decode_pixels(&framed, TransferSyntax::RleLossless).unwrap();
+        assert_eq!(back, [vec![1u8; 32], vec![2u8; 32]].concat());
+    }
+
+    #[test]
+    fn jpeg_bot_needs_codestream_starts() {
+        let ts = TransferSyntax::JpegLsLossless;
+        let joined = [vec![0xFF, 0xD8, 1, 2], vec![0xFF, 0xD8, 3, 4]].concat();
+        assert!(jpeg_bot_usable(&joined, &[0, 4], 2, ts));
+        assert!(!jpeg_bot_usable(&joined, &[0, 5], 2, ts)); // +8-style drift
+        assert!(!jpeg_bot_usable(&joined, &[2, 4], 2, ts));
+        assert!(!jpeg_bot_usable(&[0, 0, 0, 0], &[0], 1, ts));
+        let j2k = TransferSyntax::Jpeg2000Lossless;
+        assert!(jpeg_bot_usable(&[0xFF, 0x4F, 0, 0], &[0], 1, j2k));
+        assert!(!jpeg_bot_usable(&[0xFF, 0xD8, 0, 0], &[0], 1, j2k));
     }
 
     #[test]

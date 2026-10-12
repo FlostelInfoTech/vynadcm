@@ -86,6 +86,20 @@ the workspace crate version (`Cargo.toml`).
   lexical preservation, `PersonName` component groups, `BulkData`
   refused) plus `dcm2xml`/`xml2dcm` CLIs; JP CJK round-trip
   identical; 246 tests green.
+- `GB2312` Specific Character Set term (via its GBK superset) with
+  a CPython oracle vector.
+- Single-frame PNG export/import (`codec::img` over the `image`
+  crate) plus `dcm2img`/`img2dcm` CLIs; MONO 8/16-bit and RGB 8-bit,
+  no windowing; CLI round-trip byte-identical.
+- Vendored real-file regression corpus (`vendor/dicom-corpus`, MIT
+  pydicom-data: matched emri_small native/RLE/JPEG-LS/JPEG 2000 +
+  SC RGB) with cross-codec agreement and exact XML round-trip tests.
+- RLE interop fixes found by the corpus: MSB-first component-major
+  segment order (was little-endian), even-length segment padding
+  tolerated on decode and emitted on encode, bogus basic offset
+  tables validated with fragment-per-frame fallback (RLE and JPEG
+  arms), subsampled (422) RLE refused instead of written
+  non-standard; 256 tests green.
 
 ## [0.1.0] — 2026-10-11
 

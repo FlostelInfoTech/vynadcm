@@ -119,6 +119,10 @@ pub enum Error {
     #[error("XML error: {0}")]
     Xml(String),
 
+    /// Pixel image (PNG) conversion error.
+    #[error("image error: {0}")]
+    Image(String),
+
     /// Core data-model error passthrough.
     #[error(transparent)]
     Core(#[from] vyna_dcm_core::Error),

@@ -15,13 +15,14 @@ vendored `openjp2` (BSD-2-Clause, patched in-tree); Unreleased —
 deid/atna crates + charset conversion (`encoding_rs`): 218
 components (10 workspace, 208 third-party); Unreleased — XML
 presentation (`quick-xml`): 219 components (10 workspace, 209
-third-party).
+third-party); Unreleased — PNG export/import (`image` + PNG stack):
+227 components (10 workspace, 217 third-party).
 
 ## 1. Artifact
 
 `docs/sbom.cyclonedx.json` is the authoritative bill of materials in
 [CycloneDX](https://cyclonedx.org/) 1.5 JSON format. It currently lists
-**10 workspace members** (proprietary) and **209 third-party crates**,
+**10 workspace members** (proprietary) and **217 third-party crates**,
 each with name, version, Package URL, SPDX license, and (for registry
 crates) the SHA-256 checksum from `Cargo.lock`. One third-party
 component, `openjp2` 0.6.1, is vendored under `vendor/` with a VynaDCM

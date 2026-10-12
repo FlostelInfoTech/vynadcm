@@ -133,19 +133,19 @@ fn is_supported(ts: TransferSyntax) -> bool {
 }
 
 /// Decoded image geometry plus color interpretation.
-struct Geometry {
-    rows: u16,
-    columns: u16,
-    samples: u16,
-    bits: u16,
-    frames: usize,
-    photometric: Photometric,
-    planar: u16,
+pub(crate) struct Geometry {
+    pub(crate) rows: u16,
+    pub(crate) columns: u16,
+    pub(crate) samples: u16,
+    pub(crate) bits: u16,
+    pub(crate) frames: usize,
+    pub(crate) photometric: Photometric,
+    pub(crate) planar: u16,
 }
 
 /// Photometric Interpretations the transcoder understands.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum Photometric {
+pub(crate) enum Photometric {
     Mono1,
     Mono2,
     Rgb,
@@ -156,7 +156,7 @@ enum Photometric {
 }
 
 impl Photometric {
-    fn is_ybr(&self) -> bool {
+    pub(crate) fn is_ybr(&self) -> bool {
         matches!(
             self,
             Photometric::YbrFull
@@ -166,7 +166,7 @@ impl Photometric {
         )
     }
 
-    fn as_str(&self) -> &'static str {
+    pub(crate) fn as_str(&self) -> &'static str {
         match self {
             Photometric::Mono1 => "MONOCHROME1",
             Photometric::Mono2 => "MONOCHROME2",
@@ -180,7 +180,7 @@ impl Photometric {
 }
 
 impl Geometry {
-    fn read(ds: &DataSet) -> Result<Self> {
+    pub(crate) fn read(ds: &DataSet) -> Result<Self> {
         let req_u16 = |tag: Tag| {
             ds.uint16(tag).ok_or_else(|| Error::BadValue {
                 tag,
@@ -356,7 +356,7 @@ fn swap_pairs(raw: &mut [u8]) {
 }
 
 /// Color-by-plane (concatenated planes) to color-by-pixel (interleaved).
-fn deinterleave_planar(raw: &[u8], geo: &Geometry) -> Vec<u8> {
+pub(crate) fn deinterleave_planar(raw: &[u8], geo: &Geometry) -> Vec<u8> {
     let pixels = geo.rows as usize * geo.columns as usize;
     let bps = geo.bits.div_ceil(8) as usize;
     let plane = pixels * bps;
@@ -866,14 +866,10 @@ mod tests {
             Some("YBR_FULL_422")
         );
         assert_eq!(pixel_bytes(&kept), ybr);
-        // RLE preserves the subsampled bytes too.
-        let rle = transcode_dataset(&ds, TS_EXPLICIT, Ts::RleLossless, &opts()).unwrap();
-        assert_eq!(
-            rle.string(tags::PHOTOMETRIC_INTERPRETATION),
-            Some("YBR_FULL_422")
-        );
-        let unrle = transcode_dataset(&rle, Ts::RleLossless, TS_EXPLICIT, &opts()).unwrap();
-        assert_eq!(pixel_bytes(&unrle), ybr);
+        // RLE has no segment form for subsampled storage: rejected,
+        // not silently written as non-standard single-segment frames.
+        let err = transcode_dataset(&ds, TS_EXPLICIT, Ts::RleLossless, &opts()).unwrap_err();
+        assert!(format!("{err:?}").contains("full samples"), "{err:?}");
         // JPEG target: upsampled to RGB first, ends RGB on the way back.
         let mid = transcode_dataset(&ds, TS_EXPLICIT, Ts::JpegBaseline8Bit, &opts()).unwrap();
         assert_eq!(

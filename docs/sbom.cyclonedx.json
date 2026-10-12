@@ -3,7 +3,7 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-10-12T04:35:00Z",
+    "timestamp": "2026-10-12T05:16:04Z",
     "tools": {
       "components": [
         {
@@ -326,6 +326,25 @@
       ]
     },
     {
+      "bom-ref": "pkg:cargo/bytemuck@1.25.2",
+      "type": "library",
+      "name": "bytemuck",
+      "version": "1.25.2",
+      "scope": "required",
+      "purl": "pkg:cargo/bytemuck@1.25.2",
+      "licenses": [
+        {
+          "expression": "Zlib OR Apache-2.0 OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+        }
+      ]
+    },
+    {
       "bom-ref": "pkg:cargo/byteorder@1.5.0",
       "type": "library",
       "name": "byteorder",
@@ -341,6 +360,25 @@
         {
           "alg": "SHA-256",
           "content": "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:cargo/byteorder-lite@0.1.0",
+      "type": "library",
+      "name": "byteorder-lite",
+      "version": "0.1.0",
+      "scope": "required",
+      "purl": "pkg:cargo/byteorder-lite@0.1.0",
+      "licenses": [
+        {
+          "expression": "Unlicense OR MIT"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "8f1fe948ff07f4bd06c30984e69f5b4899c516a3ef74f34df92a2df2ab535495"
         }
       ]
     },
@@ -689,6 +727,25 @@
         {
           "alg": "SHA-256",
           "content": "8e985e0451871ad22fb8d2b6b076e2028a502a0d3950998c2c5c0a4f9b5d9679"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:cargo/fdeflate@0.3.7",
+      "type": "library",
+      "name": "fdeflate",
+      "version": "0.3.7",
+      "scope": "required",
+      "purl": "pkg:cargo/fdeflate@0.3.7",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1e6853b52649d4ac5c0bd02320cddc5ba956bdb407c4b75a2c6b75bf51500f8c"
         }
       ]
     },
@@ -1285,6 +1342,25 @@
       ]
     },
     {
+      "bom-ref": "pkg:cargo/image@0.25.10",
+      "type": "library",
+      "name": "image",
+      "version": "0.25.10",
+      "scope": "required",
+      "purl": "pkg:cargo/image@0.25.10",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "85ab80394333c02fe689eaf900ab500fbd0c2213da414687ebf995a65d5a6104"
+        }
+      ]
+    },
+    {
       "bom-ref": "pkg:cargo/ipnet@2.12.2",
       "type": "library",
       "name": "ipnet",
@@ -1591,6 +1667,25 @@
       ]
     },
     {
+      "bom-ref": "pkg:cargo/miniz_oxide@0.8.9",
+      "type": "library",
+      "name": "miniz_oxide",
+      "version": "0.8.9",
+      "scope": "required",
+      "purl": "pkg:cargo/miniz_oxide@0.8.9",
+      "licenses": [
+        {
+          "expression": "MIT OR Zlib OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "1fa76a2c86f704bdb222d66965fb3d63269ce38518b83cb0575fca855ebb6316"
+        }
+      ]
+    },
+    {
       "bom-ref": "pkg:cargo/miniz_oxide@0.9.1",
       "type": "library",
       "name": "miniz_oxide",
@@ -1627,6 +1722,25 @@
         {
           "alg": "SHA-256",
           "content": "1788edb87fdc09c7e26304471e2f5be8cdefb1b6930d6e3985fc02ff53bf86ee"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:cargo/moxcms@0.8.1",
+      "type": "library",
+      "name": "moxcms",
+      "version": "0.8.1",
+      "scope": "required",
+      "purl": "pkg:cargo/moxcms@0.8.1",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "bb85c154ba489f01b25c0d36ae69a87e4a1c73a72631fc6c0eb6dde34a73e44b"
         }
       ]
     },
@@ -1898,6 +2012,25 @@
       ]
     },
     {
+      "bom-ref": "pkg:cargo/png@0.18.1",
+      "type": "library",
+      "name": "png",
+      "version": "0.18.1",
+      "scope": "required",
+      "purl": "pkg:cargo/png@0.18.1",
+      "licenses": [
+        {
+          "expression": "MIT OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "60769b8b31b2a9f263dae2776c37b1b28ae246943cf719eb6946a1db05128a61"
+        }
+      ]
+    },
+    {
       "bom-ref": "pkg:cargo/potential_utf@0.1.6",
       "type": "library",
       "name": "potential_utf",
@@ -2010,6 +2143,25 @@
         {
           "alg": "SHA-256",
           "content": "480f6d9c01d5eb952d227ef21e7e1395ae6332df183f70d532ea8dd18d0850fa"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:cargo/pxfm@0.1.30",
+      "type": "library",
+      "name": "pxfm",
+      "version": "0.1.30",
+      "scope": "required",
+      "purl": "pkg:cargo/pxfm@0.1.30",
+      "licenses": [
+        {
+          "expression": "BSD-3-Clause OR Apache-2.0"
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
         }
       ]
     },

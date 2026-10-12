@@ -115,6 +115,9 @@ spec adds component contracts, algorithms, sequences, and invariants.
   (no float trip, unlike JSON), `OL`/`OV`/`OD`/`OF` numeric like
   the JSON mapping, empty attributes normalize to `Value::Empty`,
   `BulkData` refused.
+- `frame_to_png` / `inject_png`: single-frame PNG export/import over
+  `Geometry` + `decode_pixels` (MONO 8/16, RGB 8; MONO1 inverted,
+  signed offset, no windowing) and the `image` crate (PNG only).
 
 ### 2.3 `vyna-dcm-net` — DIMSE
 
@@ -259,10 +262,13 @@ reject whole association (result=1) when: bad application context,
 ### 3.2 RLE frame codec (`codec::rle`)
 
 DICOM RLE: header (`u32` segment count + 15 offsets, 64 bytes) then one
-PackBits stream per byte-plane (byte-interleaved: plane `s` holds byte
-`s` of every sample). PackBits: replicate runs of ≥3 bytes (max 128),
-else literal runs (max 128); `0x80` header is a no-op. Decode validates
-offsets against the buffer before reading.
+PackBits stream per segment, component-major and MSB-first within each
+component (16-bit mono is `[high, low]`). PackBits: replicate runs of
+≥3 bytes (max 128), else literal runs (max 128); `0x80` header is a
+no-op. Segments are even-length (one pad byte tolerated past the known
+plane length); basic offset tables are validated (RLE header / JPEG
+magic at each entry) with fragment-per-frame fallback for bogus tables.
+Subsampled (422) storage has no segment form and is refused.
 
 ### 3.3 DICOM JSON mapping (`codec::json`)
 

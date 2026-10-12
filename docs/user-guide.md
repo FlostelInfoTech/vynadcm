@@ -154,7 +154,7 @@ stgcmtscu --connect 127.0.0.1:11112 --file received.dcm --timeout-secs 60
   `--instance CLASS_UID:INSTANCE_UID`; `--timeout-secs` bounds the
   report wait, and any failed instance exits nonzero.
 
-## 6. Files: dcmdump, dcm2json, json2dcm, dcm2xml, xml2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify
+## 6. Files: dcmdump, dcm2json, json2dcm, dcm2xml, xml2dcm, dcm2img, img2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify
 
 ```sh
 dcmdump file.dcm                        # text dump to stdout
@@ -165,6 +165,8 @@ json2dcm --output implicit.dcm --transfer-syntax 1.2.840.10008.1.2 file.json
 dcm2xml file.dcm > file.xml              # Part-10 → Native DICOM Model XML
 dcm2xml --with-meta file.dcm > full.xml  # include group 0002 meta
 xml2dcm --output roundtrip.dcm file.xml  # XML → Part-10 (explicit LE)
+dcm2img frame.dcm frame.png --frame 1   # render one frame to PNG
+img2dcm frame.png frame.dcm -o inj.dcm  # inject PNG pixels (native TS only)
 dcmvalidate file.dcm                    # IOD conformance check
 dcmvalidate --sop-class 1.2.840.10008.5.1.4.1.1.2 file.dcm  # override SOP Class
 pdf2dcm report.pdf report.dcm --patient-name "Doe^Jane" --patient-id P123
@@ -264,6 +266,11 @@ Note: JSON round-trips normalize `DS` float formatting (`500` →
 Unlike JSON, XML round-trips preserve `DS` float formatting
 exactly; person names keep their `Alphabetic`/`Ideographic`/
 `Phonetic` groups as XML elements for transforms.
+
+`dcm2img` renders MONOCHROME (8/16-bit) and RGB frames without
+windowing (signed values offset, MONOCHROME1 inverted); YBR and
+palette data must be transcoded first. `img2dcm` replaces Pixel
+Data from a PNG and rewrites the geometry tags, keeping UIDs.
 
 ## 7. TLS walkthrough
 

@@ -8,7 +8,7 @@
 //! Supported terms: `ISO_IR 6`, `ISO_IR 100/101/109/110/144/127/126/
 //! 138/148/166`, `ISO_IR 192`, `ISO_IR 13`, `ISO 2022 IR 13/87/159`
 //! (Japanese, incl. code-extension pairs), `ISO 2022 IR 149`
-//! (Korean, G1 via SO/SI), `GB18030`, `GBK`. Anything else falls
+//! (Korean, G1 via SO/SI), `GB18030`, `GBK`, `GB2312`. Anything else falls
 //! back to Latin-1 on decode (the historical behavior) and UTF-8
 //! bytes on encode (data-preserving).
 
@@ -103,6 +103,9 @@ fn single_for(term: &str) -> Option<Single> {
         "ISO_IR 13" | "ISO 2022 IR 13" => Single::JisX0201,
         "GB18030" => Single::Codec(enc::GB18030),
         "GBK" => Single::Codec(enc::GBK),
+        // GBK is a strict superset of GB2312: decode-exact, though
+        // encoding may emit GBK-only bytes for non-GB2312 input.
+        "GB2312" => Single::Codec(enc::GBK),
         _ => return None,
     })
 }
@@ -374,6 +377,7 @@ mod tests {
         ),
         ("gb18030", "王伟", &[205, 245, 206, 176]),
         ("gbk", "王伟", &[205, 245, 206, 176]),
+        ("gb2312", "王伟", &[205, 245, 206, 176]),
     ];
 
     fn decoding_for(codec: &str) -> Decoding {
@@ -388,6 +392,7 @@ mod tests {
             "iso2022-kr" => vec!["ISO 2022 IR 6", "ISO 2022 IR 149"],
             "gb18030" => vec!["GB18030"],
             "gbk" => vec!["GBK"],
+            "gb2312" => vec!["GB2312"],
             other => panic!("no mapping for {other}"),
         }
         .into_iter()
