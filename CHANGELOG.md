@@ -81,6 +81,11 @@ the workspace crate version (`Cargo.toml`).
   Cyrillic/Thai sets, UTF-8, JIS X 0201, Japanese ISO-2022 pairs,
   Korean ISO 2022 IR 149, GBK/GB18030; CPython-oracle vectors,
   dataset round-trip tests, `dcmdump` CJK smoke; 242 tests green.
+- Native DICOM Model XML (PS3.19 A): `codec::xml`
+  (`dataset_to_xml`/`dataset_from_xml` over `quick-xml`, `DS`
+  lexical preservation, `PersonName` component groups, `BulkData`
+  refused) plus `dcm2xml`/`xml2dcm` CLIs; JP CJK round-trip
+  identical; 246 tests green.
 
 ## [0.1.0] — 2026-10-11
 

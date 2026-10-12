@@ -115,6 +115,10 @@ pub enum Error {
     #[error("base64 error: {0}")]
     Base64(String),
 
+    /// Native DICOM Model XML error.
+    #[error("XML error: {0}")]
+    Xml(String),
+
     /// Core data-model error passthrough.
     #[error(transparent)]
     Core(#[from] vyna_dcm_core::Error),

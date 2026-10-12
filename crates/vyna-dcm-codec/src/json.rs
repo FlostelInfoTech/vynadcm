@@ -38,11 +38,11 @@ pub fn dataset_from_json(v: &Json) -> Result<DataSet> {
     Ok(ds)
 }
 
-fn tag_key(tag: Tag) -> String {
+pub(crate) fn tag_key(tag: Tag) -> String {
     format!("{:04X}{:04X}", tag.group(), tag.element())
 }
 
-fn parse_tag_key(key: &str) -> Result<Tag> {
+pub(crate) fn parse_tag_key(key: &str) -> Result<Tag> {
     if key.len() != 8 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(Error::Json(format!("bad tag key {key:?}")));
     }

@@ -56,6 +56,9 @@ hyper. There are no DICOM dependencies outside this workspace.
   `decode_frame`).
 - `json.rs` — DICOM JSON Model (PS3.18 F): `dataset_to_json` /
   `dataset_from_json`, with `InlineBinary` for byte VRs.
+- `xml.rs` — Native DICOM Model XML (PS3.19 A): `dataset_to_xml` /
+  `dataset_from_xml` (`quick-xml` reader), `DS` lexical
+  preservation, `BulkData` refused.
 - `jpeg.rs` / `jpeg_lossless.rs` / `jpeg_ls.rs` / `jpeg_2000.rs` —
   bundled `PixelCodec` backends (`.50`, `.70`, `.80`/`.81`, `.90`/`.91`).
 - `transcode.rs` — `transcode_dataset` across the native/RLE/JPEG

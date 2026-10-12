@@ -73,6 +73,16 @@ path = "src/bin/json2dcm.rs"
 required-features = ["cli"]
 
 [[bin]]
+name = "dcm2xml"
+path = "src/bin/dcm2xml.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "xml2dcm"
+path = "src/bin/xml2dcm.rs"
+required-features = ["cli"]
+
+[[bin]]
 name = "dcmvalidate"
 path = "src/bin/dcmvalidate.rs"
 required-features = ["cli"]

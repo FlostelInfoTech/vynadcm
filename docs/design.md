@@ -109,6 +109,12 @@ spec adds component contracts, algorithms, sequences, and invariants.
   `InlineBinary` (base64); `DS`/`IS` accept JSON numbers or strings.
   Known normalization: Part-10 → JSON → Part-10 rewrites DS lexical
   form (`500` → `500.0`); values stay numerically identical.
+- `dataset_to_xml` / `dataset_from_xml`: PS3.19 Native DICOM
+  Model (`quick-xml` reader); `Value`/`PersonName`/`Item`/
+  `InlineBinary` children per VR, `DS` lexical form preserved
+  (no float trip, unlike JSON), `OL`/`OV`/`OD`/`OF` numeric like
+  the JSON mapping, empty attributes normalize to `Value::Empty`,
+  `BulkData` refused.
 
 ### 2.3 `vyna-dcm-net` — DIMSE
 

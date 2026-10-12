@@ -3,7 +3,7 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-10-12T04:21:53Z",
+    "timestamp": "2026-10-12T04:35:00Z",
     "tools": {
       "components": [
         {
@@ -2010,6 +2010,27 @@
         {
           "alg": "SHA-256",
           "content": "480f6d9c01d5eb952d227ef21e7e1395ae6332df183f70d532ea8dd18d0850fa"
+        }
+      ]
+    },
+    {
+      "bom-ref": "pkg:cargo/quick-xml@0.38.4",
+      "type": "library",
+      "name": "quick-xml",
+      "version": "0.38.4",
+      "scope": "required",
+      "purl": "pkg:cargo/quick-xml@0.38.4",
+      "licenses": [
+        {
+          "license": {
+            "id": "MIT"
+          }
+        }
+      ],
+      "hashes": [
+        {
+          "alg": "SHA-256",
+          "content": "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
         }
       ]
     },

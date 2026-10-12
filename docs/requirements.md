@@ -140,6 +140,12 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   errors, unusable records are reported, never silently dropped),
   and write them from referenced datasets (`build_dicomdir`) with
   measured two-pass offsets. `MRDR` following stays out of scope.
+- **FR-CODEC-11 (M)** Convert datasets to/from Native DICOM Model
+  XML (PS3.19 A): `Value` children for text/numbers/AT (8-hex),
+  `PersonName` component groups, `InlineBinary` for byte VRs,
+  nested `Item` datasets; `DS` keeps its wire lexical form (no
+  float trip). `BulkData` references are refused; DCMTK's
+  proprietary `<element>` format stays out of scope.
 
 ### 3.3 DIMSE networking (`vyna-dcm-net`)
 
@@ -254,6 +260,8 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   take `--audit-server` for wired emission.
 - **FR-CLI-02 (M)** File tools: `dcmdump`, `dcm2json` (incl. file-meta
   option), `json2dcm` (incl. transfer-syntax selection),
+  `dcm2xml` (incl. file-meta option), `xml2dcm` (incl.
+  transfer-syntax selection),
   `dcmvalidate` (IOD check with SOP-Class override; exit 0/1/2),
   `pdf2dcm` (PDF → Part-10 with IOD self-check; exit 0/1),
   `dcm2pdf` (Part-10 → PDF extraction; exit 0/1),
@@ -349,12 +357,13 @@ ATNA audit-trail emission.
 | FR-CODEC-08 | `dump_contains_expected_lines` |
 | FR-CODEC-09 | `mono8_lossless_matrix_is_exact`, `mono16_and_bigendian_roundtrip_exact`, `rgb_*`, `ybr422_*`, `ybr_full_*`, `lossy_source_keeps_history_*`, `multiframe_*`, `bad_inputs_rejected`, `baseline_rgb_odd_sizes_roundtrip`, CLI `dcm2dcm` matrix runs |
 | FR-CODEC-10 | `roundtrip_tree` (every link points at an item tag), `empty_dir_roundtrip`, `record_type_mapping`, `entry_validation`, `rejects_non_directory`, `walker_*` (skips, loops, dangling, deleted), `capture_points_at_item_tags`, CLI `dcmdir` create+list runs |
+| FR-CODEC-11 | `round_trips_mixed_dataset`, `person_name_component_groups`, `rejects_bad_inputs`, `liberal_parse_accepts_minimal`, CLI `dcm2xml` → `xml2dcm` JP round-trip run |
 | FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, `loopback_storage_commit`, `storage_commit_skips_wait_on_action_failure`, PDU/DIMSE tests (20); live C-ECHO against third-party endpoint `0x0000` |
 | FR-NET-07 | worklist/MPPS/commitment tests |
 | FR-NET-08 | `tls_loopback_echo`, `rejects_empty_chain_and_key` |
 | FR-WEB-01…03 | `end_to_end_client_against_hyper`, `wado_uri_against_stub`, `wado_uri_*` param tests, dispatch/multipart tests |
 | FR-ECG-01…03 | `vyna-dcm-ecg` tests (7); `ecg_write` example |
-| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `movescu`, `getscu`, `mppsscu`, `stgcmtscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
+| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `movescu`, `getscu`, `mppsscu`, `stgcmtscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
 | FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
 | FR-DEID-01…03 | `every_action_fires`, `shift_keeps_longitudinal_intervals`, `datetimes_shift_or_dummy_by_vr`, `burned_in_annotation_refuses_before_mutation`, `uid_maps_stay_consistent_across_datasets`, `shifts_cross_month_year_and_leap_day`, profile self-checks, CLI `output_plans_*` + `process_file_round_trip`, `deidentified_ecg_validates_with_identical_samples` |

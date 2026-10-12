@@ -163,8 +163,25 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   `dcmdump` JP/CN smoke runs, 242/242 tests, clippy clean. Out of
   scope (documented): ISO 8859-10/13/14/15/16, UTF-16, vendor code
   pages.
-- **XML presentation** (`dcm2xml`/`xml2dcm`): debugging and transforms.
-- **UPS / IAN**: adopt if customers demand; niche otherwise.
+- **XML presentation** (`dcm2xml`/`xml2dcm`) — DONE: shipped
+  `codec::xml` (PS3.19 Native DICOM Model: `Value`/`PersonName`/
+  `Item`/`InlineBinary`, `DS` lexical preservation, strict VR
+  child checks, liberal keyword/numbering) plus the `dcm2xml`
+  (`--with-meta`) / `xml2dcm` (`--transfer-syntax`, encapsulated
+  re-fragment) CLIs. Accepted: 4 round-trip/rejection tests, JP
+  CJK round-trip identical, 246/246 tests, clippy clean. Out of
+  scope (documented): `BulkData` resolution, DCMTK `<element>`
+  format.
+- **UPS / IAN** — EVALUATED (2026-10-12): demand gate not met,
+  no code shipped. Verified reusable on adoption day: SCU
+  `n_create`/`n_set`/`n_get`/`n_action`/`n_delete`/
+  `n_event_report` + `storage_commit` N-ACTION/report-wait, SCP
+  `on_n_*` handler hooks, UPS tags in the generated dictionary.
+  Adoption plan when demanded: UPS Push/Pull/Watch/Event + IAN SOP
+  Class UIDs, UPS state machine (transitions, locking,
+  subscriptions) with an SCP-side store, `upsscu` CLI, IAN
+  emission, verification against a real peer (dcm4chee UPS SCP) —
+  self-loopback alone proves little for a workflow protocol.
 
 ## 6. Deliberate non-goals
 

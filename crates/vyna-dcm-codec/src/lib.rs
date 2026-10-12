@@ -5,6 +5,7 @@
 //! - [`read_part10`] / [`write_part10`] — Part-10 file format
 //! - [`rle`] — from-scratch RLE Lossless pixel codec
 //! - [`dataset_to_json`] / [`dataset_from_json`] — DICOM JSON Model (PS3.18 F)
+//! - [`dataset_to_xml`] / [`dataset_from_xml`] — Native DICOM Model XML (PS3.19 A)
 //! - [`dump_dataset`] — human-readable text dump
 //! - [`PixelCodec`] — plug-in trait for JPEG/JPEG 2000 families
 //! - [`BundledCodec`] — built-in [`PixelCodec`] for all bundled JPEG syntaxes
@@ -37,6 +38,7 @@ mod json;
 mod part10;
 pub mod rle;
 pub mod transcode;
+mod xml;
 
 pub use decode::{UNDEFINED_LENGTH, decode_dataset};
 pub(crate) use decode::{decode_dataset_capture_items, decode_up_to};
@@ -57,6 +59,7 @@ pub(crate) use part10::meta_section_len;
 pub use part10::{FileMeta, META_VERSION, PREFIX_LEN, read_part10, write_part10};
 pub use transcode::{TranscodeOptions, transcode_dataset};
 pub use vyna_dcm_core::TransferSyntax;
+pub use xml::{dataset_from_xml, dataset_to_xml};
 
 use vyna_dcm_core::{DataSet, FragmentSequence};
 
