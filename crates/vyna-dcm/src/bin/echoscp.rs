@@ -69,6 +69,9 @@ async fn main() -> Result<()> {
         let Ok((tcp, peer)) = listener.accept().await else {
             continue;
         };
+        // DIMSE is small-write chatty; Nagle would stall each PDU on the
+        // peer's delayed ACK (~40ms).
+        tcp.set_nodelay(true).ok();
         let (acceptor, tls) = (acceptor.clone(), tls.clone());
         tokio::spawn(async move {
             println!("association from {peer}");

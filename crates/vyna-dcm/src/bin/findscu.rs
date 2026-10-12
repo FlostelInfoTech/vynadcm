@@ -27,8 +27,24 @@ struct Args {
     /// Print matches as DICOM JSON instead of text dump.
     #[arg(long, default_value_t = false)]
     json: bool,
+    /// Cancel the query after receiving this many matches (0 = run
+    /// to completion). A requested cancel exits 0 with status FE00.
+    #[arg(long, default_value_t = 0)]
+    cancel: u32,
     #[command(flatten)]
     audit: AuditArgs,
+}
+
+fn print_match(ds: &vyna_dcm::DataSet, count: u32, json: bool) {
+    println!("--- match {count} ---");
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&vyna_dcm::dataset_to_json(ds)).unwrap()
+        );
+    } else {
+        print!("{}", dump_dataset(ds));
+    }
 }
 
 #[tokio::main]
@@ -52,21 +68,25 @@ async fn main() -> Result<()> {
         .conn
         .connect(&[sop], &ConnArgs::default_syntaxes())
         .await?;
-    let mut count = 0;
-    let status = assoc
-        .find_with(sop, &query, 0, |ds| {
-            count += 1;
-            println!("--- match {count} ---");
-            if args.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&vyna_dcm::dataset_to_json(&ds)).unwrap()
-                );
-            } else {
-                print!("{}", dump_dataset(&ds));
-            }
-        })
-        .await?;
+    let mut count = 0u32;
+    let json = args.json;
+    let status = if args.cancel > 0 {
+        let limit = args.cancel;
+        assoc
+            .find_cancelable(sop, &query, 0, |ds| {
+                count += 1;
+                print_match(&ds, count, json);
+                count < limit
+            })
+            .await?
+    } else {
+        assoc
+            .find_with(sop, &query, 0, |ds| {
+                count += 1;
+                print_match(&ds, count, json);
+            })
+            .await?
+    };
     println!("C-FIND complete: {count} match(es), status {status:#06X}");
     if let Some(audit) = args.audit.sender(&args.conn.calling)? {
         let mut msg = vyna_dcm::AuditMessage::query(
@@ -78,16 +98,26 @@ async fn main() -> Result<()> {
             Some(host_of(&args.conn.connect)),
             &audit.source,
         );
-        msg.outcome = outcome_for_status(status);
+        // A requested cancel is the successful outcome, not a failure.
+        msg.outcome = if requested_cancel(status, args.cancel > 0) {
+            vyna_dcm::Outcome::Success
+        } else {
+            outcome_for_status(status)
+        };
         emit_best_effort(Some(&audit.sender), &msg, "findscu");
     }
     assoc.release().await?;
-    if status != 0 {
+    if status != 0 && !requested_cancel(status, args.cancel > 0) {
         return Err(common::anyhowish::Error::msg(format!(
             "C-FIND failed: {status:#06X}"
         )));
     }
     Ok(())
+}
+
+/// True when `status` is FE00 from our own `--cancel` request.
+fn requested_cancel(status: u16, cancel_armed: bool) -> bool {
+    cancel_armed && status == vyna_dcm::net::dimse::status::CANCEL
 }
 
 #[cfg(test)]
@@ -144,6 +174,19 @@ mod tests {
         ])
         .unwrap();
         assert!(args.audit.sender("VYNA_SCU").unwrap().is_some());
+    }
+
+    #[test]
+    fn cancel_flag_parses() {
+        let args = Args::try_parse_from(["findscu", "--connect", "127.0.0.1:11112"]).unwrap();
+        assert_eq!(args.cancel, 0);
+        let args =
+            Args::try_parse_from(["findscu", "--connect", "127.0.0.1:11112", "--cancel", "5"])
+                .unwrap();
+        assert_eq!(args.cancel, 5);
+        assert!(requested_cancel(0xFE00, true));
+        assert!(!requested_cancel(0xFE00, false));
+        assert!(!requested_cancel(0x0000, true));
     }
 
     #[test]

@@ -6,7 +6,9 @@ mod common;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
-use common::{ConnArgs, anyhowish::Result};
+use common::{
+    AuditArgs, ConnArgs, anyhowish::Result, emit_best_effort, host_of, outcome_for_status,
+};
 use vyna_dcm::core::sop_class;
 use vyna_dcm::net::worklist::MppsData;
 
@@ -61,6 +63,8 @@ struct Args {
     /// Final status DISCONTINUED instead of COMPLETED.
     #[arg(long, default_value_t = false)]
     discontinue: bool,
+    #[command(flatten)]
+    audit: AuditArgs,
 }
 
 /// Current UTC date/time as (`YYYYMMDD`, `HHMMSS`).
@@ -154,6 +158,31 @@ async fn main() -> Result<()> {
     data.end_time = Some(args.end_time.clone().unwrap_or_else(|| now.clone()));
     let (ss, _) = assoc.n_set(sop, &mpps_uid, &data.to_set_dataset()).await?;
     println!("N-SET {mpps_uid} ({final_status}): status {ss:#06X}");
+    if let Some(audit) = args.audit.sender(&args.conn.calling)? {
+        match &args.study_uid {
+            Some(study) => {
+                let refs: Vec<(&str, &str)> = data
+                    .performed_series
+                    .iter()
+                    .map(|(_, class, inst)| (class.as_str(), inst.as_str()))
+                    .collect();
+                let mut msg = vyna_dcm::AuditMessage::begin_transferring(
+                    None,
+                    study,
+                    &refs,
+                    &args.conn.calling,
+                    None,
+                    &args.conn.called,
+                    Some(host_of(&args.conn.connect)),
+                    &audit.source,
+                );
+                let status = if cs != 0 { cs } else { ss };
+                msg.outcome = outcome_for_status(status);
+                emit_best_effort(Some(&audit.sender), &msg, "mppsscu");
+            }
+            None => eprintln!("mppsscu: skipping audit: no --study-uid"),
+        }
+    }
     assoc.release().await?;
     if cs != 0 || ss != 0 {
         return Err(common::anyhowish::Error::msg(format!(
@@ -192,5 +221,22 @@ mod tests {
         assert!(parse_series("1.2:1.3").is_err());
         assert!(parse_series("1.2::1.4").is_err());
         assert!(parse_series("1.2:1.3:1.4:1.5").is_err());
+    }
+
+    #[test]
+    fn audit_flags_parse() {
+        let args = Args::try_parse_from([
+            "mppsscu",
+            "--connect",
+            "127.0.0.1:11112",
+            "--pps-id",
+            "PPS1",
+            "--modality",
+            "ECG",
+            "--audit-server",
+            "udp://127.0.0.1:514",
+        ])
+        .unwrap();
+        assert!(args.audit.sender("VYNA_SCU").unwrap().is_some());
     }
 }

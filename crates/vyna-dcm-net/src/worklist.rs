@@ -6,7 +6,15 @@
 //! - Storage Commitment: N-ACTION (action type 1) on
 //!   [`STORAGE_COMMITMENT_PUSH`], result via N-EVENT-REPORT.
 
-use vyna_dcm_core::{DataSet, Vr, tags};
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use vyna_dcm_codec::{FileMeta, read_part10, write_part10};
+use vyna_dcm_core::{DataSet, TransferSyntax, Vr, is_valid_uid, tags};
+
+use crate::dimse::status;
+use crate::service::{Handlers, RequestContext};
 
 pub use vyna_dcm_core::sop_class::{
     MODALITY_PERFORMED_PROCEDURE_STEP as MODALITY_PPS, MODALITY_WORKLIST_FIND as MODALITY_WORKLIST,
@@ -237,6 +245,184 @@ pub fn storage_commitment_request(instances: &[(&str, &str)]) -> (DataSet, Strin
     (ds, transaction_uid)
 }
 
+/// File-backed MPPS SCP state: N-CREATE inserts a step, N-SET
+/// merges updates into it. Steps persist as Part-10 files named by
+/// MPPS UID; final states (`COMPLETED`/`DISCONTINUED`) reject
+/// further updates. Attribute-level validation is out of scope: the
+/// stub stores what arrives.
+pub struct MppsScp {
+    directory: PathBuf,
+    steps: Mutex<HashMap<String, DataSet>>,
+}
+
+impl MppsScp {
+    /// Empty store persisting into `directory`.
+    #[must_use]
+    pub fn new(directory: PathBuf) -> Self {
+        Self {
+            directory,
+            steps: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Load persisted `*.dcm` steps (filename stem = MPPS UID);
+    /// returns the store plus the skip count.
+    #[must_use]
+    pub fn load(directory: &Path) -> (Self, usize) {
+        let mut steps = HashMap::new();
+        let mut skipped = 0;
+        let entries = std::fs::read_dir(directory).map(|r| r.filter_map(|e| e.ok()));
+        for entry in entries.into_iter().flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "dcm") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default();
+            let bytes = std::fs::read(&path).unwrap_or_default();
+            match read_part10(&bytes) {
+                Ok((_, ds)) if is_valid_uid(stem) => {
+                    steps.insert(stem.to_string(), ds);
+                }
+                _ => {
+                    tracing::warn!("mpps: skipping unreadable file {}", path.display());
+                    skipped += 1;
+                }
+            }
+        }
+        (
+            Self {
+                directory: directory.to_path_buf(),
+                steps: Mutex::new(steps),
+            },
+            skipped,
+        )
+    }
+
+    /// A copy of the stored step, if present.
+    #[must_use]
+    pub fn get(&self, uid: &str) -> Option<DataSet> {
+        self.steps.lock().unwrap().get(uid).cloned()
+    }
+
+    /// Number of stored steps.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.steps.lock().unwrap().len()
+    }
+
+    /// True when no steps are stored.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.steps.lock().unwrap().is_empty()
+    }
+
+    /// N-CREATE: insert a new step (stamping SOP Class/Instance UIDs
+    /// so the persisted file is self-describing).
+    pub fn create(
+        &self,
+        uid: &str,
+        sop_class: &str,
+        dataset: Option<DataSet>,
+    ) -> (u16, Option<DataSet>) {
+        if sop_class != MODALITY_PPS {
+            return (status::SOP_CLASS_NOT_SUPPORTED, None);
+        }
+        if !is_valid_uid(uid) {
+            return (status::MISTYPED_ARGUMENT, None);
+        }
+        let Some(mut ds) = dataset else {
+            return (status::DATASET_MISMATCH, None);
+        };
+        let mut steps = self.steps.lock().unwrap();
+        if steps.contains_key(uid) {
+            return (status::DUPLICATE_SOP_INSTANCE, None);
+        }
+        ds.put_uid(tags::SOP_CLASS_UID, MODALITY_PPS);
+        ds.put_uid(tags::SOP_INSTANCE_UID, uid);
+        if let Err(e) = self.persist(uid, &ds) {
+            tracing::warn!("mpps: persist failed for {uid}: {e}");
+            return (status::OUT_OF_RESOURCES, None);
+        }
+        steps.insert(uid.to_string(), ds);
+        (status::SUCCESS, None)
+    }
+
+    /// N-SET: merge `dataset` over the stored step.
+    pub fn set(
+        &self,
+        uid: &str,
+        sop_class: &str,
+        dataset: Option<DataSet>,
+    ) -> (u16, Option<DataSet>) {
+        if sop_class != MODALITY_PPS {
+            return (status::SOP_CLASS_NOT_SUPPORTED, None);
+        }
+        if !is_valid_uid(uid) {
+            return (status::MISTYPED_ARGUMENT, None);
+        }
+        let Some(update) = dataset else {
+            return (status::DATASET_MISMATCH, None);
+        };
+        let mut steps = self.steps.lock().unwrap();
+        let Some(stored) = steps.get(uid) else {
+            return (status::NO_SUCH_SOP_INSTANCE, None);
+        };
+        if matches!(
+            stored.string(tags::PERFORMED_PROCEDURE_STEP_STATUS),
+            Some("COMPLETED" | "DISCONTINUED")
+        ) {
+            return (status::PROCESSING_FAILURE, None);
+        }
+        let mut merged = stored.clone();
+        for (_tag, el) in update.iter() {
+            merged.insert(el.clone());
+        }
+        if let Err(e) = self.persist(uid, &merged) {
+            tracing::warn!("mpps: persist failed for {uid}: {e}");
+            return (status::OUT_OF_RESOURCES, None);
+        }
+        steps.insert(uid.to_string(), merged);
+        (status::SUCCESS, None)
+    }
+
+    /// Write one step as Part-10 (`uid` is validated before any call).
+    fn persist(&self, uid: &str, ds: &DataSet) -> crate::Result<()> {
+        let meta = FileMeta::new(MODALITY_PPS, uid, TransferSyntax::ExplicitVrLittleEndian);
+        let bytes = write_part10(&meta, ds)?;
+        std::fs::write(self.directory.join(format!("{uid}.dcm")), bytes)?;
+        Ok(())
+    }
+}
+
+impl Handlers for MppsScp {
+    async fn on_n_create(
+        &self,
+        ctx: &RequestContext<'_>,
+        dataset: Option<DataSet>,
+    ) -> (u16, Option<DataSet>) {
+        let class = ctx.command.affected_sop_class_uid.as_deref().unwrap_or("");
+        let Some(uid) = ctx.command.affected_sop_instance_uid.as_deref() else {
+            return (status::MISTYPED_ARGUMENT, None);
+        };
+        self.create(uid, class, dataset)
+    }
+
+    async fn on_n_set(
+        &self,
+        ctx: &RequestContext<'_>,
+        dataset: Option<DataSet>,
+    ) -> (u16, Option<DataSet>) {
+        let class = ctx.command.affected_sop_class_uid.as_deref().unwrap_or("");
+        let Some(uid) = ctx.command.affected_sop_instance_uid.as_deref() else {
+            return (status::MISTYPED_ARGUMENT, None);
+        };
+        self.set(uid, class, dataset)
+    }
+}
+
 /// A parsed Storage Commitment N-EVENT-REPORT result:
 /// `(transaction_uid, succeeded, failed)`, each entry a
 /// `(sop_class_uid, sop_instance_uid)` pair.
@@ -335,6 +521,151 @@ mod tests {
             set.sequence(tags::PERFORMED_SERIES_SEQUENCE).unwrap().len(),
             1
         );
+    }
+
+    fn mpps_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mppsscp-test-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn mpps_create_data() -> MppsData {
+        MppsData {
+            performed_procedure_step_id: "PPS1".into(),
+            performed_station_ae: "ECG01".into(),
+            modality: "ECG".into(),
+            start_date: "20261012".into(),
+            start_time: "120000".into(),
+            status: "IN PROGRESS".into(),
+            ..MppsData::default()
+        }
+    }
+
+    #[test]
+    fn mpps_create_then_set_merges() {
+        let dir = mpps_test_dir("merge");
+        let scp = MppsScp::new(dir.clone());
+        let (s, _) = scp.create(
+            "1.2.3.1",
+            MODALITY_PPS,
+            Some(mpps_create_data().to_create_dataset()),
+        );
+        assert_eq!(s, crate::dimse::status::SUCCESS);
+        let stored = scp.get("1.2.3.1").unwrap();
+        assert_eq!(
+            stored.string(tags::PERFORMED_PROCEDURE_STEP_ID),
+            Some("PPS1")
+        );
+        let set = MppsData {
+            status: "COMPLETED".into(),
+            end_date: Some("20261012".into()),
+            ..MppsData::default()
+        }
+        .to_set_dataset();
+        let (s, _) = scp.set("1.2.3.1", MODALITY_PPS, Some(set));
+        assert_eq!(s, crate::dimse::status::SUCCESS);
+        let stored = scp.get("1.2.3.1").unwrap();
+        assert_eq!(
+            stored.string(tags::PERFORMED_PROCEDURE_STEP_STATUS),
+            Some("COMPLETED")
+        );
+        assert_eq!(
+            stored.string(tags::PERFORMED_PROCEDURE_STEP_ID),
+            Some("PPS1")
+        );
+        assert!(dir.join("1.2.3.1.dcm").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mpps_rejects_bad_requests() {
+        use crate::dimse::status;
+        let dir = mpps_test_dir("reject");
+        let scp = MppsScp::new(dir.clone());
+        let ds = mpps_create_data().to_create_dataset();
+        assert_eq!(
+            scp.create("1.2.3.1", MODALITY_PPS, Some(ds.clone())).0,
+            status::SUCCESS
+        );
+        assert_eq!(
+            scp.create("1.2.3.1", MODALITY_PPS, Some(ds.clone())).0,
+            status::DUPLICATE_SOP_INSTANCE
+        );
+        assert_eq!(
+            scp.set("9.9.9", MODALITY_PPS, Some(ds.clone())).0,
+            status::NO_SUCH_SOP_INSTANCE
+        );
+        assert_eq!(
+            scp.create("1.2.3.2", "1.2.3.4", Some(ds.clone())).0,
+            status::SOP_CLASS_NOT_SUPPORTED
+        );
+        assert_eq!(
+            scp.create("1.2.3.2", MODALITY_PPS, None).0,
+            status::DATASET_MISMATCH
+        );
+        assert_eq!(
+            scp.set("1.2.3.1", MODALITY_PPS, None).0,
+            status::DATASET_MISMATCH
+        );
+        assert_eq!(
+            scp.create("../evil", MODALITY_PPS, Some(ds.clone())).0,
+            status::MISTYPED_ARGUMENT
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mpps_final_states_reject_updates() {
+        use crate::dimse::status;
+        let dir = mpps_test_dir("final");
+        let scp = MppsScp::new(dir.clone());
+        scp.create(
+            "1.2.3.1",
+            MODALITY_PPS,
+            Some(mpps_create_data().to_create_dataset()),
+        );
+        let done = MppsData {
+            status: "COMPLETED".into(),
+            ..MppsData::default()
+        }
+        .to_set_dataset();
+        assert_eq!(
+            scp.set("1.2.3.1", MODALITY_PPS, Some(done)).0,
+            status::SUCCESS
+        );
+        let more = MppsData {
+            status: "COMPLETED".into(),
+            ..MppsData::default()
+        }
+        .to_set_dataset();
+        assert_eq!(
+            scp.set("1.2.3.1", MODALITY_PPS, Some(more)).0,
+            status::PROCESSING_FAILURE
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mpps_reloads_persisted_steps() {
+        let dir = mpps_test_dir("reload");
+        let scp = MppsScp::new(dir.clone());
+        scp.create(
+            "1.2.3.1",
+            MODALITY_PPS,
+            Some(mpps_create_data().to_create_dataset()),
+        );
+        drop(scp);
+        let (reloaded, skipped) = MppsScp::load(&dir);
+        assert_eq!(skipped, 0);
+        assert_eq!(
+            reloaded
+                .get("1.2.3.1")
+                .unwrap()
+                .string(tags::PERFORMED_PROCEDURE_STEP_ID),
+            Some("PPS1")
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -5,6 +5,33 @@ the workspace crate version (`Cargo.toml`).
 
 ## [Unreleased]
 
+## [0.3.0] — 2026-10-12
+
+### Added
+
+- `dcmodify` sequence paths (`SEQ[i].TAG`, 0-based repeatable hops;
+  hops must exist).
+- ATNA `--audit-server` wiring for `movescu`, `getscu`, `mppsscu`,
+  `stgcmtscu` (plus `mppsscp`/`stgcmtscp` and parse tests for
+  `findscp`/`mwlscp`): every DIMSE tool but echo is now wired.
+- C-CANCEL both sides: `findscu --cancel N` (requested FE00 exits
+  0), SCP honoring mid-stream during C-FIND/C-MOVE (C-GET already
+  aborted); `TCP_NODELAY` on all sockets (Nagle stalled each PDU
+  ~40 ms; loopback suite 0.37 s → 0.01 s).
+- `img2dcm --transfer-syntax` (+ `--quality`/`--near`/
+  `--lossy-ratio`): encapsulated RLE/JPEG/JPEG-LS/JPEG 2000
+  injection via transcode (also fixes big-endian templates).
+- `storescp --exec` receive hooks (`{file}`/`{class}`/`{instance}`/
+  `{patient}`/`{study}`/`{caller}`/`{called}`, no shell,
+  best-effort).
+- MPPS SCP: `net::worklist::MppsScp` (N-CREATE insert, N-SET merge,
+  0x0111/0x0112/final-state discipline, Part-10 persistence +
+  reload) plus the `mppsscp` CLI.
+- Storage Commitment SCP: framework `ScpFollowUp` (SCP-initiated
+  N-EVENT-REPORT after the RSP, RSP awaited) + `net::qrdb::`
+  `StgCommitScp` (index holdings commit, rest fail 0x0112) plus the
+  `stgcmtscp` CLI; 298 tests green.
+
 ## [0.2.0] — 2026-10-12
 
 ### Added

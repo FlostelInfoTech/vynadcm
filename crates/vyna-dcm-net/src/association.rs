@@ -6,6 +6,7 @@
 //! as `impl Association` methods; the SCP dispatch loop is
 //! [`crate::service::run_scp`].
 
+use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -98,6 +99,10 @@ pub struct Association {
     max_incoming_pdu: u32,
     read_timeout: Duration,
     next_id: u16,
+    /// Pushback queue: events seen by a cancel poll that belong to the
+    /// dispatch loop (e.g. RELEASE-RQ mid-FIND). [`Association::recv`]
+    /// drains this before touching the wire.
+    pending: VecDeque<DimseEvent>,
 }
 
 impl Association {
@@ -110,6 +115,9 @@ impl Association {
         proposed: Vec<ProposedContext>,
     ) -> Result<Self> {
         let stream = TcpStream::connect(addr).await?;
+        // DIMSE is small-write chatty; Nagle would stall each PDU on the
+        // peer's delayed ACK (~40ms), as DCMTK/dcm4che also avoid.
+        stream.set_nodelay(true)?;
         Self::request_over(opts, calling_ae, called_ae, stream, proposed).await
     }
 
@@ -150,6 +158,7 @@ impl Association {
             max_incoming_pdu: opts.max_incoming_pdu,
             read_timeout: opts.read_timeout,
             next_id: 1,
+            pending: VecDeque::new(),
         };
         let rq = AssociateRq {
             called_ae: called_ae.clone(),
@@ -235,6 +244,7 @@ impl Association {
             max_incoming_pdu: opts.max_incoming_pdu,
             read_timeout: opts.read_timeout,
             next_id: 1,
+            pending: VecDeque::new(),
         }
     }
 
@@ -332,6 +342,9 @@ impl Association {
 
     /// Receive one complete DIMSE message (reassembling PDVs), or a release.
     pub async fn recv(&mut self) -> Result<DimseEvent> {
+        if let Some(ev) = self.pending.pop_front() {
+            return Ok(ev);
+        }
         let mut cmd_buf: Vec<u8> = Vec::new();
         let mut cmd_ctx: Option<u8> = None;
         let mut command: Option<Command> = None;
@@ -408,6 +421,28 @@ impl Association {
         }
     }
 
+    /// Receive one event, waiting at most `wait`; `Ok(None)` on timeout.
+    ///
+    /// Used to poll for C-CANCEL between pending responses. Timeout
+    /// soundness: a timeout abandons a partial read, so callers must
+    /// only poll while the peer can solely send small single-PDU
+    /// messages (C-CANCEL is ~30 bytes); anything larger in flight
+    /// risks association desync, which then fails loudly.
+    pub async fn poll_event(&mut self, wait: Duration) -> Result<Option<DimseEvent>> {
+        if let Some(ev) = self.pending.pop_front() {
+            return Ok(Some(ev));
+        }
+        match timeout(wait, self.recv()).await {
+            Ok(ev) => Ok(Some(ev?)),
+            Err(_) => Ok(None),
+        }
+    }
+
+    /// Return an event to the pushback queue (see [`Association::recv`]).
+    pub fn stash(&mut self, ev: DimseEvent) {
+        self.pending.push_back(ev);
+    }
+
     /// Clean release: RELEASE-RQ then await RELEASE-RSP.
     pub async fn release(&mut self) -> Result<()> {
         crate::pdu::write_pdu(&mut self.stream, &Pdu::ReleaseRq).await?;
@@ -467,6 +502,7 @@ mod tests {
             max_incoming_pdu: opts.max_incoming_pdu,
             read_timeout: opts.read_timeout,
             next_id: u16::MAX,
+            pending: VecDeque::new(),
         };
         assert_eq!(assoc.next_message_id(), u16::MAX);
         assert_eq!(assoc.next_message_id(), 1);

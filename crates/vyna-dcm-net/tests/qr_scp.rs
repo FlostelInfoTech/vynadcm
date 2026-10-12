@@ -106,6 +106,7 @@ macro_rules! serve_with {
         let scp_opts = $o;
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
             accept(stream, &acceptor(), &handlers, &scp_opts)
                 .await
                 .unwrap();
@@ -200,6 +201,7 @@ async fn move_delivers_to_destination() {
     let dest_addr = dest_listener.local_addr().unwrap();
     tokio::spawn(async move {
         let (stream, _) = dest_listener.accept().await.unwrap();
+        stream.set_nodelay(true).unwrap();
         accept(stream, &acceptor(), &*d2, &ScpOptions::default())
             .await
             .unwrap();

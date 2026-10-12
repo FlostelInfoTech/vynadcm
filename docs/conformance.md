@@ -1,6 +1,6 @@
 # VynaDCM DICOM Conformance Statement
 
-Product: VynaDCM `0.2.0` (workspace crates `vyna-dcm-*`).
+Product: VynaDCM `0.3.0` (workspace crates `vyna-dcm-*`).
 Generated from the implemented capabilities by
 `docs/generate-conformance.py` — do not hand-edit; rerun the script.
 
@@ -10,7 +10,7 @@ This statement describes the DICOM networking, media, and DICOMweb
 behaviour of the VynaDCM command-line Application Entities and the
 library defaults behind them, following the structure of PS3.2.
 Implementation Class UID
-`2.25.46417651854989365804951432447169401540`, Implementation Version Name `VYNA_DCM_020`.
+`2.25.46417651854989365804951432447169401540`, Implementation Version Name `VYNA_DCM_030`.
 
 ## 2. Implementation model
 
@@ -27,6 +27,8 @@ Implementation Class UID
 | `storescp` | `VYNA_SCP` | SCP | C-STORE |
 | `findscp` | `VYNA_SCP` | SCP | C-FIND, C-MOVE, C-GET |
 | `mwlscp` | `VYNA_SCP` | SCP | C-FIND |
+| `mppsscp` | `VYNA_SCP` | SCP | N-CREATE, N-SET |
+| `stgcmtscp` | `VYNA_SCP` | SCP | N-ACTION |
 
 Application data flow is tool-to-peer over one TCP association per
 invocation: SCU tools connect, negotiate, perform their service, and
@@ -64,6 +66,7 @@ release/abort, and loop.
   - Modality Worklist — FIND (`1.2.840.10008.5.1.4.31`).
 - Transfer syntaxes proposed: Explicit VR Little Endian and
   Implicit VR Little Endian.
+- Note: `--cancel N` stops after N matches; a requested FE00 exits 0.
 
 #### 3.1.4 `movescu` — C-MOVE retrieve: the peer sends matches to --dest (run storescp there)
 
@@ -144,6 +147,16 @@ release/abort, and loop.
 
 - Services handled: C-FIND.
 
+#### 3.2.5 `mppsscp` — Receive MPPS N-CREATE/N-SET into a directory
+
+- Services handled: N-CREATE, N-SET.
+- Note: N-CREATE inserts a step, N-SET merges over it, final states reject updates; steps persist as Part-10 files named by MPPS UID.
+
+#### 3.2.6 `stgcmtscp` — Serve Storage Commitment N-ACTION from a directory
+
+- Services handled: N-ACTION.
+- Note: commits index holdings and fails the rest with 0x0112; the verdict ships as an N-EVENT-REPORT on the same association.
+
 Acceptance policy (library defaults, shared by all SCP tools): any
 proposed SOP Class is accepted (`accepted_sop_classes: None`); all
 16 transfer syntaxes of Annex B are accepted; Called-AE
@@ -154,7 +167,7 @@ authentication unless the embedding application installs the
 ### 3.3 Association policies
 
 - Application Context Name: `1.2.840.10008.3.1.1.1`.
-- Implementation Class UID `2.25.46417651854989365804951432447169401540`, Version Name `VYNA_DCM_020`.
+- Implementation Class UID `2.25.46417651854989365804951432447169401540`, Version Name `VYNA_DCM_030`.
 - Presentation contexts: the SCU proposes one context per SOP Class,
   each with the offered transfer syntaxes; the SCP accepts at most
   one syntax per context from its accepted list.
@@ -169,6 +182,8 @@ authentication unless the embedding application installs the
 - SCU tools request release after their service; SCP tools answer
   release and abort cleanly. Protocol violations abort the
   association (A-ABORT source 2).
+- C-CANCEL is honored mid-stream during C-FIND/C-MOVE (final FE00);
+  C-GET aborts delivery when cancel arrives with the C-STORE-RSP.
 
 ## 4. Communication profiles
 
@@ -304,4 +319,4 @@ authentication unless the embedding application installs the
 ## Annex C — Implementation identifying attributes
 
 - Implementation Class UID: `2.25.46417651854989365804951432447169401540`.
-- Implementation Version Name: `VYNA_DCM_020`.
+- Implementation Version Name: `VYNA_DCM_030`.

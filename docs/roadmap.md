@@ -3,15 +3,16 @@
 | Field | Value |
 |---|---|
 | Document | Roadmap (living) |
-| Version | 0.2.0 |
+| Version | 0.3.0 |
 | Date | 2026-10-12 |
 | Status | Living — reprioritized as VynaECG/VynaLink needs evolve |
-| Applies to | VynaDCM workspace v0.2.0 |
+| Applies to | VynaDCM workspace v0.3.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, from comparison
 with dcm4che, DCMTK, pydicom (+pynetdicom), and fo-dicom;
 0.2.0 (2026-10-12) — version bump; all P0–P2 items and both
-comparison rounds DONE.
+comparison rounds DONE;
+0.3.0 (2026-10-12) — post-0.2.0 hardening batch DONE.
 
 ## Contents
 
@@ -215,6 +216,17 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   HTTP, live findscp/move/getscu and wadorsd CLI smokes, 271/271
   tests, clippy clean. Out of scope (documented): persistent
   archive behind `wadorsd` (STOW lands in memory), UPS/IAN (§5).
+- **Post-0.2.0 hardening batch** — DONE: the eight follow-ups from
+  the second comparison pass — `dcmodify` sequence paths, ATNA
+  wiring for the remaining SCUs (echo excepted), C-CANCEL both
+  sides + `TCP_NODELAY`, encapsulated `img2dcm`, `storescp`
+  `--exec`, `mppsscp`, and `stgcmtscp` over a new SCP-initiated
+  N-EVENT-REPORT framework. Accepted: unit + loopback tests per
+  item (incl. full commitment Push handshake and cancel
+  truncation), live CLI smokes for each, 298/298 tests, clippy
+  clean. Out of scope (documented): `dump2dcm`, `mkkos`,
+  relational C-FIND, persistent QR index, UPS/IAN (still
+  demand-gated).
 
 ## 7. Deliberate non-goals
 

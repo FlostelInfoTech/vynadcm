@@ -3,16 +3,18 @@
 | Field | Value |
 |---|---|
 | Document | SRS (living) |
-| Version | 0.2.0 |
+| Version | 0.3.0 |
 | Date | 2026-10-12 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.2.0 (crates `vyna-dcm-*`) |
+| Applies to | VynaDCM workspace v0.3.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
 implemented baseline (176 tests green, IOD validator + PDF helpers
 + tag editor + transcoder + DICOMDIR + WADO-URI applied);
 0.2.0 (2026-10-12) — version bump; FR-WEB-04 + QR/MWL SCP +
-charset/XML/img requirements folded in since 0.1.0.
+charset/XML/img requirements folded in since 0.1.0;
+0.3.0 (2026-10-12) — FR-NET-11 (MPPS/commitment SCP) + cancel
++ ATNA completion + CLI deltas folded in.
 
 ## Contents
 
@@ -172,7 +174,9 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   application `Handlers`.
 - **FR-NET-05 (M)** C-MOVE: route instances to a configured destination
   AE over a dedicated outbound association; C-GET: deliver over the
-  same association and abort delivery on C-CANCEL.
+  same association and abort delivery on C-CANCEL; C-FIND/C-MOVE
+  honor C-CANCEL mid-stream (final FE00, other mid-operation events
+  stashed, never swallowed).
 - **FR-NET-06 (M)** Status handling: classify statuses
   (success/warning/failure/pending/cancel) and count sub-operations
   (completed/failed/warning) for MOVE/GET responses.
@@ -192,6 +196,13 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **FR-NET-10 (M)** MWL SCP (`net::qrdb` + `mwlscp`): worklist C-FIND
   without a level key, with Scheduled Procedure Step sequence
   matching, one response per matching item.
+- **FR-NET-11 (M)** MPPS SCP (`net::worklist::MppsScp` + `mppsscp`):
+  N-CREATE inserts a step, N-SET merges over it (duplicates 0x0111,
+  unknown steps 0x0112, final states reject updates), persisted as
+  Part-10 by MPPS UID with reload. Storage Commitment SCP
+  (`net::qrdb::StgCommitScp` + `stgcmtscp`): index holdings commit,
+  the rest fail 0x0112, verdict via an N-EVENT-REPORT follow-up on
+  the same association (framework `ScpFollowUp`, RSP awaited).
 
 ### 3.4 DICOMweb (`vyna-dcm-web`)
 
@@ -273,28 +284,32 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 ### 3.9 CLI tools (`vyna-dcm`, feature `cli`)
 
 - **FR-CLI-01 (M)** Network tools: `echoscu`, `echoscp`, `storescu`,
-  `storescp`, `findscu` (incl. MWL model, `-k` keys, JSON output),
-  `movescu` (C-MOVE to a `--dest` AE), `getscu` (C-GET into
-  `--output-dir`, transcoding encapsulated arrivals to native),
-  `findscp` (QR FIND/MOVE/GET from a directory, `--route` AE table),
-  `mwlscp` (worklist FIND from a directory), `mppsscu`
-  (MPPS N-CREATE + N-SET), `stgcmtscu`
-  (Storage Commitment N-ACTION + report wait), `qidors`, `wadors`,
-  `stowrs` (DICOMweb client tools, `--bearer`/`--basic` auth),
-  `wadorsd` (stub server over a directory), `auditsend` (one
+  `storescp` (with `--exec` receive hooks), `findscu` (incl. MWL
+  model, `-k` keys, JSON output, `--cancel N`), `movescu` (C-MOVE
+  to a `--dest` AE), `getscu` (C-GET into `--output-dir`,
+  transcoding encapsulated arrivals to native), `findscp` (QR
+  FIND/MOVE/GET from a directory, `--route` AE table), `mwlscp`
+  (worklist FIND from a directory), `mppsscu` (MPPS N-CREATE +
+  N-SET), `mppsscp` (MPPS N-CREATE/N-SET into a directory),
+  `stgcmtscu` (Storage Commitment N-ACTION + report wait),
+  `stgcmtscp` (commitment verdicts from a directory), `qidors`,
+  `wadors`, `stowrs` (DICOMweb client tools, `--bearer`/`--basic`
+  auth), `wadorsd` (stub server over a directory), `auditsend` (one
   ATNA message per invocation), each with AE titles, PDU/timeout
-  tuning, and TLS options; `storescp`/`storescu`/`findscu` also
-  take `--audit-server` for wired emission.
+  tuning, and TLS options; every DIMSE tool but `echoscu`/`echoscp`
+  also takes `--audit-server` for wired emission.
 - **FR-CLI-02 (M)** File tools: `dcmdump`, `dcm2json` (incl. file-meta
   option), `json2dcm` (incl. transfer-syntax selection),
   `dcm2xml` (incl. file-meta option), `xml2dcm` (incl.
   transfer-syntax selection), `dcm2img` (`--frame`), `img2dcm`
-  (PNG + template, native syntaxes only),
+  (PNG + template, native by default, `--transfer-syntax` +
+  quality knobs for encapsulated targets),
   `dcmvalidate` (IOD check with SOP-Class override; exit 0/1/2),
   `pdf2dcm` (PDF → Part-10 with IOD self-check; exit 0/1),
   `dcm2pdf` (Part-10 → PDF extraction; exit 0/1),
-  `dcmodify` (tag modify/insert/erase with VR-aware values,
-  file-meta UID sync, in-place or `--output`; exit 0/1),
+  `dcmodify` (tag modify/insert/erase with VR-aware values and
+  `SEQ[i].TAG` sequence paths, file-meta UID sync, in-place or
+  `--output`; exit 0/1),
   `dcm2dcm` (transcode with syntax names/UIDs and quality knobs;
   exit 0/1),
   `dcmdir` (create a DICOMDIR from files/dirs, or `--list` one;
@@ -315,12 +330,15 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   outcome-mapped severity; `--dry-run` XML preview.
 - **FR-ATNA-03 (M)** Wired emission: `storescp` (actor-start +
   per-store), `storescu` (per-store with failure outcomes),
-  `findscu` (per-query) via shared `--audit-server` /
-  `--audit-source` / `--audit-ca` flags; best-effort (transport
-  failures warn, never break the clinical path).
+  `findscu`/`findscp`/`mwlscp` (per-query), `movescu`
+  (begin-transferring), `getscu` (per-arrival), `mppsscu`/`mppsscp`
+  (per-step), `stgcmtscu`/`stgcmtscp` (per-instance) via shared
+  `--audit-server` / `--audit-source` / `--audit-ca` flags;
+  best-effort (transport failures warn, never break the clinical
+  path).
 - **FR-ATNA-04 (S)** Scope honesty: code triples pinned by tests
   per PS3.15/DCMR; peer socket IPs not plumbed (AE titles only
-  from handlers); movescu/getscu/mppsscu/stgcmtscu not yet wired.
+  from handlers).
 
 ### 3.11 Specific Character Set conversion (`vyna-dcm-codec`)
 
@@ -389,18 +407,18 @@ ATNA audit-trail emission.
 | FR-CODEC-10 | `roundtrip_tree` (every link points at an item tag), `empty_dir_roundtrip`, `record_type_mapping`, `entry_validation`, `rejects_non_directory`, `walker_*` (skips, loops, dangling, deleted), `capture_points_at_item_tags`, CLI `dcmdir` create+list runs |
 | FR-CODEC-11 | `round_trips_mixed_dataset`, `person_name_component_groups`, `rejects_bad_inputs`, `liberal_parse_accepts_minimal`, CLI `dcm2xml` → `xml2dcm` JP round-trip run |
 | FR-CODEC-12 | `png_round_trip_mono16_signed`, `mono1_inverts_and_planar_rgb_renders`, `rejects_unsupported` (img), `corpus_renders_png`, CLI `dcm2img` → `img2dcm` byte-identical run |
-| FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, `loopback_storage_commit`, `storage_commit_skips_wait_on_action_failure`, PDU/DIMSE tests (20); live C-ECHO against third-party endpoint `0x0000` |
+| FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, `loopback_find_cancel_truncates`, `loopback_storage_commit`, `storage_commit_skips_wait_on_action_failure`, PDU/DIMSE tests (20); live C-ECHO against third-party endpoint `0x0000`, live `findscu --cancel` vs `findscp` (FE00, exit 0) |
 | FR-NET-07 | worklist/MPPS/commitment tests |
 | FR-NET-08 | `tls_loopback_echo`, `rejects_empty_chain_and_key` |
-| FR-NET-09…10 | `wildcard_and_range_match`, `pn_matches_leading_components`, `level_grouping_dedupes`, `responses_echo_requested_keys_only`, `sequence_keys_match_nested`, loopback `find_study_level_groups`, `find_missing_level_fails`, `move_delivers_to_destination`, `get_serves_over_same_association`, `mwl_matches_station`, CLI `findscp`/`mwlscp` smoke runs |
+| FR-NET-09…11 | `wildcard_and_range_match`, `pn_matches_leading_components`, `level_grouping_dedupes`, `responses_echo_requested_keys_only`, `sequence_keys_match_nested`, loopback `find_study_level_groups`, `find_missing_level_fails`, `move_delivers_to_destination`, `get_serves_over_same_association`, `mwl_matches_station`, `mpps_create_then_set_merges`, `mpps_rejects_bad_requests`, `mpps_final_states_reject_updates`, `mpps_reloads_persisted_steps`, `commitment_holds_partition`, `commitment_rejects_bad_requests`, loopback `loopback_mpps_create_set`, `loopback_storage_commit_push`, CLI `findscp`/`mwlscp`/`mppsscp`/`stgcmtscp` smoke runs |
 | FR-WEB-01…03 | `end_to_end_client_against_hyper`, `wado_uri_against_stub`, `wado_uri_*` param tests, dispatch/multipart tests |
 | FR-WEB-04 | `qido_finds_seeded_instance`, `wado_round_trips_file_metadata_frames`, `stow_lands_and_qido_sees_it`, wadors `frames_parse`, CLI smoke runs against `wadorsd` |
 | FR-ECG-01…03 | `vyna-dcm-ecg` tests (7); `ecg_write` example |
-| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `findscp`, `mwlscp`, `movescu`, `getscu`, `mppsscu`, `stgcmtscu`, `qidors`, `wadors`, `stowrs`, `wadorsd`, `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`, `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
+| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `findscp`, `mwlscp`, `movescu`, `getscu`, `mppsscu`, `mppsscp`, `stgcmtscu`, `stgcmtscp`, `qidors`, `wadors`, `stowrs`, `wadorsd`, `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`, `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example; `cancel_flag_parses`, `sequence_paths_parse`, `sequence_edits_apply_per_item`, `transfer_syntax_names_parse`, `quality_knobs_validate`, `injected_png_survives_lossless_targets`, `exec_template_parses_and_expands`, `exec_hook_runs_and_reports_exit`, `study_uid_prefers_top_level` |
 | FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
 | FR-DEID-01…03 | `every_action_fires`, `shift_keeps_longitudinal_intervals`, `datetimes_shift_or_dummy_by_vr`, `burned_in_annotation_refuses_before_mutation`, `uid_maps_stay_consistent_across_datasets`, `shifts_cross_month_year_and_leap_day`, profile self-checks, CLI `output_plans_*` + `process_file_round_trip`, `deidentified_ecg_validates_with_identical_samples` |
-| FR-ATNA-01…04 | `event_code_triples_are_pinned`, `transferred_xml_has_shape_and_roles`, `values_escape`, `urls_parse_with_scheme_defaults`, UDP/TCP/TLS loopbacks (+ untrusted rejection), CLI `flow_messages_*` + `subcommands_parse`, wired `audit_flags_parse` ×3, `statuses_map_to_outcomes`, live UDP/TCP/TLS ARR-stub runs |
+| FR-ATNA-01…04 | `event_code_triples_are_pinned`, `transferred_xml_has_shape_and_roles`, `values_escape`, `urls_parse_with_scheme_defaults`, UDP/TCP/TLS loopbacks (+ untrusted rejection), CLI `flow_messages_*` + `subcommands_parse`, wired `audit_flags_parse` ×11, `statuses_map_to_outcomes`, live UDP/TCP/TLS ARR-stub runs |
 | FR-CHARSET-01…03 | `oracle_vectors_decode`, `oracle_vectors_round_trip` (CPython latin-1/8859-2/8859-5/8859-7/cp1254/cp874/iso2022-jp/iso2022-kr/gb18030 vectors), `jis_x_0201_is_mechanical`, `ascii_and_fallbacks_behave`, `unmappable_encodes_to_question_mark`, `round_trips_latin1_patient_name`, `round_trips_japanese_pn_component_groups`, `sequence_items_inherit_charset`, `decodes_oracle_gb18030_bytes`, `dcmdump` CJK smoke runs |
 | NFR-04 | `rejects_garbage`, `rejects_non_part10`, `rejects_bad_json`, `rejects_missing_boundary`, unknown-route 404 tests |
 | NFR-07 | CI-equivalent gate run per change (see §4) |

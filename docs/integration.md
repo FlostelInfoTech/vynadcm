@@ -3,14 +3,15 @@
 | Field | Value |
 |---|---|
 | Document | Integration guide (living) |
-| Version | 0.2.0 |
+| Version | 0.3.0 |
 | Date | 2026-10-12 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.2.0 |
+| Applies to | VynaDCM workspace v0.3.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue. Every snippet
 below is compile-checked against the workspace (see §12);
-0.2.0 (2026-10-12) — version bump, snippets re-checked.
+0.2.0 (2026-10-12) — version bump, snippets re-checked;
+0.3.0 (2026-10-12) — documents MppsScp/StgCommitScp/ScpFollowUp.
 
 Audience: Rust developers embedding VynaDCM in VynaECG and VynaLink.
 Operators should start with `docs/user-guide.md`.
@@ -194,6 +195,12 @@ Tighten negotiation via `AcceptorOptions`: `check_called_ae`,
 C-MOVE delivery needs `ScpOptions { move_config }` with an
 `AeDirectory` (e.g. `HashMapDirectory { map }`), outbound association
 options, and a calling AE.
+
+Ready-made N-service servants: `net::worklist::MppsScp` persists
+MPPS N-CREATE/N-SET steps as Part-10 by MPPS UID, and
+`net::qrdb::StgCommitScp` answers Storage Commitment N-ACTION from
+a `QrIndex`. `on_n_action` may also return `ScpFollowUp::EventReport`s,
+which the framework emits after the RSP (with the RSP awaited).
 
 ## 6. TLS (PS3.15)
 

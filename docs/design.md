@@ -3,14 +3,16 @@
 | Field | Value |
 |---|---|
 | Document | SDS (living) |
-| Version | 0.2.0 |
+| Version | 0.3.0 |
 | Date | 2026-10-12 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.2.0 |
+| Applies to | VynaDCM workspace v0.3.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue; full-dictionary
 (P0.1) update applied same day (generated tables, private dict, `SV`);
-0.2.0 (2026-10-12) — version bump, no design change.
+0.2.0 (2026-10-12) — version bump, no design change;
+0.3.0 (2026-10-12) — cancel polling + follow-ups +
+TCP_NODELAY design notes.
 
 ## Contents
 
@@ -158,6 +160,16 @@ spec adds component contracts, algorithms, sequences, and invariants.
   (event type 1 only); acknowledges it SUCCESS and parses the
   result. A failed N-ACTION returns `(status, None)` without
   waiting; the association read timeout bounds the wait.
+- SCP cancel polling (`service.rs`): C-FIND/C-MOVE poll for C-CANCEL
+  between pending responses (1 ms window, final FE00); anything else
+  arriving mid-operation is stashed in `Association::pending` for the
+  dispatch loop, never swallowed. All sockets set `TCP_NODELAY`
+  (Nagle stalls small PDU writes ~40 ms on delayed ACKs).
+- SCP-initiated follow-ups (`service.rs`): `on_n_action` may return
+  `ScpFollowUp::EventReport`s, emitted after the RSP on success with
+  the RSP awaited; `StgCommitScp` (`qrdb.rs`) commits index holdings
+  this way, `MppsScp` (`worklist.rs`) persists N-CREATE/N-SET steps
+  as Part-10 by MPPS UID.
 - SCU CLIs (`movescu`, `getscu`, `mppsscu`, `stgcmtscu`) share
   `common.rs` helpers with `findscu`/`storescp`: `build_qr_query`
   (`-k KEY=value` with derived Query/Retrieve Level) and

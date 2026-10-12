@@ -78,6 +78,8 @@ impl TlsConnector {
         addr: &str,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let stream = TcpStream::connect(addr).await?;
+        // As in Association::request: Nagle stalls small PDU writes.
+        stream.set_nodelay(true)?;
         self.connect(stream).await
     }
 }
@@ -178,6 +180,7 @@ mod tests {
         let acceptor = TlsAcceptor::new(&cert_pem, &key_pem, None).unwrap();
         tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
+            tcp.set_nodelay(true).unwrap();
             let tls = acceptor.accept(tcp).await.unwrap();
             let mut acc = AcceptorOptions::default();
             acc.association.read_timeout = std::time::Duration::from_secs(10);

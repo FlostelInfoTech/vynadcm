@@ -3,14 +3,15 @@
 | Field | Value |
 |---|---|
 | Document | User guide (living) |
-| Version | 0.2.0 |
+| Version | 0.3.0 |
 | Date | 2026-10-12 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.2.0, `vyna-dcm` CLI tools |
+| Applies to | VynaDCM workspace v0.3.0, `vyna-dcm` CLI tools |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue. Flag
 reference below is transcribed from `--help` output;
-0.2.0 (2026-10-12) — version bump, 30 CLI tools covered.
+0.2.0 (2026-10-12) — version bump, 30 CLI tools covered;
+0.3.0 (2026-10-12) — 32 CLI tools + cancel/exec/paths/syntax flags.
 
 Audience: operators and support engineers running connectivity checks,
 storage, queries, and file conversions. Developers embedding the
@@ -99,6 +100,11 @@ storescu --connect 127.0.0.1:11113 study1.dcm study2.dcm
   2 = low; default 0).
 - Statuses: `0x0000` stored; `0xA700` out of resources (disk write
   failed); `0xA900` encode failure.
+- `--exec "prog {file} {instance} {caller}"` runs a command after
+  each successful store (best-effort: failures warn). The template
+  splits on whitespace without a shell; `{file}` `{class}`
+  `{instance}` `{patient}` `{study}` `{caller}` `{called}` expand
+  per argument — put pipelines in a wrapper script.
 - Both take `--audit-server` for ATNA emission (see §10).
 
 ## 5. Query: findscu
@@ -120,6 +126,9 @@ findscu --connect 127.0.0.1:11112 --model mwl \
   8-hex-digit tag (`00100020`); empty value (`-k PatientName=`)
   requests a return key.
 - `--json` prints matches as DICOM JSON; otherwise a text dump.
+- `--cancel N` stops after N matches (C-CANCEL; a requested FE00
+  exits 0). The SCP side honors cancel mid-stream during
+  C-FIND/C-MOVE/C-GET.
 
 ### Retrieve: movescu / getscu
 
@@ -155,7 +164,7 @@ mwlscp --bind 127.0.0.1:11112 ./worklist
 - Without `--route` entries, C-MOVE fails cleanly with Move
   Destination Unknown; C-FIND and C-GET still work.
 
-### MPPS and Storage Commitment: mppsscu / stgcmtscu
+### MPPS and Storage Commitment: mppsscu / mppsscp / stgcmtscu / stgcmtscp
 
 ```sh
 # MPPS: N-CREATE (IN PROGRESS) then N-SET (COMPLETED)
@@ -164,6 +173,10 @@ mppsscu --connect 127.0.0.1:11112 --pps-id PPS1 --modality ECG \
 
 # Storage Commitment: N-ACTION then wait for the N-EVENT-REPORT
 stgcmtscu --connect 127.0.0.1:11112 --file received.dcm --timeout-secs 60
+
+# Server side: MPPS steps / commitment holdings from a directory
+mppsscp --bind 127.0.0.1:11112 ./mpps-store
+stgcmtscp --bind 127.0.0.1:11112 ./commit-store
 ```
 
 - `mppsscu` generates the MPPS UID and UTC start/end dates unless
@@ -172,6 +185,11 @@ stgcmtscu --connect 127.0.0.1:11112 --file received.dcm --timeout-secs 60
 - `stgcmtscu` takes `--file` (SOP UIDs read from Part-10 meta) and/or
   `--instance CLASS_UID:INSTANCE_UID`; `--timeout-secs` bounds the
   report wait, and any failed instance exits nonzero.
+- `mppsscp` stores each step as `<MPPSUID>.dcm` (N-SET merges over
+  it; duplicates fail 0x0111, updates to final states fail) and
+  reloads the directory at startup.
+- `stgcmtscp` commits indexed holdings and fails the rest 0x0112,
+  reporting both lists back over the same association.
 
 ### DICOMweb: qidors / wadors / stowrs / wadorsd
 
@@ -207,7 +225,8 @@ dcm2xml file.dcm > file.xml              # Part-10 → Native DICOM Model XML
 dcm2xml --with-meta file.dcm > full.xml  # include group 0002 meta
 xml2dcm --output roundtrip.dcm file.xml  # XML → Part-10 (explicit LE)
 dcm2img frame.dcm frame.png --frame 1   # render one frame to PNG
-img2dcm frame.png frame.dcm -o inj.dcm  # inject PNG pixels (native TS only)
+img2dcm frame.png frame.dcm -o inj.dcm  # inject PNG pixels (native TS)
+img2dcm frame.png frame.dcm -o jls.dcm --transfer-syntax jpeg-ls  # encapsulated
 dcmvalidate file.dcm                    # IOD conformance check
 dcmvalidate --sop-class 1.2.840.10008.5.1.4.1.1.2 file.dcm  # override SOP Class
 pdf2dcm report.pdf report.dcm --patient-name "Doe^Jane" --patient-id P123
@@ -237,16 +256,24 @@ input file name, and `--transfer-syntax explicit|implicit|deflated`
 validated against its IOD before writing, so a zero exit means the
 file is C-STORE-able; `dcm2pdf` extracts the bytes back exactly.
 
+`img2dcm` without `--transfer-syntax` keeps a native template
+syntax; with one (the `dcm2dcm` name set plus UIDs, with `--quality`
+/ `--near` / `--lossy-ratio` knobs) the injected pixels are encoded
+to the target. Lossy targets get a fresh SOP Instance UID.
+
 `dcmodify` edits tags in place (or to `--output`): `-m TAG=VALUE`
 changes an existing element keeping its VR, `-i TAG[:VR]=VALUE`
 adds one (`:VR` needed only when the tag has no dictionary entry),
 `-e TAG` removes one. Tags accept `(0010,0010)`, `0010,0010`,
 `00100010`, or keywords; `\` separates multi-values, empty values
-blank the element, and `@path` feeds file bytes to binary VRs:
+blank the element, and `@path` feeds file bytes to binary VRs.
+`SEQ[index].TAG` paths (0-based, repeatable hops) edit inside
+sequence items; hops must exist (edits never create items):
 
 ```sh
 dcmodify file.dcm -o anon.dcm -m PatientName="Smith^John" -m PatientID= -e AccessionNumber
 dcmodify file.dcm -i SeriesDescription=Edited -i "(0009,1001):LO=private"
+dcmodify file.dcm -m "ReferencedImageSequence[0].SeriesDescription=First"
 dcmvalidate anon.dcm   # check the edited file still conforms
 ```
 
@@ -359,10 +386,13 @@ every received instance to a downstream PACS.
 
 ## 10. ATNA audit trail
 
-`storescp` (actor-start + per-store), `storescu` (per-store), and
-`findscu` (per-query) emit DICOM audit messages when given an audit
-server; outcomes follow the DIMSE status, and emission failures warn
-without breaking the transfer:
+Every DIMSE tool but `echoscu`/`echoscp` emits DICOM audit messages
+when given an audit server: `storescp` (actor-start + per-store),
+`storescu` (per-store), `findscu`/`findscp`/`mwlscp` (per-query),
+`movescu` (per-move), `getscu` (per-arrival), `mppsscu`/`mppsscp`
+(per-step), `stgcmtscu`/`stgcmtscp` (per-instance). Outcomes follow
+the DIMSE status, and emission failures warn without breaking the
+transfer:
 
 ```sh
 storescp --bind 127.0.0.1:11112 --directory /data/incoming \

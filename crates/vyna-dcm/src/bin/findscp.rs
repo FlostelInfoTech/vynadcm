@@ -192,6 +192,9 @@ async fn main() -> Result<()> {
         let Ok((tcp, peer)) = listener.accept().await else {
             continue;
         };
+        // DIMSE is small-write chatty; Nagle would stall each PDU on the
+        // peer's delayed ACK (~40ms).
+        tcp.set_nodelay(true).ok();
         let (acceptor, tls, handlers, scp_opts) = (
             acceptor.clone(),
             tls.clone(),
@@ -226,5 +229,17 @@ mod tests {
         assert!(parse_routes(&["no-equals".to_string()]).is_err());
         assert!(parse_routes(&["AE=host".to_string()]).is_err());
         assert!(parse_routes(&["AE=host:xx".to_string()]).is_err());
+    }
+
+    #[test]
+    fn audit_flags_parse() {
+        let args = Args::try_parse_from([
+            "findscp",
+            "/tmp/qr",
+            "--audit-server",
+            "udp://127.0.0.1:514",
+        ])
+        .unwrap();
+        assert!(args.audit.sender("VYNA_SCP").unwrap().is_some());
     }
 }

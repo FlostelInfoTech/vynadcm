@@ -6,7 +6,10 @@ mod common;
 use std::path::PathBuf;
 
 use clap::Parser;
-use common::{ConnArgs, anyhowish::Result, build_qr_query, safe_instance_filename};
+use common::{
+    AuditArgs, ConnArgs, anyhowish::Result, build_qr_query, emit_best_effort, host_of,
+    outcome_for_status, safe_instance_filename,
+};
 use vyna_dcm::core::sop_class;
 use vyna_dcm::{FileMeta, TransferSyntax};
 
@@ -28,6 +31,8 @@ struct Args {
     /// Output directory for retrieved instances.
     #[arg(long, default_value = ".")]
     output_dir: PathBuf,
+    #[command(flatten)]
+    audit: AuditArgs,
 }
 
 fn get_sop_for_model(model: &str) -> Result<&'static str> {
@@ -37,6 +42,35 @@ fn get_sop_for_model(model: &str) -> Result<&'static str> {
         other => Err(common::anyhowish::Error::msg(format!(
             "unknown model {other:?} (C-GET has no Patient/Study-only or MWL form)"
         ))),
+    }
+}
+
+/// Best-effort per-arrival audit; silent when auditing is off or the
+/// arrival carries no Study UID.
+#[allow(clippy::too_many_arguments)]
+fn audit_arrival(
+    audit: &Option<common::SenderWithId>,
+    patient: Option<&str>,
+    study: Option<&str>,
+    class: &str,
+    inst: &str,
+    conn: &ConnArgs,
+    peer_ip: &str,
+    outcome: vyna_dcm::Outcome,
+) {
+    if let (Some(audit), Some(study)) = (audit, study) {
+        let mut msg = vyna_dcm::AuditMessage::instances_transferred(
+            patient,
+            study,
+            &[(class, inst)],
+            &conn.called,
+            Some(peer_ip),
+            &conn.calling,
+            None,
+            &audit.source,
+        );
+        msg.outcome = outcome;
+        emit_best_effort(Some(&audit.sender), &msg, "getscu");
     }
 }
 
@@ -57,8 +91,14 @@ async fn main() -> Result<()> {
 
     let mut count = 0u32;
     let dir = &args.output_dir;
+    let audit = args.audit.sender(&args.conn.calling)?;
+    let peer_ip = host_of(&args.conn.connect).to_string();
     let r = assoc
         .get_with(sop, &query, 0, |class: String, inst: String, ds, ts| {
+            let patient = ds.string(vyna_dcm::tags::PATIENT_ID).map(str::to_string);
+            let study = ds
+                .string(vyna_dcm::tags::STUDY_INSTANCE_UID)
+                .map(str::to_string);
             // Encapsulated arrivals transcode to native; store Explicit LE.
             let ds = if ts.is_encapsulated() {
                 match vyna_dcm::transcode_dataset(
@@ -70,6 +110,16 @@ async fn main() -> Result<()> {
                     Ok(ds) => ds,
                     Err(e) => {
                         println!("transcode failed for {inst}: {e}");
+                        audit_arrival(
+                            &audit,
+                            patient.as_deref(),
+                            study.as_deref(),
+                            &class,
+                            &inst,
+                            &args.conn,
+                            &peer_ip,
+                            vyna_dcm::Outcome::MajorFailure,
+                        );
                         return 0xA900; // dataset does not match SOP class
                     }
                 }
@@ -78,7 +128,7 @@ async fn main() -> Result<()> {
             };
             let meta = FileMeta::new(&class, &inst, TransferSyntax::ExplicitVrLittleEndian);
             let path = dir.join(format!("{}.dcm", safe_instance_filename(&inst)));
-            match vyna_dcm::write_part10(&meta, &ds) {
+            let status = match vyna_dcm::write_part10(&meta, &ds) {
                 Ok(bytes) => match std::fs::write(&path, bytes) {
                     Ok(()) => {
                         count += 1;
@@ -94,7 +144,18 @@ async fn main() -> Result<()> {
                     println!("encode failed for {inst}: {e}");
                     0xA900 // dataset does not match SOP class
                 }
-            }
+            };
+            audit_arrival(
+                &audit,
+                patient.as_deref(),
+                study.as_deref(),
+                &class,
+                &inst,
+                &args.conn,
+                &peer_ip,
+                outcome_for_status(status),
+            );
+            status
         })
         .await?;
     println!(
@@ -127,5 +188,18 @@ mod tests {
         );
         assert!(get_sop_for_model("patientstudy").is_err());
         assert!(get_sop_for_model("mwl").is_err());
+    }
+
+    #[test]
+    fn audit_flags_parse() {
+        let args = Args::try_parse_from([
+            "getscu",
+            "--connect",
+            "127.0.0.1:11112",
+            "--audit-server",
+            "udp://127.0.0.1:514",
+        ])
+        .unwrap();
+        assert!(args.audit.sender("VYNA_SCU").unwrap().is_some());
     }
 }

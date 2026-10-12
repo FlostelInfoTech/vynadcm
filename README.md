@@ -20,7 +20,7 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | `vyna-dcm-pdf` | Encapsulated PDF SOP-instance builders and extractors |
 | `vyna-dcm-deid` | Basic-profile de-identification for research exports |
 | `vyna-dcm-atna` | ATNA audit-trail emission over syslog |
-| `vyna-dcm` | Facade re-exporting the above, plus 30 CLI tools and 3 examples |
+| `vyna-dcm` | Facade re-exporting the above, plus 32 CLI tools and 3 examples |
 
 ## Documentation
 
@@ -83,7 +83,9 @@ cargo run -p vyna-dcm --example link_route -- 127.0.0.1:11115 127.0.0.1:11114 PA
 | `movescu` | C-MOVE retrieve to a destination AE |
 | `getscu` | C-GET retrieve into a directory |
 | `mppsscu` | MPPS N-CREATE + N-SET |
+| `mppsscp` | MPPS N-CREATE/N-SET receiver into a directory |
 | `stgcmtscu` | Storage Commitment request + report wait |
+| `stgcmtscp` | Storage Commitment verdicts from a directory |
 | `qidors` | QIDO-RS search, prints matches |
 | `wadors` | WADO-RS retrieve (instance/metadata/frames/bulkdata) |
 | `stowrs` | STOW-RS store files |

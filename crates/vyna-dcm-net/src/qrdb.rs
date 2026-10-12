@@ -19,7 +19,8 @@ use vyna_dcm_codec::read_part10;
 use vyna_dcm_core::{DataElement, DataSet, Tag, Value, Vr, tags};
 
 use crate::dimse::status;
-use crate::service::{Handlers, MoveInstance, RequestContext};
+use crate::service::{Handlers, MoveInstance, RequestContext, ScpFollowUp};
+use crate::worklist::{COMMITMENT_ACTION_REQUEST, COMMITMENT_EVENT_TYPE, STORAGE_COMMITMENT_PUSH};
 
 /// One indexed file: path plus its header dataset (pixels stripped).
 #[derive(Clone, Debug)]
@@ -357,6 +358,105 @@ impl MwlScp {
     }
 }
 
+/// Storage Commitment (Push) SCP over a [`QrIndex`]: instances the
+/// index holds commit, the rest fail with 0x0112. The verdict ships
+/// as an N-EVENT-REPORT follow-up on the same association.
+#[derive(Clone)]
+pub struct StgCommitScp {
+    index: std::sync::Arc<QrIndex>,
+}
+
+impl StgCommitScp {
+    /// Serve commitment requests against `index` holdings.
+    #[must_use]
+    pub fn new(index: QrIndex) -> Self {
+        Self {
+            index: std::sync::Arc::new(index),
+        }
+    }
+
+    /// Study UID for an indexed instance (bin audits).
+    #[must_use]
+    pub fn study_uid_for(&self, sop_instance_uid: &str) -> Option<String> {
+        self.index.records.iter().find_map(|r| {
+            (r.dataset.string(tags::SOP_INSTANCE_UID) == Some(sop_instance_uid))
+                .then(|| r.dataset.string(tags::STUDY_INSTANCE_UID))
+                .flatten()
+                .map(str::to_string)
+        })
+    }
+
+    /// N-ACTION core: status + optional RSP dataset + the report
+    /// follow-up. `requested_uid` is the commitment request UID.
+    pub fn commit(
+        &self,
+        requested_uid: Option<&str>,
+        action_type: Option<u16>,
+        sop_class: &str,
+        dataset: Option<DataSet>,
+    ) -> (u16, Option<DataSet>, Vec<ScpFollowUp>) {
+        if sop_class != STORAGE_COMMITMENT_PUSH {
+            return (status::SOP_CLASS_NOT_SUPPORTED, None, Vec::new());
+        }
+        if action_type != Some(COMMITMENT_ACTION_REQUEST) {
+            return (status::UNRECOGNIZED_OPERATION, None, Vec::new());
+        }
+        let Some(uid) = requested_uid.filter(|u| vyna_dcm_core::is_valid_uid(u)) else {
+            return (status::MISTYPED_ARGUMENT, None, Vec::new());
+        };
+        let Some(req) = dataset else {
+            return (status::DATASET_MISMATCH, None, Vec::new());
+        };
+        let Some(txn) = req.string(tags::TRANSACTION_UID) else {
+            return (status::DATASET_MISMATCH, None, Vec::new());
+        };
+        let refs: Vec<(String, String)> = req
+            .sequence(tags::REFERENCED_SOP_SEQUENCE)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|it| {
+                        Some((
+                            it.string(tags::REFERENCED_SOP_CLASS_UID)?.to_string(),
+                            it.string(tags::REFERENCED_SOP_INSTANCE_UID)?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let (mut ok, mut failed) = (Vec::new(), Vec::new());
+        for (class, inst) in refs {
+            let held = self.index.records.iter().any(|r| {
+                r.dataset.string(tags::SOP_CLASS_UID) == Some(class.as_str())
+                    && r.dataset.string(tags::SOP_INSTANCE_UID) == Some(inst.as_str())
+            });
+            if held {
+                let mut item = DataSet::new();
+                item.put_uid(tags::REFERENCED_SOP_CLASS_UID, class);
+                item.put_uid(tags::REFERENCED_SOP_INSTANCE_UID, inst);
+                ok.push(item);
+            } else {
+                let mut item = DataSet::new();
+                item.put_uid(tags::REFERENCED_SOP_CLASS_UID, class);
+                item.put_uid(tags::REFERENCED_SOP_INSTANCE_UID, inst);
+                item.put_u16_single(tags::FAILURE_REASON, status::NO_SUCH_SOP_INSTANCE);
+                failed.push(item);
+            }
+        }
+        let mut report = DataSet::new();
+        report.put_uid(tags::TRANSACTION_UID, txn);
+        report.put_sequence(tags::REFERENCED_SOP_SEQUENCE, ok);
+        report.put_sequence(tags::FAILED_SOP_SEQUENCE, failed);
+        let follow_up = ScpFollowUp::EventReport {
+            sop_class_uid: STORAGE_COMMITMENT_PUSH.to_string(),
+            affected_sop_instance_uid: uid.to_string(),
+            event_type_id: COMMITMENT_EVENT_TYPE,
+            dataset: Some(report),
+        };
+        (status::SUCCESS, None, vec![follow_up])
+    }
+}
+
 fn is_qr_find(sop: &str) -> bool {
     matches!(
         sop,
@@ -467,6 +567,22 @@ impl Handlers for MwlScp {
             return (status::SOP_CLASS_NOT_SUPPORTED, Vec::new());
         }
         find_matches(&self.index, query, true)
+    }
+}
+
+impl Handlers for StgCommitScp {
+    async fn on_n_action(
+        &self,
+        ctx: &RequestContext<'_>,
+        dataset: Option<DataSet>,
+    ) -> (u16, Option<DataSet>, Vec<ScpFollowUp>) {
+        // N-ACTION-RQ carries *requested* (not affected) UIDs.
+        self.commit(
+            ctx.command.requested_sop_instance_uid.as_deref(),
+            ctx.command.action_type_id,
+            ctx.command.requested_sop_class_uid.as_deref().unwrap_or(""),
+            dataset,
+        )
     }
 }
 
@@ -614,5 +730,116 @@ mod tests {
         let mut q = DataSet::new();
         q.put_sequence(tags::SCHEDULED_PROCEDURE_STEP_SEQUENCE, vec![item]);
         assert_eq!(find_matches(&idx, &q, true).1.len(), 0);
+    }
+
+    fn commit_index() -> QrIndex {
+        let mut held = DataSet::new();
+        held.put_uid(tags::SOP_CLASS_UID, vyna_dcm_core::sop_class::CT_IMAGE);
+        held.put_uid(tags::SOP_INSTANCE_UID, "1.2.1.1.1");
+        held.put_uid(tags::STUDY_INSTANCE_UID, "1.2.1");
+        QrIndex {
+            records: vec![QrRecord {
+                path: PathBuf::from("1.2.1.1.1.dcm"),
+                dataset: held,
+            }],
+            skipped: 0,
+        }
+    }
+
+    #[test]
+    fn commitment_holds_partition() {
+        use crate::worklist::{parse_commitment_result, storage_commitment_request};
+        let scp = StgCommitScp::new(commit_index());
+        let ct = vyna_dcm_core::sop_class::CT_IMAGE;
+        let (req, txn) = storage_commitment_request(&[(ct, "1.2.1.1.1"), (ct, "9.9.9")]);
+        let (s, _, follow_ups) = scp.commit(
+            Some("1.9.1"),
+            Some(1),
+            crate::worklist::STORAGE_COMMITMENT_PUSH,
+            Some(req),
+        );
+        assert_eq!(s, status::SUCCESS);
+        assert_eq!(follow_ups.len(), 1);
+        let crate::service::ScpFollowUp::EventReport {
+            sop_class_uid,
+            affected_sop_instance_uid,
+            event_type_id,
+            dataset,
+        } = &follow_ups[0];
+        assert_eq!(sop_class_uid, crate::worklist::STORAGE_COMMITMENT_PUSH);
+        assert_eq!(affected_sop_instance_uid, "1.9.1");
+        assert_eq!(*event_type_id, 1);
+        let report = dataset.as_ref().unwrap();
+        let (t, ok, failed) = parse_commitment_result(report);
+        assert_eq!(t, Some(txn));
+        assert_eq!(ok, vec![(ct.to_string(), "1.2.1.1.1".to_string())]);
+        assert_eq!(failed, vec![(ct.to_string(), "9.9.9".to_string())]);
+        let ng = &report.sequence(tags::FAILED_SOP_SEQUENCE).unwrap()[0];
+        assert_eq!(ng.uint16(tags::FAILURE_REASON), Some(0x0112));
+        assert_eq!(scp.study_uid_for("1.2.1.1.1"), Some("1.2.1".to_string()));
+        assert_eq!(scp.study_uid_for("9.9.9"), None);
+    }
+
+    #[test]
+    fn commitment_rejects_bad_requests() {
+        use crate::worklist::storage_commitment_request;
+        let scp = StgCommitScp::new(commit_index());
+        let ct = vyna_dcm_core::sop_class::CT_IMAGE;
+        let (req, _) = storage_commitment_request(&[(ct, "1.2.1.1.1")]);
+        assert_eq!(
+            scp.commit(Some("1.9.1"), Some(1), "1.2.9.9", Some(req.clone()))
+                .0,
+            status::SOP_CLASS_NOT_SUPPORTED
+        );
+        assert_eq!(
+            scp.commit(
+                Some("1.9.1"),
+                Some(2),
+                crate::worklist::STORAGE_COMMITMENT_PUSH,
+                Some(req.clone())
+            )
+            .0,
+            status::UNRECOGNIZED_OPERATION
+        );
+        assert_eq!(
+            scp.commit(
+                Some("../x"),
+                Some(1),
+                crate::worklist::STORAGE_COMMITMENT_PUSH,
+                Some(req.clone())
+            )
+            .0,
+            status::MISTYPED_ARGUMENT
+        );
+        assert_eq!(
+            scp.commit(
+                None,
+                Some(1),
+                crate::worklist::STORAGE_COMMITMENT_PUSH,
+                Some(req.clone())
+            )
+            .0,
+            status::MISTYPED_ARGUMENT
+        );
+        assert_eq!(
+            scp.commit(
+                Some("1.9.1"),
+                Some(1),
+                crate::worklist::STORAGE_COMMITMENT_PUSH,
+                None
+            )
+            .0,
+            status::DATASET_MISMATCH
+        );
+        assert_eq!(
+            scp.commit(
+                Some("1.9.1"),
+                Some(1),
+                crate::worklist::STORAGE_COMMITMENT_PUSH,
+                Some(DataSet::new())
+            )
+            .0,
+            status::DATASET_MISMATCH
+        );
     }
 }

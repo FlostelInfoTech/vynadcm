@@ -28,14 +28,16 @@ struct Args {
     /// Output file (default: replace the input).
     #[arg(short, long)]
     output: Option<PathBuf>,
-    /// Modify an existing tag: `TAG=VALUE` (keeps the element's VR).
-    /// Repeatable. Multi-valued: separate values with `\`.
+    /// Modify an existing tag: `PATH=VALUE` (keeps the element's
+    /// VR). Repeatable. Multi-valued: separate values with `\`.
+    /// Paths descend into sequences: `SEQ[0].TAG` (0-based).
     #[arg(short = 'm', long = "modify")]
     modifies: Vec<String>,
     /// Erase a tag (warns and continues when absent). Repeatable.
+    /// Accepts `SEQ[0].TAG` paths.
     #[arg(short = 'e', long = "erase")]
     erases: Vec<String>,
-    /// Insert a tag: `TAG=VALUE` or `TAG:VR=VALUE` (`:VR` required
+    /// Insert a tag: `PATH=VALUE` or `PATH:VR=VALUE` (`:VR` required
     /// when the tag has no dictionary entry). Repeatable.
     #[arg(short = 'i', long = "insert")]
     inserts: Vec<String>,
@@ -74,18 +76,90 @@ fn parse_tag_spec(spec: &str) -> Result<Tag, String> {
         .ok_or_else(|| format!("unknown tag {spec:?}: want (GGGG,EEEE), GGGGEEEE, or a keyword"))
 }
 
-/// Split an insert's `TAG[:VR]` left-hand side.
-fn parse_tag_vr(left: &str) -> Result<(Tag, Option<Vr>), String> {
+/// An edit path: sequence hops (`TAG[index]`, 0-based) leading to a
+/// final tag, e.g. `ReferencedImageSequence[0].SeriesDescription`.
+/// A bare `TAG` addresses the top-level dataset.
+#[derive(Debug, PartialEq, Eq)]
+struct EditPath {
+    hops: Vec<(Tag, usize)>,
+    tag: Tag,
+}
+
+/// Split an insert's `PATH[:VR]` left-hand side (`:` cannot appear in
+/// a path, so the first colon is the VR separator).
+fn parse_path_vr(left: &str) -> Result<(EditPath, Option<Vr>), String> {
     match left.split_once(':') {
-        None => Ok((parse_tag_spec(left)?, None)),
-        Some((tag, vr)) => {
+        None => Ok((parse_edit_path(left)?, None)),
+        Some((path, vr)) => {
             let vr = vr
                 .to_ascii_uppercase()
                 .parse::<Vr>()
                 .map_err(|_| format!("unknown VR {vr:?} in {left:?}"))?;
-            Ok((parse_tag_spec(tag)?, Some(vr)))
+            Ok((parse_edit_path(path)?, Some(vr)))
         }
     }
+}
+
+fn parse_edit_path(left: &str) -> Result<EditPath, String> {
+    // Tag specs (keywords, hex, `(GGGG,EEEE)`) never contain `.`.
+    let segs: Vec<&str> = left.split('.').collect();
+    if segs.iter().any(|s| s.trim().is_empty()) {
+        return Err(format!("bad path {left:?}: empty segment"));
+    }
+    let mut hops = Vec::with_capacity(segs.len().saturating_sub(1));
+    for seg in &segs[..segs.len() - 1] {
+        let (tag_part, idx) = split_hop(seg, left)?;
+        hops.push((parse_tag_spec(tag_part)?, idx));
+    }
+    let last = segs[segs.len() - 1];
+    if last.contains('[') {
+        return Err(format!("bad path {left:?}: the final tag takes no [index]"));
+    }
+    Ok(EditPath {
+        hops,
+        tag: parse_tag_spec(last)?,
+    })
+}
+
+/// Split a `TAG[index]` hop; a bare tag is rejected (descending needs
+/// an explicit 0-based item index).
+fn split_hop<'a>(seg: &'a str, whole: &str) -> Result<(&'a str, usize), String> {
+    let (tag_part, rest) = seg
+        .split_once('[')
+        .ok_or_else(|| format!("bad path {whole:?}: {seg:?} needs [index] to descend"))?;
+    let idx = rest
+        .strip_suffix(']')
+        .ok_or_else(|| format!("bad path {whole:?}: {seg:?} wants TAG[index]"))?;
+    let idx: usize = idx
+        .parse()
+        .map_err(|_| format!("bad path {whole:?}: {idx:?} is not an item index"))?;
+    if tag_part.trim().is_empty() {
+        return Err(format!("bad path {whole:?}: empty tag in {seg:?}"));
+    }
+    Ok((tag_part, idx))
+}
+
+/// Follow `hops` from `ds`; every hop must name an existing sequence
+/// with an in-range item (edits never create items).
+fn descend<'a>(ds: &'a mut DataSet, hops: &[(Tag, usize)]) -> Result<&'a mut DataSet, String> {
+    let mut cur = ds;
+    for (tag, idx) in hops {
+        let el = cur
+            .get_mut(*tag)
+            .ok_or_else(|| format!("({tag}): not present; path hops must exist"))?;
+        match &mut el.value {
+            Value::Sequence(items) => {
+                let len = items.len();
+                cur = items.get_mut(*idx).ok_or_else(|| {
+                    format!("({tag})[{idx}]: item index out of range (len {len})")
+                })?;
+            }
+            _ => {
+                return Err(format!("({tag}): not a sequence (VR {})", el.vr));
+            }
+        }
+    }
+    Ok(cur)
 }
 
 /// Build an element from CLI text for `vr` (`\` separates values;
@@ -152,7 +226,7 @@ fn parse_values(tag: Tag, vr: Vr, text: &str) -> Result<DataElement, String> {
         }
         Vr::Sq => {
             return Err(format!(
-                "({tag}): sequences can't be set from the CLI (erase only)"
+                "({tag}): sequences can't be set wholesale; edit items via SEQ[index].TAG paths"
             ));
         }
         Vr::Si => {
@@ -203,13 +277,14 @@ fn apply_edits(
     let mut counts = EditCounts::default();
     for spec in erases {
         if spec.contains('=') || spec.contains(':') {
-            return Err(format!("bad --erase {spec:?}: want TAG without = or :VR"));
+            return Err(format!("bad --erase {spec:?}: want PATH without = or :VR"));
         }
-        let tag = parse_tag_spec(spec)?;
-        if ds.remove(tag).is_none() {
+        let path = parse_edit_path(spec)?;
+        let target = descend(ds, &path.hops)?;
+        if target.remove(path.tag).is_none() {
             counts
                 .warnings
-                .push(format!("({tag}): not present, nothing erased"));
+                .push(format!("({}): not present, nothing erased", path.tag));
         } else {
             counts.erased += 1;
         }
@@ -217,26 +292,29 @@ fn apply_edits(
     for spec in modifies {
         let (left, text) = spec
             .split_once('=')
-            .ok_or_else(|| format!("bad --modify {spec:?}: want TAG=VALUE"))?;
+            .ok_or_else(|| format!("bad --modify {spec:?}: want PATH=VALUE"))?;
         if left.contains(':') {
             return Err(format!(
                 "bad --modify {spec:?}: modifies keep the existing VR (no :VR)"
             ));
         }
-        let tag = parse_tag_spec(left)?;
-        let vr = ds
-            .get(tag)
+        let path = parse_edit_path(left)?;
+        let target = descend(ds, &path.hops)?;
+        let vr = target
+            .get(path.tag)
             .map(|el| el.vr)
-            .ok_or_else(|| format!("({tag}): not present; use --insert to add it"))?;
-        ds.insert(parse_values(tag, vr, text)?);
+            .ok_or_else(|| format!("({}): not present; use --insert to add it", path.tag))?;
+        target.insert(parse_values(path.tag, vr, text)?);
         counts.modified += 1;
     }
     for spec in inserts {
         let (left, text) = spec
             .split_once('=')
-            .ok_or_else(|| format!("bad --insert {spec:?}: want TAG[:VR]=VALUE"))?;
-        let (tag, explicit_vr) = parse_tag_vr(left)?;
-        if ds.contains(tag) {
+            .ok_or_else(|| format!("bad --insert {spec:?}: want PATH[:VR]=VALUE"))?;
+        let (path, explicit_vr) = parse_path_vr(left)?;
+        let target = descend(ds, &path.hops)?;
+        let tag = path.tag;
+        if target.contains(tag) {
             return Err(format!(
                 "({tag}): already present; use --modify to change it"
             ));
@@ -257,7 +335,7 @@ fn apply_edits(
             None => dictionary_vr(tag)
                 .ok_or_else(|| format!("({tag}): no dictionary entry; use TAG:VR=VALUE"))?,
         };
-        ds.insert(parse_values(tag, vr, text)?);
+        target.insert(parse_values(tag, vr, text)?);
         counts.inserted += 1;
     }
     Ok(counts)
@@ -408,12 +486,17 @@ mod tests {
 
     #[test]
     fn insert_vr_suffix_parses() {
-        let (tag, vr) = parse_tag_vr("PatientName:PN").unwrap();
-        assert_eq!((tag, vr), (tags::PATIENT_NAME, Some(Vr::Pn)));
-        let (tag, vr) = parse_tag_vr("(0009,1001):lo").unwrap();
-        assert_eq!((tag, vr), (Tag::new(0x0009, 0x1001), Some(Vr::Lo)));
-        assert!(parse_tag_vr("00100010:XX").is_err());
-        assert_eq!(parse_tag_vr("00100010").unwrap().1, None);
+        let (path, vr) = parse_path_vr("PatientName:PN").unwrap();
+        assert!(path.hops.is_empty());
+        assert_eq!((path.tag, vr), (tags::PATIENT_NAME, Some(Vr::Pn)));
+        let (path, vr) = parse_path_vr("(0009,1001):lo").unwrap();
+        assert!(path.hops.is_empty());
+        assert_eq!((path.tag, vr), (Tag::new(0x0009, 0x1001), Some(Vr::Lo)));
+        let (path, vr) = parse_path_vr("ReferencedImageSequence[0].(0009,1001):LO").unwrap();
+        assert_eq!(path.hops, vec![(REF_IMG_SEQ, 0)]);
+        assert_eq!((path.tag, vr), (Tag::new(0x0009, 0x1001), Some(Vr::Lo)));
+        assert!(parse_path_vr("00100010:XX").is_err());
+        assert_eq!(parse_path_vr("00100010").unwrap().1, None);
     }
 
     #[test]
@@ -456,6 +539,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    const REF_IMG_SEQ: Tag = Tag::new(0x0008, 0x1140);
+
     fn sample() -> DataSet {
         let mut ds = DataSet::new();
         ds.put_uid(tags::SOP_CLASS_UID, "1.2.3");
@@ -466,6 +551,119 @@ mod tests {
         );
         ds.put_text(tags::PATIENT_ID, Vr::Lo, "P123");
         ds
+    }
+
+    fn sample_with_sequence() -> DataSet {
+        let mut ds = sample();
+        let mut item0 = DataSet::new();
+        item0.put_text(tags::SERIES_DESCRIPTION, Vr::Sh, "Old");
+        let mut item1 = DataSet::new();
+        item1.put_text(tags::SERIES_DESCRIPTION, Vr::Sh, "Second");
+        ds.insert(DataElement::new(
+            REF_IMG_SEQ,
+            Vr::Sq,
+            Value::Sequence(vec![item0, item1]),
+        ));
+        ds
+    }
+
+    #[test]
+    fn sequence_paths_parse() {
+        let p = parse_edit_path("PatientName").unwrap();
+        assert!(p.hops.is_empty());
+        assert_eq!(p.tag, tags::PATIENT_NAME);
+        let p = parse_edit_path("ReferencedImageSequence[0].SeriesDescription").unwrap();
+        assert_eq!(p.hops, vec![(REF_IMG_SEQ, 0)]);
+        assert_eq!(p.tag, tags::SERIES_DESCRIPTION);
+        let p = parse_edit_path("(0008,1140)[1].(0008,103E)").unwrap();
+        assert_eq!(p.hops, vec![(REF_IMG_SEQ, 1)]);
+        assert_eq!(p.tag, tags::SERIES_DESCRIPTION);
+        // Nested hops.
+        let p =
+            parse_edit_path("ReferencedImageSequence[0].ReferencedImageSequence[1].SOPInstanceUID")
+                .unwrap();
+        assert_eq!(p.hops, vec![(REF_IMG_SEQ, 0), (REF_IMG_SEQ, 1)]);
+        // Violations.
+        assert!(parse_edit_path("ReferencedImageSequence.SeriesDescription").is_err());
+        assert!(parse_edit_path("ReferencedImageSequence[0]").is_err());
+        assert!(parse_edit_path("ReferencedImageSequence[x].SeriesDescription").is_err());
+        assert!(parse_edit_path("ReferencedImageSequence[0].SeriesDescription[0]").is_err());
+        assert!(parse_edit_path("").is_err());
+    }
+
+    #[test]
+    fn sequence_edits_apply_per_item() {
+        let mut ds = sample_with_sequence();
+        let counts = apply_edits(
+            &mut ds,
+            &["ReferencedImageSequence[1].SeriesDescription=New".to_string()],
+            &["ReferencedImageSequence[0].SeriesDescription".to_string()],
+            &["ReferencedImageSequence[0].InstitutionName=St Elsewhere".to_string()],
+        )
+        .unwrap();
+        assert_eq!((counts.modified, counts.inserted, counts.erased), (1, 1, 1));
+        let items = ds.sequence(REF_IMG_SEQ).unwrap();
+        assert!(!items[0].contains(tags::SERIES_DESCRIPTION));
+        assert_eq!(
+            items[0].string(tags::INSTITUTION_NAME),
+            Some("St Elsewhere")
+        );
+        assert_eq!(items[1].string(tags::SERIES_DESCRIPTION), Some("New"));
+    }
+
+    #[test]
+    fn sequence_edit_violations_error() {
+        let mut ds = sample_with_sequence();
+        // Item index out of range.
+        assert!(
+            apply_edits(
+                &mut ds,
+                &["ReferencedImageSequence[7].SeriesDescription=X".to_string()],
+                &[],
+                &[],
+            )
+            .is_err()
+        );
+        // Hop through a non-sequence.
+        assert!(
+            apply_edits(
+                &mut ds,
+                &["PatientID[0].SeriesDescription=X".to_string()],
+                &[],
+                &[]
+            )
+            .is_err()
+        );
+        // Modify a tag missing from the item.
+        assert!(
+            apply_edits(
+                &mut ds,
+                &["ReferencedImageSequence[0].Modality=CT".to_string()],
+                &[],
+                &[]
+            )
+            .is_err()
+        );
+        // Insert a tag already in the item.
+        assert!(
+            apply_edits(
+                &mut ds,
+                &[],
+                &[],
+                &["ReferencedImageSequence[0].SeriesDescription=X".to_string()],
+            )
+            .is_err()
+        );
+        // Erasing a missing item tag warns instead of failing.
+        let counts = apply_edits(
+            &mut ds,
+            &[],
+            &["ReferencedImageSequence[0].Modality".to_string()],
+            &[],
+        )
+        .unwrap();
+        assert_eq!(counts.erased, 0);
+        assert_eq!(counts.warnings.len(), 1);
     }
 
     #[test]

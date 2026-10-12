@@ -1,6 +1,6 @@
 [package]
 name = "vyna-dcm-deid"
-version = "0.2.0"
+version = "0.3.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -9,5 +9,5 @@ repository.workspace = true
 description = "VynaDCM de-identification: PS3.15 E-style profiles for research exports"
 
 [dependencies]
-vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.2" }
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.3" }
 thiserror.workspace = true

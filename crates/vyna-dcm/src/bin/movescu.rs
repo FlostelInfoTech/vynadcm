@@ -4,7 +4,10 @@
 mod common;
 
 use clap::Parser;
-use common::{ConnArgs, anyhowish::Result, build_qr_query};
+use common::{
+    AuditArgs, ConnArgs, anyhowish::Result, build_qr_query, emit_best_effort, host_of,
+    outcome_for_status,
+};
 use vyna_dcm::core::sop_class;
 
 /// C-MOVE SCU.
@@ -25,6 +28,8 @@ struct Args {
     /// Matching keys as KEY=value (keyword or GGGGEEEE tag). Repeatable.
     #[arg(short, long = "key")]
     keys: Vec<String>,
+    #[command(flatten)]
+    audit: AuditArgs,
 }
 
 fn move_sop_for_model(model: &str) -> Result<&'static str> {
@@ -53,6 +58,29 @@ async fn main() -> Result<()> {
         "C-MOVE complete: {} completed, {} failed, {} warning, status {:#06X}",
         r.completed, r.failed, r.warning, r.status
     );
+    if let Some(audit) = args.audit.sender(&args.conn.calling)? {
+        // C-MOVE responses carry counts, not instance UIDs, so the audit
+        // names the query target; the transfer itself is peer -> --dest.
+        let study = query
+            .string(vyna_dcm::tags::STUDY_INSTANCE_UID)
+            .unwrap_or("");
+        let mut msg = vyna_dcm::AuditMessage::begin_transferring(
+            query.string(vyna_dcm::tags::PATIENT_ID),
+            study,
+            &[],
+            &args.conn.called,
+            Some(host_of(&args.conn.connect)),
+            &args.dest,
+            None,
+            &audit.source,
+        );
+        msg.outcome = if r.failed > 0 && r.status == 0 {
+            vyna_dcm::Outcome::MinorFailure
+        } else {
+            outcome_for_status(r.status)
+        };
+        emit_best_effort(Some(&audit.sender), &msg, "movescu");
+    }
     assoc.release().await?;
     if r.status != 0 {
         return Err(common::anyhowish::Error::msg(format!(
@@ -82,5 +110,20 @@ mod tests {
             sop_class::PATIENT_STUDY_ONLY_MOVE
         );
         assert!(move_sop_for_model("mwl").is_err());
+    }
+
+    #[test]
+    fn audit_flags_parse() {
+        let args = Args::try_parse_from([
+            "movescu",
+            "--connect",
+            "127.0.0.1:11112",
+            "--dest",
+            "DEST_AE",
+            "--audit-server",
+            "udp://127.0.0.1:514",
+        ])
+        .unwrap();
+        assert!(args.audit.sender("VYNA_SCU").unwrap().is_some());
     }
 }

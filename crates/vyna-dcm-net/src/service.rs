@@ -165,7 +165,7 @@ pub fn negotiate(
             max_pdu_len: opts.association.max_pdu_len,
             implementation_class_uid: opts.association.implementation_class_uid.clone(),
             implementation_version: opts.association.implementation_version.clone(),
-            async_ops: None,                           // v0.1 is synchronous
+            async_ops: None, // synchronous: one outstanding operation per association
             role_selection: rq.role_selection.clone(), // accept proposed roles
             user_identity_response: identity_response,
         },
@@ -265,13 +265,15 @@ pub trait Handlers: Send + Sync {
         (status::SOP_CLASS_NOT_SUPPORTED, None)
     }
 
-    /// N-ACTION-RQ → status + optional response dataset.
+    /// N-ACTION-RQ → status + optional response dataset + follow-up
+    /// SCP-initiated requests, emitted after the RSP on success with
+    /// their RSPs awaited (Storage Commitment reports).
     async fn on_n_action(
         &self,
         _ctx: &RequestContext<'_>,
         _dataset: Option<DataSet>,
-    ) -> (u16, Option<DataSet>) {
-        (status::SOP_CLASS_NOT_SUPPORTED, None)
+    ) -> (u16, Option<DataSet>, Vec<ScpFollowUp>) {
+        (status::SOP_CLASS_NOT_SUPPORTED, None, Vec::new())
     }
 
     /// N-DELETE-RQ → status.
@@ -302,6 +304,69 @@ impl AeDirectory for HashMapDirectory {
     fn resolve(&self, ae: &str) -> Option<(String, u16)> {
         self.map.get(ae.trim()).cloned()
     }
+}
+
+/// How long the SCP waits for a C-CANCEL between pending responses.
+/// Local peers answer in microseconds; the wait also yields to the
+/// executor so the peer task runs between responses.
+const CANCEL_POLL_WAIT: Duration = Duration::from_millis(1);
+
+/// Outcome of polling for C-CANCEL during a multi-response operation.
+enum CancelPoll {
+    /// No C-CANCEL for `message_id`; streaming continues.
+    KeepGoing,
+    /// C-CANCEL for `message_id` arrived; stop with status CANCEL.
+    Cancelled,
+    /// The peer released mid-operation; stop without a final response
+    /// (the stashed release reaches the dispatch loop next).
+    Released,
+}
+
+/// Poll once for a C-CANCEL-RQ targeting `message_id`. Anything else
+/// the peer sends mid-operation (e.g. RELEASE-RQ) is stashed back for
+/// the dispatch loop — never swallowed.
+async fn poll_cancel(assoc: &mut Association, message_id: u16) -> Result<CancelPoll> {
+    match assoc.poll_event(CANCEL_POLL_WAIT).await? {
+        None => Ok(CancelPoll::KeepGoing),
+        Some(DimseEvent::Released) => {
+            assoc.stash(DimseEvent::Released);
+            Ok(CancelPoll::Released)
+        }
+        Some(DimseEvent::Message(m))
+            if m.command.field == CF::C_CANCEL_RQ
+                && m.command.message_id_rsp == Some(message_id) =>
+        {
+            Ok(CancelPoll::Cancelled)
+        }
+        Some(other) => {
+            if let DimseEvent::Message(m) = &other {
+                tracing::debug!(
+                    "stashing {} received mid-operation for message {message_id}",
+                    m.command.name()
+                );
+            }
+            assoc.stash(other);
+            Ok(CancelPoll::KeepGoing)
+        }
+    }
+}
+
+/// An SCP-initiated request emitted after the RSP, with its RSP
+/// awaited before dispatch continues. The framework assigns the
+/// message ID at send time.
+#[derive(Clone, Debug)]
+pub enum ScpFollowUp {
+    /// N-EVENT-REPORT-RQ (Storage Commitment today; UPS later).
+    EventReport {
+        /// Affected SOP Class UID.
+        sop_class_uid: String,
+        /// Affected SOP Instance UID.
+        affected_sop_instance_uid: String,
+        /// Event Type ID.
+        event_type_id: u16,
+        /// Report dataset, if any.
+        dataset: Option<DataSet>,
+    },
 }
 
 /// How the SCP performs C-MOVE sub-operations.
@@ -465,9 +530,21 @@ async fn dispatch<H: Handlers>(
                     true,
                 );
                 assoc.send(ctx_id, &rsp, Some(m)).await?;
+                match poll_cancel(assoc, rsp_id).await? {
+                    CancelPoll::KeepGoing => {}
+                    CancelPoll::Released => return Ok(()),
+                    CancelPoll::Cancelled => {
+                        let rsp = Command::find_rsp(
+                            rsp_id,
+                            cmd.affected_sop_class_uid.clone(),
+                            status::CANCEL,
+                            false,
+                        );
+                        assoc.send(ctx_id, &rsp, None).await?;
+                        return Ok(());
+                    }
+                }
             }
-            // NOTE: v0.1 streams from a collected Vec, so C-CANCEL cannot
-            // interrupt mid-FIND; handlers returning promptly is enough.
             let rsp = Command::find_rsp(
                 rsp_id,
                 cmd.affected_sop_class_uid.clone(),
@@ -477,7 +554,10 @@ async fn dispatch<H: Handlers>(
             assoc.send(ctx_id, &rsp, None).await?;
         }
         CF::C_CANCEL_RQ => {
-            tracing::debug!("C-CANCEL-RQ ignored (no streaming operations in v0.1)");
+            // In-flight operations consume their own CANCEL via
+            // poll_cancel; one arriving here targets a completed (or
+            // unknown) operation and is correctly ignored.
+            tracing::debug!("C-CANCEL-RQ for a completed operation ignored");
         }
         CF::C_MOVE_RQ => {
             handle_move(assoc, handlers, opts, &rctx, &msg, ctx_id).await?;
@@ -517,9 +597,14 @@ async fn dispatch<H: Handlers>(
             assoc.send(ctx_id, &rsp, ds.as_ref()).await?;
         }
         CF::N_ACTION_RQ => {
-            let (s, ds) = handlers.on_n_action(&rctx, msg.dataset).await;
+            let (s, ds, follow_ups) = handlers.on_n_action(&rctx, msg.dataset).await;
             let rsp = Command::n_action_rsp(rsp_id, s);
             send_optional(assoc, ctx_id, rsp, ds).await?;
+            if status::is_success(s) {
+                for f in follow_ups {
+                    emit_follow_up(assoc, ctx_id, f).await?;
+                }
+            }
         }
         CF::N_DELETE_RQ => {
             let s = handlers.on_n_delete(&rctx).await;
@@ -538,6 +623,49 @@ async fn dispatch<H: Handlers>(
                 "unrecognised command field {:#06X}",
                 cmd.field
             )));
+        }
+    }
+    Ok(())
+}
+
+/// Emit one SCP-initiated follow-up and await its RSP. Anything
+/// but the matching RSP (e.g. a release) is stashed for the
+/// dispatch loop — never swallowed.
+async fn emit_follow_up(assoc: &mut Association, ctx_id: u8, f: ScpFollowUp) -> Result<()> {
+    let ScpFollowUp::EventReport {
+        sop_class_uid,
+        affected_sop_instance_uid,
+        event_type_id,
+        dataset,
+    } = f;
+    let id = assoc.next_message_id();
+    let rq = Command::n_event_report_rq(
+        id,
+        sop_class_uid,
+        affected_sop_instance_uid,
+        event_type_id,
+        dataset.is_some(),
+    );
+    assoc.send(ctx_id, &rq, dataset.as_ref()).await?;
+    match assoc.recv().await? {
+        DimseEvent::Message(m)
+            if m.command.field == CF::N_EVENT_REPORT_RSP
+                && m.command.message_id_rsp == Some(id) =>
+        {
+            tracing::debug!(
+                "follow-up N-EVENT-REPORT acked: {:#06X}",
+                m.command.status.unwrap_or(0)
+            );
+        }
+        DimseEvent::Released => {
+            assoc.stash(DimseEvent::Released);
+        }
+        DimseEvent::Message(other) => {
+            tracing::warn!(
+                "stashing {} instead of a follow-up RSP",
+                other.command.name()
+            );
+            assoc.stash(DimseEvent::Message(other));
         }
     }
     Ok(())
@@ -646,6 +774,28 @@ async fn handle_move<H: Handlers>(
             done_warn,
         );
         assoc.send(ctx_id, &rsp, None).await?;
+        match poll_cancel(assoc, rsp_id).await? {
+            CancelPoll::KeepGoing => {}
+            CancelPoll::Released => {
+                outbound.release().await.ok();
+                return Ok(());
+            }
+            CancelPoll::Cancelled => {
+                outbound.release().await.ok();
+                let rsp = Command::move_get_rsp(
+                    true,
+                    rsp_id,
+                    sop,
+                    status::CANCEL,
+                    remaining,
+                    done_ok,
+                    done_fail,
+                    done_warn,
+                );
+                assoc.send(ctx_id, &rsp, None).await?;
+                return Ok(());
+            }
+        }
     }
     outbound.release().await.ok();
     let rsp = Command::move_get_rsp(

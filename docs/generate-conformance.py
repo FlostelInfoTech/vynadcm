@@ -279,6 +279,10 @@ SCP_HANDLERS = {
     "on_n_event_report": "N-EVENT-REPORT",
 }
 
+service_src = (NET / "service.rs").read_text()
+qrdb_src = (NET / "qrdb.rs").read_text()
+worklist_src = (NET / "worklist.rs").read_text()
+
 bin_names = re.findall(r'\[\[bin\]\]\nname = "([^"]+)"', FACACE_CARGO.read_text())
 assert bin_names, "conformance: no [[bin]] entries found"
 tools = []  # (name, kind, about, services, sop_consts, notes)
@@ -313,6 +317,9 @@ for name in bin_names:
             notes.append(
                 f"also proposes {len(STORAGE)} storage SOP classes for C-GET delivery"
             )
+        if name == "findscu":
+            assert "args.cancel" in src, "conformance: findscu --cancel vanished"
+            notes.append("`--cancel N` stops after N matches; a requested FE00 exits 0")
     elif kind == "SCP":
         for m in re.finditer(r"async fn (on_\w+)", src):
             svc = SCP_HANDLERS.get(m.group(1))
@@ -321,6 +328,19 @@ for name in bin_names:
                 services.append(svc)
         if re.search(r"impl Handlers for \w+ \{\}", src):
             services.append("C-ECHO (all other services use rejecting defaults)")
+        if name == "mppsscp":
+            assert "pub struct MppsScp" in worklist_src, "conformance: MppsScp vanished"
+            notes.append(
+                "N-CREATE inserts a step, N-SET merges over it, final states "
+                "reject updates; steps persist as Part-10 files named by MPPS UID"
+            )
+        if name == "stgcmtscp":
+            assert "pub struct StgCommitScp" in qrdb_src, "conformance: StgCommitScp vanished"
+            assert "ScpFollowUp::EventReport" in service_src, "conformance: report path vanished"
+            notes.append(
+                "commits index holdings and fails the rest with 0x0112; "
+                "the verdict ships as an N-EVENT-REPORT on the same association"
+            )
     tools.append((name, kind, about, services, sops, notes))
 
 scu_tools = [t for t in tools if t[1] == "SCU"]
@@ -396,10 +416,12 @@ for i, (name, _k, about, services, sops, notes) in enumerate(scu_tools, 1):
     add("")
 add("### 3.2 SCP tools")
 add("")
-for i, (name, _k, about, services, _s, _n) in enumerate(scp_tools, 1):
+for i, (name, _k, about, services, _s, notes) in enumerate(scp_tools, 1):
     add(f"#### 3.2.{i} `{name}` — {about}")
     add("")
     add(f"- Services handled: {', '.join(services)}.")
+    for n in notes:
+        add(f"- Note: {n}.")
     add("")
 add("Acceptance policy (library defaults, shared by all SCP tools): any")
 add("proposed SOP Class is accepted (`accepted_sop_classes: None`); all")
@@ -426,6 +448,9 @@ add("  extended/common negotiation) is offered by either side.")
 add("- SCU tools request release after their service; SCP tools answer")
 add("  release and abort cleanly. Protocol violations abort the")
 add("  association (A-ABORT source 2).")
+assert "poll_cancel" in service_src, "conformance: cancel polling vanished"
+add("- C-CANCEL is honored mid-stream during C-FIND/C-MOVE (final FE00);")
+add("  C-GET aborts delivery when cancel arrives with the C-STORE-RSP.")
 add("")
 add("## 4. Communication profiles")
 add("")

@@ -130,6 +130,9 @@ async fn main() -> Result<()> {
         let Ok((tcp, peer)) = listener.accept().await else {
             continue;
         };
+        // DIMSE is small-write chatty; Nagle would stall each PDU on the
+        // peer's delayed ACK (~40ms).
+        tcp.set_nodelay(true).ok();
         let (acceptor, tls, handlers) = (acceptor.clone(), tls.clone(), handlers.clone());
         tokio::spawn(async move {
             println!("association from {peer}");
@@ -147,5 +150,22 @@ async fn main() -> Result<()> {
                 Err(e) => println!("association from {peer} ended: {e}"),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audit_flags_parse() {
+        let args = Args::try_parse_from([
+            "mwlscp",
+            "/tmp/mwl",
+            "--audit-server",
+            "udp://127.0.0.1:514",
+        ])
+        .unwrap();
+        assert!(args.audit.sender("VYNA_SCP").unwrap().is_some());
     }
 }

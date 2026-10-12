@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | Software bill of materials (living) |
-| Version | 0.2.0 |
+| Version | 0.3.0 |
 | Date | 2026-10-12 |
 | Status | Living — regenerated on every dependency change |
-| Applies to | VynaDCM workspace v0.2.0 |
+| Applies to | VynaDCM workspace v0.3.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue (201
 components); Unreleased — bundled JPEG codecs + IOD validator + PDF
@@ -17,13 +17,16 @@ components (10 workspace, 208 third-party); Unreleased — XML
 presentation (`quick-xml`): 219 components (10 workspace, 209
 third-party); Unreleased — PNG export/import (`image` + PNG stack):
 227 components (10 workspace, 217 third-party);
-0.2.0 (2026-10-12) — version bump, dependency set unchanged.
+0.2.0 (2026-10-12) — version bump, dependency set unchanged;
+Unreleased — `storescp --exec` (tokio `process` feature):
+229 components (10 workspace, 219 third-party);
+0.3.0 (2026-10-12) — version bump, dependency set as above.
 
 ## 1. Artifact
 
 `docs/sbom.cyclonedx.json` is the authoritative bill of materials in
 [CycloneDX](https://cyclonedx.org/) 1.5 JSON format. It currently lists
-**10 workspace members** (proprietary) and **217 third-party crates**,
+**10 workspace members** (proprietary) and **219 third-party crates**,
 each with name, version, Package URL, SPDX license, and (for registry
 crates) the SHA-256 checksum from `Cargo.lock`. One third-party
 component, `openjp2` 0.6.1, is vendored under `vendor/` with a VynaDCM

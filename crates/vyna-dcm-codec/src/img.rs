@@ -216,6 +216,39 @@ mod tests {
         assert_eq!(rgb.as_raw(), &[10, 30, 50, 20, 40, 60]);
     }
 
+    fn gray8_png(px: &[u8], w: u32, h: u32) -> Vec<u8> {
+        let img = DynamicImage::ImageLuma8(image::GrayImage::from_raw(w, h, px.to_vec()).unwrap());
+        let mut buf = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Png)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn injected_png_survives_lossless_targets() {
+        use crate::transcode::{TranscodeOptions, transcode_dataset};
+        let png = gray8_png(&[0, 64, 128, 255], 2, 2);
+        let mut native = DataSet::new();
+        inject_png(&mut native, &png).unwrap();
+        let expect = decode_pixels(&native, TransferSyntax::ExplicitVrLittleEndian).unwrap();
+        let opts = TranscodeOptions::default();
+        for target in [
+            TransferSyntax::JpegLossless,
+            TransferSyntax::JpegLsLossless,
+            TransferSyntax::Jpeg2000Lossless,
+            TransferSyntax::RleLossless,
+        ] {
+            let enc = transcode_dataset(
+                &native,
+                TransferSyntax::ExplicitVrLittleEndian,
+                target,
+                &opts,
+            )
+            .unwrap();
+            assert_eq!(decode_pixels(&enc, target).unwrap(), expect, "{target:?}");
+        }
+    }
+
     #[test]
     fn rejects_unsupported() {
         // YBR output is refused (transcode first).

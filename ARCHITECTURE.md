@@ -168,10 +168,11 @@ The physics convention follows PS3.3 C.10.9:
 - `lib.rs` — re-exports `core`/`codec`/`iod`/`pdf`/`deid`/`atna` always;
   `net`/`web`/`ecg` behind same-named features; common types
   (`DataSet`, `Tag`, `Vr`, `tags`, codec entry points) at the root.
-- `src/bin/` — 30 CLIs (feature `cli`; DIMSE tools also require
+- `src/bin/` — 32 CLIs (feature `cli`; DIMSE tools also require
   `net`, DICOMweb tools `web`): `echoscu`, `echoscp`, `storescu`,
   `storescp`, `findscu`, `findscp`, `movescu`, `getscu`, `mwlscp`,
-  `mppsscu`, `stgcmtscu`, `qidors`, `wadors`, `stowrs`, `wadorsd`,
+  `mppsscu`, `mppsscp`, `stgcmtscu`, `stgcmtscp`, `qidors`, `wadors`,
+  `stowrs`, `wadorsd`,
   `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`,
   `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`,
   `dcmdir`, `deidentify`, `auditsend` (`common.rs` holds shared DIMSE

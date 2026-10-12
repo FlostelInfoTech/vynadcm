@@ -548,6 +548,7 @@ mod tests {
         let h2 = handlers.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
             let acc = AcceptorOptions {
                 association: short_opts(),
                 ..Default::default()
@@ -606,7 +607,8 @@ mod tests {
             .unwrap();
         assert_eq!(s, status::SUCCESS);
         assert_eq!(matches.len(), 2);
-        // Cancelable FIND stopping after the first match.
+        // Cancelable FIND stopping after the first match: the SCP
+        // honors C-CANCEL mid-stream, so the final status is CANCEL.
         let mut seen = 0;
         let s = assoc
             .find_cancelable(
@@ -620,9 +622,216 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!((seen, s), (1, status::SUCCESS));
+        assert_eq!((seen, s), (1, status::CANCEL));
         assoc.release().await.unwrap();
         assert_eq!(handlers.stored.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn loopback_find_cancel_truncates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let matches: Vec<DataSet> = (0..30).map(|i| test_ds(&format!("1.2.3.{i}"))).collect();
+        let handlers = ArcTestScp::new(TestScp {
+            stored: Mutex::new(vec![]),
+            find_matches: matches,
+            move_instances: vec![],
+        });
+        let h2 = handlers.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let acc = AcceptorOptions {
+                association: short_opts(),
+                ..Default::default()
+            };
+            accept(stream, &acc, &*h2, &ScpOptions::default())
+                .await
+                .unwrap();
+        });
+
+        let mut assoc = Association::request(
+            &short_opts(),
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            &addr.to_string(),
+            propose(
+                &[
+                    vyna_dcm_core::sop_class::VERIFICATION,
+                    vyna_dcm_core::sop_class::STUDY_ROOT_FIND,
+                ],
+                &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
+            ),
+        )
+        .await
+        .unwrap();
+
+        // Cancel after the 5th match: the drain discards in-flight
+        // pendings without counting, so `seen` is exactly 5 and the
+        // server stops early with CANCEL instead of running to 30.
+        let mut seen = 0;
+        let s = assoc
+            .find_cancelable(
+                vyna_dcm_core::sop_class::STUDY_ROOT_FIND,
+                &DataSet::new(),
+                priority::MEDIUM,
+                |_| {
+                    seen += 1;
+                    seen < 5
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!((seen, s), (5, status::CANCEL));
+        // The association stays in sync after a cancelled FIND.
+        assert_eq!(
+            assoc
+                .echo(vyna_dcm_core::sop_class::VERIFICATION)
+                .await
+                .unwrap(),
+            status::SUCCESS
+        );
+        assoc.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_mpps_create_set() {
+        use crate::worklist::{MppsData, MppsScp};
+        let dir = std::env::temp_dir().join(format!("mpps-loopback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handlers = Arc::new(MppsScp::new(dir.clone()));
+        let h2 = handlers.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let acc = AcceptorOptions {
+                association: short_opts(),
+                ..Default::default()
+            };
+            accept(stream, &acc, &*h2, &ScpOptions::default())
+                .await
+                .unwrap();
+        });
+
+        let sop = vyna_dcm_core::sop_class::MODALITY_PERFORMED_PROCEDURE_STEP;
+        let mut assoc = Association::request(
+            &short_opts(),
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            &addr.to_string(),
+            propose(
+                &[sop],
+                &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
+            ),
+        )
+        .await
+        .unwrap();
+
+        let create = MppsData {
+            performed_procedure_step_id: "PPS1".into(),
+            performed_station_ae: "SCU".into(),
+            modality: "ECG".into(),
+            start_date: "20261012".into(),
+            start_time: "120000".into(),
+            status: "IN PROGRESS".into(),
+            ..MppsData::default()
+        }
+        .to_create_dataset();
+        let (cs, _) = assoc.n_create(sop, "1.2.3.1", Some(&create)).await.unwrap();
+        assert_eq!(cs, status::SUCCESS);
+        // Duplicate N-CREATE fails; the step survives.
+        let (dup, _) = assoc.n_create(sop, "1.2.3.1", Some(&create)).await.unwrap();
+        assert_eq!(dup, status::DUPLICATE_SOP_INSTANCE);
+        let set = MppsData {
+            status: "COMPLETED".into(),
+            end_date: Some("20261012".into()),
+            ..MppsData::default()
+        }
+        .to_set_dataset();
+        let (ss, _) = assoc.n_set(sop, "1.2.3.1", &set).await.unwrap();
+        assert_eq!(ss, status::SUCCESS);
+        // Unknown step and post-final updates fail.
+        let (ns, _) = assoc.n_set(sop, "9.9.9", &set).await.unwrap();
+        assert_eq!(ns, status::NO_SUCH_SOP_INSTANCE);
+        let (fin, _) = assoc.n_set(sop, "1.2.3.1", &set).await.unwrap();
+        assert_eq!(fin, status::PROCESSING_FAILURE);
+        assoc.release().await.unwrap();
+
+        let stored = handlers.get("1.2.3.1").unwrap();
+        assert_eq!(
+            stored.string(tags::PERFORMED_PROCEDURE_STEP_STATUS),
+            Some("COMPLETED")
+        );
+        assert_eq!(
+            stored.string(tags::PERFORMED_PROCEDURE_STEP_ID),
+            Some("PPS1")
+        );
+        assert!(dir.join("1.2.3.1.dcm").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_storage_commit_push() {
+        use crate::qrdb::StgCommitScp;
+        // Two files on disk; only one gets requested + one ghost.
+        let dir = std::env::temp_dir().join(format!("stgcommit-loopback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ct = vyna_dcm_core::sop_class::CT_IMAGE;
+        for inst in ["1.2.3.1", "1.2.3.2"] {
+            let meta = vyna_dcm_codec::FileMeta::new(
+                ct,
+                inst,
+                vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian,
+            );
+            let bytes = vyna_dcm_codec::write_part10(&meta, &test_ds(inst)).unwrap();
+            std::fs::write(dir.join(format!("{inst}.dcm")), bytes).unwrap();
+        }
+        let index = crate::qrdb::QrIndex::scan(&dir).unwrap();
+        assert_eq!(index.records().len(), 2);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handlers = Arc::new(StgCommitScp::new(index));
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let acc = AcceptorOptions {
+                association: short_opts(),
+                ..Default::default()
+            };
+            accept(stream, &acc, &*handlers, &ScpOptions::default())
+                .await
+                .unwrap();
+        });
+
+        let sop = vyna_dcm_core::sop_class::STORAGE_COMMITMENT_PUSH;
+        let mut assoc = Association::request(
+            &short_opts(),
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            &addr.to_string(),
+            propose(
+                &[sop],
+                &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
+            ),
+        )
+        .await
+        .unwrap();
+
+        let (req, txn) =
+            crate::worklist::storage_commitment_request(&[(ct, "1.2.3.1"), (ct, "9.9.9")]);
+        let (s, res) = assoc.storage_commit(sop, "1.9.1", &req).await.unwrap();
+        assert_eq!(s, status::SUCCESS);
+        let (got_txn, succ, failed) = res.unwrap();
+        assert_eq!(got_txn.as_deref(), Some(txn.as_str()));
+        assert_eq!(succ, vec![(ct.to_string(), "1.2.3.1".to_string())]);
+        assert_eq!(failed, vec![(ct.to_string(), "9.9.9".to_string())]);
+        assoc.release().await.unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]
@@ -638,6 +847,7 @@ mod tests {
         let d2 = dest_handlers.clone();
         tokio::spawn(async move {
             let (stream, _) = dest_listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
             let acc = AcceptorOptions {
                 association: short_opts(),
                 ..Default::default()
@@ -670,6 +880,7 @@ mod tests {
         let h2 = handlers.clone();
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
             let acc = AcceptorOptions {
                 association: short_opts(),
                 ..Default::default()
