@@ -70,11 +70,15 @@ Part-10 round-trips green, 125/125 tests, clippy clean. Out of
 scope (documented): sequence items, value-type gating, value
 formats, overlays.
 
-### P0.4 Encapsulated PDF helpers (`pdf2dcm` / `dcm2pdf`-like)
+### P0.4 Encapsulated PDF helpers (`pdf2dcm` / `dcm2pdf`-like) — DONE
 
-ECG reports are standardly encapsulated PDFs. Provide SOP-instance
-builders and extractors for Encapsulated PDF storage. Acceptance:
-round-trip a PDF through a C-STORE-able instance.
+Shipped `vyna-dcm-pdf` (`pdf_to_dataset` + `ExtractedPdf` via
+`pdf_from_dataset`): real Type 1s, always-present Type 2s, recorded
+document length for exact padding removal, UTF-8 charset only when
+needed — plus the `pdf2dcm` (IOD self-check) and `dcm2pdf` CLIs.
+Accepted: built instances validate clean in all native syntaxes,
+odd-length PDFs round-trip byte-exactly, 137/137 tests, clippy
+clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
 
 ## 4. Priority 1: interface-engine depth
 

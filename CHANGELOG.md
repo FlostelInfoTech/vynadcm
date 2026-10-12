@@ -25,6 +25,12 @@ the workspace crate version (`Cargo.toml`).
   `dcmvalidate` CLI (exit 0/1/2); 125 tests green.
 - `TransferSyntax::is_lossy`, dictionary multi-VR alternates
   (`DictEntry.alts`), and 11 new SOP Class UID constants.
+- New `vyna-dcm-pdf` crate: Encapsulated PDF SOP-instance builder
+  (`pdf_to_dataset` with generated UIDs, always-present Type 2s,
+  recorded document length, UTF-8 charset when needed) and
+  extractor (`pdf_from_dataset` → byte-exact `ExtractedPdf`),
+  plus the `pdf2dcm` (with IOD self-check) and `dcm2pdf` CLIs;
+  137 tests green.
 
 ## [0.1.0] — 2026-10-11
 

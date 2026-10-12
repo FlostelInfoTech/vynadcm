@@ -6,6 +6,8 @@ Dependency direction (each layer only depends on layers below it):
 vyna-dcm (facade: re-exports + bins + examples)
 ├── vyna-dcm-ecg ──┐
 ├── vyna-dcm-web ──┤
+├── vyna-dcm-iod ──┤
+├── vyna-dcm-pdf ──┤
 └── vyna-dcm-net ──┴──> vyna-dcm-codec ──> vyna-dcm-core
 ```
 
@@ -122,15 +124,21 @@ The physics convention follows PS3.3 C.10.9:
 - `lib.rs` — `validate(ds, sop_uid, ts)`: Type 1/2 presence, VR/VM
   checks, 7 conditional rules; `Finding`/`Report` in tag order.
 
+## vyna-dcm-pdf — Encapsulated PDF mapping
+
+- `document.rs` — `PdfInstanceMeta` (identity + document defaults),
+  `pdf_to_dataset` (validatable SOP instance), `pdf_from_dataset`
+  (`ExtractedPdf`: byte-exact bytes + metadata), `file_meta_for_dataset`.
+
 ## vyna-dcm — facade, tools, examples
 
-- `lib.rs` — re-exports `core`/`codec`/`iod` always; `net`/`web`/`ecg`
-  behind same-named features; common types (`DataSet`, `Tag`, `Vr`,
-  `tags`, codec entry points) at the root.
-- `src/bin/` — 9 CLIs (feature `cli`; network tools also require `net`):
+- `lib.rs` — re-exports `core`/`codec`/`iod`/`pdf` always;
+  `net`/`web`/`ecg` behind same-named features; common types
+  (`DataSet`, `Tag`, `Vr`, `tags`, codec entry points) at the root.
+- `src/bin/` — 11 CLIs (feature `cli`; network tools also require `net`):
   `echoscu`, `echoscp`, `storescu`, `storescp`, `findscu`, `dcmdump`,
-  `dcm2json`, `json2dcm`, `dcmvalidate` (`common.rs` holds shared arg
-  parsing).
+  `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`
+  (`common.rs` holds shared arg parsing).
 - `examples/` — `ecg_write` (VynaECG pattern), `wado_fetch` (DICOMweb
   client), `link_route` (VynaLink store-and-forward chain: C-STORE in,
   routes to a downstream SCP).
@@ -151,7 +159,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Test layout
 
-117 unit tests live next to the code (`#[cfg(test)]` modules) plus 2 integration tests (`tests/`), 6 doc tests
+128 unit tests live next to the code (`#[cfg(test)]` modules) plus 2 integration tests (`tests/`), 7 doc tests
 on the crate roots. Network tests bind `127.0.0.1:0` (ephemeral ports)
 with in-process SCP peers — no fixed ports, no external services.
 Feature-gated tests (`tls`, `server`) compile out with their features.

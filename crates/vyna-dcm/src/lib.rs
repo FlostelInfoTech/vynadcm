@@ -7,6 +7,8 @@
 //! - [`net`] — DIMSE, associations, SCU/SCP services, TLS (feature `net`)
 //! - [`web`] — DICOMweb QIDO/WADO/STOW client + server (feature `web`)
 //! - [`ecg`] — ECG waveform model for VynaECG (feature `ecg`)
+//! - [`iod`] — IOD conformance validation
+//! - [`pdf`] — Encapsulated PDF builders and extractors
 //!
 //! Common types are re-exported at the root for convenience.
 
@@ -19,6 +21,7 @@ pub use vyna_dcm_ecg as ecg;
 pub use vyna_dcm_iod as iod;
 #[cfg(feature = "net")]
 pub use vyna_dcm_net as net;
+pub use vyna_dcm_pdf as pdf;
 #[cfg(feature = "web")]
 pub use vyna_dcm_web as web;
 
@@ -33,3 +36,4 @@ pub use vyna_dcm_core::{
     DataElement, DataSet, PersonName, Tag, TransferSyntax, Value, Vr, lookup_keyword, new_uid, tags,
 };
 pub use vyna_dcm_iod::{Finding, Iod, Report, Severity, find_iod, validate};
+pub use vyna_dcm_pdf::{ExtractedPdf, PdfInstanceMeta, pdf_from_dataset, pdf_to_dataset};

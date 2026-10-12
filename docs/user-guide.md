@@ -22,7 +22,7 @@ library should read `docs/integration.md`.
 - [3. Connectivity: echoscu / echoscp](#3-connectivity-echoscu--echoscp)
 - [4. Storage: storescu / storescp](#4-storage-storescu--storescp)
 - [5. Query: findscu](#5-query-findscu)
-- [6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate](#6-files-dcmdump-dcm2json-json2dcm-dcmvalidate)
+- [6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate, pdf2dcm, dcm2pdf](#6-files-dcmdump-dcm2json-json2dcm-dcmvalidate-pdf2dcm-dcm2pdf)
 - [7. TLS walkthrough](#7-tls-walkthrough)
 - [8. Worked examples](#8-worked-examples)
 - [9. Troubleshooting](#9-troubleshooting)
@@ -117,7 +117,7 @@ findscu --connect 127.0.0.1:11112 --model mwl \
   requests a return key.
 - `--json` prints matches as DICOM JSON; otherwise a text dump.
 
-## 6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate
+## 6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate, pdf2dcm, dcm2pdf
 
 ```sh
 dcmdump file.dcm                        # text dump to stdout
@@ -127,6 +127,8 @@ json2dcm --output roundtrip.dcm file.json  # JSON → Part-10 (explicit LE)
 json2dcm --output implicit.dcm --transfer-syntax 1.2.840.10008.1.2 file.json
 dcmvalidate file.dcm                    # IOD conformance check
 dcmvalidate --sop-class 1.2.840.10008.5.1.4.1.1.2 file.dcm  # override SOP Class
+pdf2dcm report.pdf report.dcm --patient-name "Doe^Jane" --patient-id P123
+dcm2pdf report.dcm report.out.pdf       # extract (byte-exact)
 ```
 
 `dcmvalidate` checks 18 SOP Classes (CR/CT/MR/MG/DX/US/SC/PT/NM/XA/
@@ -135,6 +137,14 @@ conditional rules (multi-frame, color, lossy syntax, charset); it
 also verifies file-meta SOP UIDs match the dataset. Exit 0 means
 no errors (warnings allowed), 1 means errors, 2 means the SOP
 Class is not supported.
+
+`pdf2dcm` wraps a PDF (e.g. an ECG report) in an Encapsulated PDF
+instance: Study/Series/SOP UIDs are generated unless `--study-uid` /
+`--series-uid` / `--sop-uid` are given, `--title` defaults to the
+input file name, and `--transfer-syntax explicit|implicit|deflated`
+(default `explicit`) picks the dataset encoding. The instance is
+validated against its IOD before writing, so a zero exit means the
+file is C-STORE-able; `dcm2pdf` extracts the bytes back exactly.
 
 Note: JSON round-trips normalize `DS` float formatting (`500` →
 `500.0`); values stay numerically identical.

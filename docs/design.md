@@ -29,7 +29,7 @@ spec adds component contracts, algorithms, sequences, and invariants.
 
 ## 1. Design principles
 
-1. **Layered, acyclic**: `core ← codec ← {net, web, ecg} ← facade`.
+1. **Layered, acyclic**: `core ← codec ← {net, web, ecg, iod, pdf} ← facade`.
    A lower layer never names an upper one; each crate builds standalone.
 2. **Parse, don't validate**: wire bytes become typed values
    (`Tag`, `Vr`, `Command`, PDU structs) at the boundary; downstream
@@ -38,8 +38,8 @@ spec adds component contracts, algorithms, sequences, and invariants.
    `#[cfg(test)]` suites assert `Err` (not panic) on truncated,
    over-long, and contradictory input.
 4. **Explicit async**: only `net`/`web` are async (tokio); `core`,
-   `codec`, `ecg` are sync and runtime-free so VynaECG can call them
-   from any executor.
+   `codec`, `ecg`, `iod`, `pdf` are sync and runtime-free so VynaECG
+   can call them from any executor.
 5. **One TLS stack**: rustls 0.23 + `ring` everywhere; reqwest 0.13
    runs provider-less and shares the same install (see §7).
 
@@ -155,6 +155,20 @@ spec adds component contracts, algorithms, sequences, and invariants.
   range check for countable values; findings in tag order.
 - `dcmvalidate` bin adds file-meta SOP UID consistency and exit
   codes (0 clean, 1 errors, 2 unsupported SOP Class).
+
+### 2.7 `vyna-dcm-pdf` — Encapsulated PDF mapping
+
+- `PdfInstanceMeta` (patient/study/series identity, document
+  title/concept, Modality/Conversion/Burned-In defaults `OT`/`WSD`/
+  `YES`); empty UIDs are generated via `new_uid`.
+- `pdf_to_dataset`: real Type 1s, every Type 2 present (empty when
+  unknown), exact length in (0042,0015), `ISO_IR 192` only when
+  text needs non-ASCII — output validates clean.
+- `pdf_from_dataset -> ExtractedPdf { bytes, mime_type, title,
+  sop_instance_uid }`: truncates via (0042,0015) when sane, joins
+  fragments, never guesses without a length.
+- `pdf2dcm` bin self-validates before writing (exit 0/1);
+  `dcm2pdf` bin extracts (exit 0/1).
 
 ## 3. Key algorithms
 

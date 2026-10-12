@@ -3,7 +3,7 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-10-11T15:50:11Z",
+    "timestamp": "2026-10-12T01:02:12Z",
     "tools": {
       "components": [
         {
@@ -3343,6 +3343,22 @@
       "version": "0.1.0",
       "scope": "required",
       "purl": "pkg:cargo/vyna-dcm-net@0.1.0",
+      "licenses": [
+        {
+          "license": {
+            "id": "Proprietary"
+          }
+        }
+      ],
+      "description": "VynaDCM workspace member (proprietary)"
+    },
+    {
+      "bom-ref": "pkg:cargo/vyna-dcm-pdf@0.1.0",
+      "type": "library",
+      "name": "vyna-dcm-pdf",
+      "version": "0.1.0",
+      "scope": "required",
+      "purl": "pkg:cargo/vyna-dcm-pdf@0.1.0",
       "licenses": [
         {
           "license": {
