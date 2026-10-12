@@ -202,6 +202,10 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **FR-WEB-03 (M)** Server core: route QIDO/WADO/STOW against any
   `DicomWebStore` implementation; ship an in-memory store; expose a
   hyper HTTP/1.1 front end (feature `server`).
+- **FR-WEB-04 (M)** CLIs: `qidors` (search with `-k` keys, limit/offset,
+  text or JSON output), `wadors` (instance/metadata/frames/bulkdata
+  retrieve), `stowrs` (multipart store), `wadorsd` (stub server over
+  a directory; STOW lands in memory).
 
 ### 3.5 ECG mapping (`vyna-dcm-ecg`)
 
@@ -273,7 +277,9 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   `findscp` (QR FIND/MOVE/GET from a directory, `--route` AE table),
   `mwlscp` (worklist FIND from a directory), `mppsscu`
   (MPPS N-CREATE + N-SET), `stgcmtscu`
-  (Storage Commitment N-ACTION + report wait), `auditsend` (one
+  (Storage Commitment N-ACTION + report wait), `qidors`, `wadors`,
+  `stowrs` (DICOMweb client tools, `--bearer`/`--basic` auth),
+  `wadorsd` (stub server over a directory), `auditsend` (one
   ATNA message per invocation), each with AE titles, PDU/timeout
   tuning, and TLS options; `storescp`/`storescu`/`findscu` also
   take `--audit-server` for wired emission.
@@ -386,8 +392,9 @@ ATNA audit-trail emission.
 | FR-NET-08 | `tls_loopback_echo`, `rejects_empty_chain_and_key` |
 | FR-NET-09…10 | `wildcard_and_range_match`, `pn_matches_leading_components`, `level_grouping_dedupes`, `responses_echo_requested_keys_only`, `sequence_keys_match_nested`, loopback `find_study_level_groups`, `find_missing_level_fails`, `move_delivers_to_destination`, `get_serves_over_same_association`, `mwl_matches_station`, CLI `findscp`/`mwlscp` smoke runs |
 | FR-WEB-01…03 | `end_to_end_client_against_hyper`, `wado_uri_against_stub`, `wado_uri_*` param tests, dispatch/multipart tests |
+| FR-WEB-04 | `qido_finds_seeded_instance`, `wado_round_trips_file_metadata_frames`, `stow_lands_and_qido_sees_it`, wadors `frames_parse`, CLI smoke runs against `wadorsd` |
 | FR-ECG-01…03 | `vyna-dcm-ecg` tests (7); `ecg_write` example |
-| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `findscp`, `mwlscp`, `movescu`, `getscu`, `mppsscu`, `stgcmtscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`, `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
+| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `findscp`, `mwlscp`, `movescu`, `getscu`, `mppsscu`, `stgcmtscu`, `qidors`, `wadors`, `stowrs`, `wadorsd`, `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`, `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
 | FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
 | FR-DEID-01…03 | `every_action_fires`, `shift_keeps_longitudinal_intervals`, `datetimes_shift_or_dummy_by_vr`, `burned_in_annotation_refuses_before_mutation`, `uid_maps_stay_consistent_across_datasets`, `shifts_cross_month_year_and_leap_day`, profile self-checks, CLI `output_plans_*` + `process_file_round_trip`, `deidentified_ecg_validates_with_identical_samples` |

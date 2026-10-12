@@ -58,6 +58,26 @@ path = "src/bin/findscu.rs"
 required-features = ["cli", "net"]
 
 [[bin]]
+name = "qidors"
+path = "src/bin/qidors.rs"
+required-features = ["cli", "web"]
+
+[[bin]]
+name = "wadors"
+path = "src/bin/wadors.rs"
+required-features = ["cli", "web"]
+
+[[bin]]
+name = "stowrs"
+path = "src/bin/stowrs.rs"
+required-features = ["cli", "web"]
+
+[[bin]]
+name = "wadorsd"
+path = "src/bin/wadorsd.rs"
+required-features = ["cli", "web"]
+
+[[bin]]
 name = "findscp"
 path = "src/bin/findscp.rs"
 required-features = ["cli", "net"]

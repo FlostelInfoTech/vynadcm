@@ -172,6 +172,28 @@ stgcmtscu --connect 127.0.0.1:11112 --file received.dcm --timeout-secs 60
   `--instance CLASS_UID:INSTANCE_UID`; `--timeout-secs` bounds the
   report wait, and any failed instance exits nonzero.
 
+### DICOMweb: qidors / wadors / stowrs / wadorsd
+
+```sh
+# Stub server over a directory (STOW lands in memory)
+wadorsd --bind 127.0.0.1:8080 --dir ./store
+
+# Search studies/series/instances
+qidors --url http://127.0.0.1:8080 -k StudyDate=20240101- -k Modality=
+qidors --url http://127.0.0.1:8080 --series 1.2.3 -k Modality=CT
+
+# Retrieve instance / metadata / frames
+wadors --url http://127.0.0.1:8080 1.2.3 --series 1.2.3.1 --instance 1.2.3.1.1 -o inst.dcm
+wadors --url http://127.0.0.1:8080 1.2.3 --series 1.2.3.1 --instance 1.2.3.1.1 --metadata
+wadors --url http://127.0.0.1:8080 1.2.3 --series 1.2.3.1 --instance 1.2.3.1.1 --frames 1,2 -o fr.bin
+
+# Store files
+stowrs --url http://127.0.0.1:8080 a.dcm b.dcm
+```
+
+- Client tools take `--bearer TOKEN` or `--basic user:pass`.
+- `--frames` writes one file as given, or `STEM_N.EXT` per frame.
+
 ## 6. Files: dcmdump, dcm2json, json2dcm, dcm2xml, xml2dcm, dcm2img, img2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify
 
 ```sh

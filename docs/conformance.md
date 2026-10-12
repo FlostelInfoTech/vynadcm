@@ -189,6 +189,8 @@ authentication unless the embedding application installs the
   WADO-URI (`wado_uri`, `wado_uri_dataset`), STOW-RS store (`stow`).
 - Server (default `server` feature): framework-agnostic dispatch
   over an in-memory store, with a hyper front end.
+- CLIs: `qidors` (search), `wadors` (retrieve), `stowrs` (store),
+  `wadorsd` (stub server over a directory).
 
 ### 4.3 Media (DICOMDIR)
 

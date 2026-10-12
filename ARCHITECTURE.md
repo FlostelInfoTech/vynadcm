@@ -168,12 +168,14 @@ The physics convention follows PS3.3 C.10.9:
 - `lib.rs` — re-exports `core`/`codec`/`iod`/`pdf`/`deid`/`atna` always;
   `net`/`web`/`ecg` behind same-named features; common types
   (`DataSet`, `Tag`, `Vr`, `tags`, codec entry points) at the root.
-- `src/bin/` — 20 CLIs (feature `cli`; network tools also require `net`):
-  `echoscu`, `echoscp`, `storescu`, `storescp`, `findscu`, `movescu`,
-  `getscu`, `mppsscu`, `stgcmtscu`, `dcmdump`,
-  `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`,
-  `dcm2dcm`, `dcmdir`, `deidentify`, `auditsend` (`common.rs` holds
-  shared arg parsing, incl. `AuditArgs`).
+- `src/bin/` — 30 CLIs (feature `cli`; DIMSE tools also require
+  `net`, DICOMweb tools `web`): `echoscu`, `echoscp`, `storescu`,
+  `storescp`, `findscu`, `findscp`, `movescu`, `getscu`, `mwlscp`,
+  `mppsscu`, `stgcmtscu`, `qidors`, `wadors`, `stowrs`, `wadorsd`,
+  `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`,
+  `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`,
+  `dcmdir`, `deidentify`, `auditsend` (`common.rs` holds shared DIMSE
+  arg parsing incl. `AuditArgs`; `webcommon.rs` the DICOMweb side).
 - `examples/` — `ecg_write` (VynaECG pattern), `wado_fetch` (DICOMweb
   client), `link_route` (VynaLink store-and-forward chain: C-STORE in,
   routes to a downstream SCP).

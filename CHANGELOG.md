@@ -107,6 +107,10 @@ the workspace crate version (`Cargo.toml`).
   instance's transfer syntax so `getscu` transcodes encapsulated
   arrivals to native, and default C-GET storage proposals cover the
   enhanced/common image classes; 267 tests green.
+- DICOMweb CLIs: `qidors` (search, `-k` keys, limit/offset, text/JSON),
+  `wadors` (instance/metadata/frames/bulkdata retrieve), `stowrs`
+  (multipart store), `wadorsd` (stub server over a directory);
+  client↔server loopback tests over real HTTP; 271 tests green.
 
 ## [0.1.0] — 2026-10-11
 
