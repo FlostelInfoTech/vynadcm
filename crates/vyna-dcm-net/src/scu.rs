@@ -10,6 +10,7 @@ use crate::{
     Error, Result,
     association::{Association, DimseEvent},
     dimse::{Command, DimseMessage, command_field as CF, status},
+    worklist::{CommitmentResult, parse_commitment_result},
 };
 
 /// C-MOVE / C-GET final outcome with sub-operation counts.
@@ -374,6 +375,51 @@ impl Association {
         Ok(msg.command.status.unwrap_or(status::PROCESSING_FAILURE))
     }
 
+    /// Storage Commitment: N-ACTION request (action type 1), then wait for
+    /// the N-EVENT-REPORT on this same association.
+    ///
+    /// The report is acknowledged with SUCCESS automatically and parsed.
+    /// Returns the N-ACTION status plus the report, or `None` when the
+    /// N-ACTION itself failed (no report follows a failed request). The
+    /// association read timeout bounds the wait.
+    pub async fn storage_commit(
+        &mut self,
+        sop_class_uid: &str,
+        request_instance_uid: &str,
+        dataset: &DataSet,
+    ) -> Result<(u16, Option<CommitmentResult>)> {
+        let (action_status, _) = self
+            .n_action(sop_class_uid, request_instance_uid, 1, Some(dataset))
+            .await?;
+        if !status::is_success(action_status) {
+            return Ok((action_status, None));
+        }
+        match self.recv().await? {
+            DimseEvent::Released => Err(Error::Released),
+            DimseEvent::Message(m) if m.command.field == CF::N_EVENT_REPORT_RQ => {
+                if m.command.event_type_id != Some(1) {
+                    return Err(Error::BadCommand(format!(
+                        "unexpected storage commitment event type {:?}, want 1",
+                        m.command.event_type_id
+                    )));
+                }
+                let report_id = m.command.message_id.unwrap_or(0);
+                let result = m.dataset.as_ref().map(parse_commitment_result).unwrap_or((
+                    None,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+                let rsp = Command::n_event_report_rsp(report_id, status::SUCCESS);
+                self.send(m.context_id, &rsp, None).await?;
+                Ok((action_status, Some(result)))
+            }
+            DimseEvent::Message(m) => Err(Error::UnexpectedPdu {
+                expected: "N-EVENT-REPORT-RQ",
+                got: m.command.name().to_string(),
+            }),
+        }
+    }
+
     // -- internals ---------------------------------------------------------
 
     async fn expect_message(&mut self, field: u16, id: u16) -> Result<DimseMessage> {
@@ -694,4 +740,143 @@ mod tests {
 
     /// `Arc<TestScp>` derefs to `TestScp: Handlers`.
     type ArcTestScp = Arc<TestScp>;
+
+    /// DIMSE-level loopback pair (no A-ASSOCIATE): client + scripted server.
+    fn dimse_pair() -> (Association, Association) {
+        let opts = short_opts();
+        let (a, b) = tokio::io::duplex(65536);
+        let ctx = || crate::association::NegotiatedContext {
+            id: 1,
+            abstract_syntax: vyna_dcm_core::sop_class::STORAGE_COMMITMENT_PUSH.to_string(),
+            transfer_syntax: vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian,
+            transfer_syntax_uid: vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian
+                .uid()
+                .to_string(),
+        };
+        let info_a = crate::association::AssociationInfo {
+            local_ae: AeTitle::new("SCU").unwrap(),
+            peer_ae: AeTitle::new("SCP").unwrap(),
+            peer_max_pdu: 0,
+        };
+        let info_b = crate::association::AssociationInfo {
+            local_ae: AeTitle::new("SCP").unwrap(),
+            peer_ae: AeTitle::new("SCU").unwrap(),
+            peer_max_pdu: 0,
+        };
+        (
+            Association::from_accepted(Box::new(a), info_a, vec![ctx()], &opts),
+            Association::from_accepted(Box::new(b), info_b, vec![ctx()], &opts),
+        )
+    }
+
+    async fn recv_message(assoc: &mut Association) -> DimseMessage {
+        match assoc.recv().await.unwrap() {
+            DimseEvent::Message(m) => *m,
+            DimseEvent::Released => panic!("peer released"),
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_storage_commit() {
+        let (mut scu, mut scp) = dimse_pair();
+        let server = tokio::spawn(async move {
+            let rq = recv_message(&mut scp).await;
+            assert_eq!(rq.command.field, CF::N_ACTION_RQ);
+            let rq_id = rq.command.message_id.unwrap_or(0);
+            scp.send(
+                rq.context_id,
+                &Command::n_action_rsp(rq_id, status::SUCCESS),
+                None,
+            )
+            .await
+            .unwrap();
+            // Commitment report: one success, one failure.
+            let mut ok = DataSet::new();
+            ok.put_uid(
+                tags::REFERENCED_SOP_CLASS_UID,
+                vyna_dcm_core::sop_class::CT_IMAGE,
+            );
+            ok.put_uid(tags::REFERENCED_SOP_INSTANCE_UID, "1.2.3.1");
+            let mut ng = DataSet::new();
+            ng.put_uid(
+                tags::REFERENCED_SOP_CLASS_UID,
+                vyna_dcm_core::sop_class::MR_IMAGE,
+            );
+            ng.put_uid(tags::REFERENCED_SOP_INSTANCE_UID, "1.2.3.2");
+            let mut report = DataSet::new();
+            report.put_uid(tags::TRANSACTION_UID, "1.9.9");
+            report.put_sequence(tags::REFERENCED_SOP_SEQUENCE, vec![ok]);
+            report.put_sequence(tags::FAILED_SOP_SEQUENCE, vec![ng]);
+            let ev = Command::n_event_report_rq(
+                7,
+                vyna_dcm_core::sop_class::STORAGE_COMMITMENT_PUSH,
+                "1.9.1",
+                1,
+                true,
+            );
+            scp.send(1, &ev, Some(&report)).await.unwrap();
+            // SCU must acknowledge the report.
+            let ack = recv_message(&mut scp).await;
+            assert_eq!(ack.command.field, CF::N_EVENT_REPORT_RSP);
+            assert_eq!(ack.command.status, Some(status::SUCCESS));
+        });
+
+        let (req, _txn) = crate::worklist::storage_commitment_request(&[
+            (vyna_dcm_core::sop_class::CT_IMAGE, "1.2.3.1"),
+            (vyna_dcm_core::sop_class::MR_IMAGE, "1.2.3.2"),
+        ]);
+        let (s, res) = scu
+            .storage_commit(
+                vyna_dcm_core::sop_class::STORAGE_COMMITMENT_PUSH,
+                "1.9.1",
+                &req,
+            )
+            .await
+            .unwrap();
+        assert_eq!(s, status::SUCCESS);
+        let (txn, succ, failed) = res.unwrap();
+        assert_eq!(txn.as_deref(), Some("1.9.9"));
+        assert_eq!(
+            succ,
+            vec![(
+                vyna_dcm_core::sop_class::CT_IMAGE.to_string(),
+                "1.2.3.1".to_string()
+            )]
+        );
+        assert_eq!(failed.len(), 1);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_commit_skips_wait_on_action_failure() {
+        let (mut scu, mut scp) = dimse_pair();
+        let server = tokio::spawn(async move {
+            let rq = recv_message(&mut scp).await;
+            assert_eq!(rq.command.field, CF::N_ACTION_RQ);
+            let rq_id = rq.command.message_id.unwrap_or(0);
+            scp.send(
+                rq.context_id,
+                &Command::n_action_rsp(rq_id, status::PROCESSING_FAILURE),
+                None,
+            )
+            .await
+            .unwrap();
+            // No report follows; SCU must not wait for one.
+        });
+
+        let (req, _txn) = crate::worklist::storage_commitment_request(&[(
+            vyna_dcm_core::sop_class::CT_IMAGE,
+            "1.2.3.1",
+        )]);
+        let (s, res) = scu
+            .storage_commit(
+                vyna_dcm_core::sop_class::STORAGE_COMMITMENT_PUSH,
+                "1.9.1",
+                &req,
+            )
+            .await
+            .unwrap();
+        assert_eq!((s, res.is_none()), (status::PROCESSING_FAILURE, true));
+        server.await.unwrap();
+    }
 }

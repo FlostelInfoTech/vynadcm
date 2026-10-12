@@ -104,10 +104,23 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   10 dicomdir tests, 171/171 tests, clippy clean. Out of scope
   (documented): `MRDR` following, pydicom cross-read (no
   independent reader available here).
-- **WADO-URI client**: retired but still widely deployed on legacy
-  PACS; complements the RS client.
+- **WADO-URI client** — DONE: shipped `WadoUriRequest` +
+  `wado_uri`/`wado_uri_dataset` (validated UIDs/ranges, verbatim
+  rendering knobs, `application/dicom` gate on the parsed form).
+  Accepted: param unit tests + stub-server e2e (DICOM parse,
+  rendered passthrough, 404 surfacing), 176/176 tests, clippy
+  clean. Out of scope (documented): WADO-URI server side.
 - **Missing SCU tools** (`movescu`, `getscu`, `mppsscu`,
-  `stgcmtscu`): the APIs exist; dcm4che ships all four tools.
+  `stgcmtscu`) — DONE: shipped all four (shared `-k` query builder
+  with `findscu`, generated UIDs/dates where sensible) plus the
+  `Association::storage_commit` request-with-report helper.
+  Accepted: 13 CLI unit tests + 2 loopback commitment tests, live
+  C-MOVE/C-GET/MPPS/commitment-request legs against a scripted peer
+  (0x0000; retrieved files are well-formed Part-10), 191/191 tests,
+  clippy clean. Out of scope (documented): N-EVENT-REPORT emission
+  through our SCP framework (no post-response hook exists, so the
+  report leg is verified by scripted loopback instead), and C-GET
+  Role Selection proposals against strict archives.
 - **DICOM Conformance Statement**: hospitals routinely require one
   for procurement; generate from implemented capabilities.
 

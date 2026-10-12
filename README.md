@@ -18,7 +18,7 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | `vyna-dcm-ecg` | 12-lead ECG model and Waveform Sequence mapping for VynaECG |
 | `vyna-dcm-iod` | IOD validation: Type 1/2/3 presence, VR/VM checks, 18 SOP Classes |
 | `vyna-dcm-pdf` | Encapsulated PDF SOP-instance builders and extractors |
-| `vyna-dcm` | Facade re-exporting the above, plus 14 CLI tools and 3 examples |
+| `vyna-dcm` | Facade re-exporting the above, plus 18 CLI tools and 3 examples |
 
 ## Documentation
 
@@ -39,7 +39,7 @@ Requires Rust 1.98+ (edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace        # 162 unit + 2 integration + 7 doc tests
+cargo test --workspace        # 167 unit + 2 integration + 7 doc tests
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
@@ -75,6 +75,10 @@ cargo run -p vyna-dcm --example link_route -- 127.0.0.1:11115 127.0.0.1:11114 PA
 | `echoscu` / `echoscp` | C-ECHO SCU / SCP |
 | `storescu` / `storescp` | C-STORE sender / receiver into a directory |
 | `findscu` | C-FIND query, prints matches |
+| `movescu` | C-MOVE retrieve to a destination AE |
+| `getscu` | C-GET retrieve into a directory |
+| `mppsscu` | MPPS N-CREATE + N-SET |
+| `stgcmtscu` | Storage Commitment request + report wait |
 | `dcmdump` | Part-10 file text dump |
 | `dcm2json` / `json2dcm` | Part-10 <-> DICOM JSON conversion |
 | `dcmvalidate` | IOD conformance check (exit 0 clean, 1 errors, 2 unsupported SOP) |

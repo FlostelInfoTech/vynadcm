@@ -27,7 +27,7 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(String),
 
-    /// Bad request path or parameters (server side).
+    /// Bad request path or parameters.
     #[error("bad request: {0}")]
     BadRequest(String),
 

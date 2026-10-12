@@ -263,6 +263,9 @@ Auth: `.with_bearer(token)` / `.with_basic(user, pass)` builders.
 HTTPS uses the OS certificate store; the shared ring provider is
 installed automatically. Frames: `wado_frames(uids, &[1, 2], accept)`;
 metadata: `wado_metadata(...)`; bulk: `wado_bulkdata(uri)`.
+Legacy PACS: `wado_uri(&WadoUriRequest::new(study, series, object))`
+for raw bytes, or `wado_uri_dataset(...)` parsed; set `content_type`,
+`transfer_syntax`, `anonymize`, and the rendering knobs as needed.
 
 ## 9. DICOMweb server
 

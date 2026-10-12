@@ -5,8 +5,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use vyna_dcm::TransferSyntax;
+use vyna_dcm::core::{Tag, lookup_keyword};
 use vyna_dcm::net::service::propose;
 use vyna_dcm::net::{AeTitle, Association, AssociationOptions};
+use vyna_dcm::{DataSet, Vr};
 
 /// Connection + association arguments shared by all SCU tools.
 #[derive(clap::Args, Debug)]
@@ -132,6 +134,75 @@ impl ConnArgs {
         let stream = connector.connect_to(&self.connect).await?;
         Ok(Association::request_over(&opts, &calling, &called, stream, proposed).await?)
     }
+}
+
+/// Parse a query-key name (keyword or `GGGGEEEE` tag) into a [`Tag`].
+pub fn parse_tag_key(name: &str) -> anyhowish::Result<Tag> {
+    if let Some(e) = lookup_keyword(name) {
+        return Ok(e.tag);
+    }
+    if let Some(e) = vyna_dcm::core::ENTRIES
+        .iter()
+        .find(|e| e.keyword.eq_ignore_ascii_case(name))
+    {
+        return Ok(e.tag);
+    }
+    let hex: String = name.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex.len() == 8 {
+        let g = u16::from_str_radix(&hex[0..4], 16).unwrap();
+        let e = u16::from_str_radix(&hex[4..8], 16).unwrap();
+        return Ok(Tag::new(g, e));
+    }
+    Err(anyhowish::Error::msg(format!("unknown query key {name:?}")))
+}
+
+/// Build a C-FIND/C-MOVE/C-GET identifier from `-k KEY=value` pairs.
+///
+/// Q/R models get a derived Query/Retrieve Level unless the caller sets
+/// one; MWL identifiers must not carry it.
+pub fn build_qr_query(keys: &[String], is_mwl: bool) -> anyhowish::Result<DataSet> {
+    let mut ds = DataSet::new();
+    for key in keys {
+        let (name, value) = key
+            .split_once('=')
+            .ok_or_else(|| format!("key {key:?} must be KEY=value"))?;
+        let tag = parse_tag_key(name)?;
+        // Look up the VR from the dictionary; default to LO for unknowns.
+        let vr = vyna_dcm::core::dictionary_vr(tag).unwrap_or(Vr::Lo);
+        if tag == vyna_dcm::tags::PATIENT_NAME {
+            ds.put_person_name(tag, vec![value.parse().map_err(|e| format!("{e:?}"))?]);
+        } else {
+            ds.put_text(tag, vr, value);
+        }
+    }
+    if !is_mwl && !ds.contains(vyna_dcm::tags::QUERY_RETRIEVE_LEVEL) {
+        use vyna_dcm::tags as t;
+        let level = if ds.contains(t::SOP_INSTANCE_UID) {
+            "IMAGE"
+        } else if ds.contains(t::SERIES_INSTANCE_UID) {
+            "SERIES"
+        } else if ds.contains(t::STUDY_INSTANCE_UID) {
+            "STUDY"
+        } else {
+            "PATIENT"
+        };
+        ds.put_text(t::QUERY_RETRIEVE_LEVEL, Vr::Cs, level);
+    }
+    Ok(ds)
+}
+
+/// Sanitize a SOP Instance UID into a safe file stem.
+#[must_use]
+pub fn safe_instance_filename(inst: &str) -> String {
+    inst.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 fn read_opt(path: &Option<PathBuf>) -> anyhowish::Result<Option<Vec<u8>>> {

@@ -99,7 +99,7 @@ filtered by `accepted_transfer_syntaxes` (default: all 16 understood).
 
 - `client.rs` — `DicomWebClient` (reqwest + rustls): QIDO-RS search
   (studies/series/instances), WADO-RS (file/dataset/metadata/frames/
-  bulkdata), STOW-RS.
+  bulkdata), STOW-RS, WADO-URI (raw/dataset).
 - `multipart.rs` — from-scratch `multipart/related` encoder/decoder.
 - `server.rs` — framework-agnostic core: `dispatch` routes QIDO/WADO/
   STOW requests against any `DicomWebStore`; `MemoryStore` provided.
@@ -139,8 +139,9 @@ The physics convention follows PS3.3 C.10.9:
 - `lib.rs` — re-exports `core`/`codec`/`iod`/`pdf` always;
   `net`/`web`/`ecg` behind same-named features; common types
   (`DataSet`, `Tag`, `Vr`, `tags`, codec entry points) at the root.
-- `src/bin/` — 14 CLIs (feature `cli`; network tools also require `net`):
-  `echoscu`, `echoscp`, `storescu`, `storescp`, `findscu`, `dcmdump`,
+- `src/bin/` — 18 CLIs (feature `cli`; network tools also require `net`):
+  `echoscu`, `echoscp`, `storescu`, `storescp`, `findscu`, `movescu`,
+  `getscu`, `mppsscu`, `stgcmtscu`, `dcmdump`,
   `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`,
   `dcm2dcm`, `dcmdir` (`common.rs` holds shared arg parsing).
 - `examples/` — `ecg_write` (VynaECG pattern), `wado_fetch` (DICOMweb
@@ -163,7 +164,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Test layout
 
-162 unit tests live next to the code (`#[cfg(test)]` modules, incl. CLI
+167 unit tests live next to the code (`#[cfg(test)]` modules, incl. CLI
 parsers) plus 2 integration tests (`tests/`), 7 doc tests
 on the crate roots. Network tests bind `127.0.0.1:0` (ephemeral ports)
 with in-process SCP peers — no fixed ports, no external services.

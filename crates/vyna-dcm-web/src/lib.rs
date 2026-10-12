@@ -1,6 +1,6 @@
 //! `vyna-dcm-web`: DICOMweb client and server (PS3.18 §8).
 //!
-//! - [`DicomWebClient`] — QIDO-RS, WADO-RS, STOW-RS client
+//! - [`DicomWebClient`] — QIDO-RS, WADO-RS, STOW-RS, WADO-URI client
 //! - [`server::dispatch`] — framework-agnostic server core over any
 //!   [`server::DicomWebStore`] (plus [`server::MemoryStore`])
 //! - [`hyper_server`] — hyper HTTP/1.1 front end (feature `server`)
@@ -27,5 +27,5 @@ pub mod hyper_server;
 pub mod multipart;
 pub mod server;
 
-pub use client::{Auth, DicomWebClient, StowResponse};
+pub use client::{Auth, DicomWebClient, StowResponse, WadoUriRequest};
 pub use error::{Error, Result};

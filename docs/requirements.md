@@ -9,8 +9,8 @@
 | Applies to | VynaDCM workspace v0.1.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
-implemented baseline (171 tests green, IOD validator + PDF helpers
-+ tag editor + transcoder + DICOMDIR applied).
+implemented baseline (176 tests green, IOD validator + PDF helpers
++ tag editor + transcoder + DICOMDIR + WADO-URI applied).
 
 ## Contents
 
@@ -150,7 +150,8 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   DIMSE, release/abort.
 - **FR-NET-03 (M)** SCU operations: C-ECHO, C-STORE, C-FIND
   (incl. cancelable), C-MOVE, C-GET (with C-STORE sub-operation
-  handler), and N-CREATE/SET/GET/ACTION/DELETE/EVENT-REPORT.
+  handler), N-CREATE/SET/GET/ACTION/DELETE/EVENT-REPORT, and
+  Storage Commitment request-with-report (`storage_commit`).
 - **FR-NET-04 (M)** SCP: accept associations, negotiate with gating on
   AE title (optional strict mode), transfer syntaxes, SOP classes,
   and an optional user-identity callback; dispatch each service to
@@ -172,7 +173,8 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 
 - **FR-WEB-01 (M)** Client: QIDO-RS search (studies/series/instances
   with query filters), WADO-RS (file/dataset/metadata/frames/bulkdata),
-  STOW-RS upload; Basic and Bearer auth.
+  STOW-RS upload, WADO-URI retrieve (raw or parsed dataset);
+  Basic and Bearer auth.
 - **FR-WEB-02 (M)** `multipart/related` encode/decode from scratch,
   tolerating boundary-like bytes inside bodies.
 - **FR-WEB-03 (M)** Server core: route QIDO/WADO/STOW against any
@@ -224,7 +226,10 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 
 - **FR-CLI-01 (M)** Network tools: `echoscu`, `echoscp`, `storescu`,
   `storescp`, `findscu` (incl. MWL model, `-k` keys, JSON output),
-  each with AE titles, PDU/timeout tuning, and TLS options.
+  `movescu` (C-MOVE to a `--dest` AE), `getscu` (C-GET into
+  `--output-dir`), `mppsscu` (MPPS N-CREATE + N-SET), `stgcmtscu`
+  (Storage Commitment N-ACTION + report wait), each with AE titles,
+  PDU/timeout tuning, and TLS options.
 - **FR-CLI-02 (M)** File tools: `dcmdump`, `dcm2json` (incl. file-meta
   option), `json2dcm` (incl. transfer-syntax selection),
   `dcmvalidate` (IOD check with SOP-Class override; exit 0/1/2),
@@ -254,7 +259,7 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **NFR-06 (M)** Determinism: encoders emit canonical output so
   dataset/Part-10/JSON round-trips are stable.
 - **NFR-07 (M)** Quality gates for every change: unit + doc tests
-  green (currently 162 + 2 + 7), `cargo clippy --workspace --all-targets`
+  green (currently 167 + 2 + 7), `cargo clippy --workspace --all-targets`
   with zero warnings, `cargo fmt --check` clean.
 - **NFR-08 (S)** Documentation: public API documented
   (`missing_docs` enforced); this SRS, the design spec, integration
@@ -280,12 +285,12 @@ ATNA audit-trail emission.
 | FR-CODEC-08 | `dump_contains_expected_lines` |
 | FR-CODEC-09 | `mono8_lossless_matrix_is_exact`, `mono16_and_bigendian_roundtrip_exact`, `rgb_*`, `ybr422_*`, `ybr_full_*`, `lossy_source_keeps_history_*`, `multiframe_*`, `bad_inputs_rejected`, `baseline_rgb_odd_sizes_roundtrip`, CLI `dcm2dcm` matrix runs |
 | FR-CODEC-10 | `roundtrip_tree` (every link points at an item tag), `empty_dir_roundtrip`, `record_type_mapping`, `entry_validation`, `rejects_non_directory`, `walker_*` (skips, loops, dangling, deleted), `capture_points_at_item_tags`, CLI `dcmdir` create+list runs |
-| FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, PDU/DIMSE tests (20); live C-ECHO against third-party endpoint `0x0000` |
+| FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, `loopback_storage_commit`, `storage_commit_skips_wait_on_action_failure`, PDU/DIMSE tests (20); live C-ECHO against third-party endpoint `0x0000` |
 | FR-NET-07 | worklist/MPPS/commitment tests |
 | FR-NET-08 | `tls_loopback_echo`, `rejects_empty_chain_and_key` |
-| FR-WEB-01…03 | `end_to_end_client_against_hyper`, dispatch/multipart tests (11) |
+| FR-WEB-01…03 | `end_to_end_client_against_hyper`, `wado_uri_against_stub`, `wado_uri_*` param tests, dispatch/multipart tests |
 | FR-ECG-01…03 | `vyna-dcm-ecg` tests (7); `ecg_write` example |
-| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
+| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `movescu`, `getscu`, `mppsscu`, `stgcmtscu`, `dcmdump`, `dcm2json`, `json2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example |
 | FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
 | NFR-04 | `rejects_garbage`, `rejects_non_part10`, `rejects_bad_json`, `rejects_missing_boundary`, unknown-route 404 tests |

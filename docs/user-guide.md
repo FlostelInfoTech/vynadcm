@@ -41,7 +41,8 @@ Requires Rust 1.98+. The eight tools are also runnable in place with
 
 ## 2. Common connection options
 
-`echoscu`, `storescu`, and `findscu` share these flags:
+`echoscu`, `storescu`, `findscu`, `movescu`, `getscu`, `mppsscu`,
+and `stgcmtscu` share these flags:
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -116,6 +117,40 @@ findscu --connect 127.0.0.1:11112 --model mwl \
   8-hex-digit tag (`00100020`); empty value (`-k PatientName=`)
   requests a return key.
 - `--json` prints matches as DICOM JSON; otherwise a text dump.
+
+### Retrieve: movescu / getscu
+
+```sh
+# C-MOVE: the peer sends matches to the MOVEDEST AE (run storescp there)
+movescu --connect 127.0.0.1:11112 --dest MOVEDEST -k StudyInstanceUID=1.2.3
+
+# C-GET: instances arrive back on this same association
+getscu --connect 127.0.0.1:11112 --output-dir ./got -k StudyInstanceUID=1.2.3
+```
+
+- `--model`: `studyroot` (default), `patientroot`; `movescu` also
+  accepts `patientstudy` (C-GET has no Patient/Study-only form).
+- `-k/--key` works exactly as in `findscu`, including the derived
+  Query/Retrieve Level.
+- The destination AE must be known to the *peer*, not to `movescu`.
+
+### MPPS and Storage Commitment: mppsscu / stgcmtscu
+
+```sh
+# MPPS: N-CREATE (IN PROGRESS) then N-SET (COMPLETED)
+mppsscu --connect 127.0.0.1:11112 --pps-id PPS1 --modality ECG \
+  --study-uid 1.2.3 --series 1.2.3.4:1.2.840.10008.5.1.4.1.1.2:1.2.3.101
+
+# Storage Commitment: N-ACTION then wait for the N-EVENT-REPORT
+stgcmtscu --connect 127.0.0.1:11112 --file received.dcm --timeout-secs 60
+```
+
+- `mppsscu` generates the MPPS UID and UTC start/end dates unless
+  `--mpps-uid` / `--start-date` / `--end-date` (+ `--start-time` /
+  `--end-time`) are given; `--discontinue` ends DISCONTINUED.
+- `stgcmtscu` takes `--file` (SOP UIDs read from Part-10 meta) and/or
+  `--instance CLASS_UID:INSTANCE_UID`; `--timeout-secs` bounds the
+  report wait, and any failed instance exits nonzero.
 
 ## 6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify
 

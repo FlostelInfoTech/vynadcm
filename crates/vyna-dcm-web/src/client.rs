@@ -275,6 +275,100 @@ impl DicomWebClient {
         Self::expect_ok(resp).await
     }
 
+    // -- WADO-URI ----------------------------------------------------------
+
+    /// WADO-URI retrieve (`GET {base}?requestType=WADO&...`, PS3.18 §6,
+    /// retired but still widely deployed on legacy PACS).
+    ///
+    /// Returns the raw response content type and bytes.
+    pub async fn wado_uri(&self, req: &WadoUriRequest) -> Result<(String, Vec<u8>)> {
+        let params = Self::wado_uri_params(req)?;
+        let resp = self
+            .get(self.base_url.clone())
+            .query(&params)
+            .send()
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
+        Self::expect_ok(resp).await
+    }
+
+    /// WADO-URI retrieve parsed as Part-10.
+    ///
+    /// Fails unless the server answers `application/dicom` (an optional
+    /// `transfer-syntax` parameter is allowed).
+    pub async fn wado_uri_dataset(&self, req: &WadoUriRequest) -> Result<(FileMeta, DataSet)> {
+        let (ct, bytes) = self.wado_uri(req).await?;
+        let mime = ct.split(';').next().unwrap_or("").trim();
+        if !mime.eq_ignore_ascii_case("application/dicom") {
+            return Err(Error::Multipart(format!(
+                "wado-uri returned {mime}, not application/dicom"
+            )));
+        }
+        Ok(read_part10(&bytes)?)
+    }
+
+    /// Validated WADO-URI query parameters (`requestType` first).
+    fn wado_uri_params(req: &WadoUriRequest) -> Result<Vec<(&'static str, String)>> {
+        if req.study_uid.is_empty() || req.series_uid.is_empty() || req.object_uid.is_empty() {
+            return Err(Error::BadRequest(
+                "wado-uri needs studyUID, seriesUID, and objectUID".into(),
+            ));
+        }
+        if let Some(q) = req.image_quality
+            && !(1..=100).contains(&q)
+        {
+            return Err(Error::BadRequest(format!(
+                "imageQuality {q} out of range 1–100"
+            )));
+        }
+        for (name, v) in [
+            ("rows", req.rows),
+            ("columns", req.columns),
+            ("frameNumber", req.frame_number),
+        ] {
+            if v.is_some_and(|n| n == 0) {
+                return Err(Error::BadRequest(format!("{name} must be nonzero")));
+            }
+        }
+        let mut params = vec![
+            ("requestType", "WADO".to_string()),
+            ("studyUID", req.study_uid.clone()),
+            ("seriesUID", req.series_uid.clone()),
+            ("objectUID", req.object_uid.clone()),
+        ];
+        for (name, v) in [
+            ("contentType", &req.content_type),
+            ("transferSyntax", &req.transfer_syntax),
+            ("annotation", &req.annotation),
+            ("region", &req.region),
+            ("windowCenter", &req.window_center),
+            ("windowWidth", &req.window_width),
+            ("presentationUID", &req.presentation_uid),
+            ("presentationSeriesUID", &req.presentation_series_uid),
+            ("charset", &req.charset),
+        ] {
+            if let Some(s) = v {
+                params.push((name, s.clone()));
+            }
+        }
+        if req.anonymize {
+            params.push(("anonymize", "yes".to_string()));
+        }
+        for (name, v) in [
+            ("rows", req.rows),
+            ("columns", req.columns),
+            ("frameNumber", req.frame_number),
+        ] {
+            if let Some(n) = v {
+                params.push((name, n.to_string()));
+            }
+        }
+        if let Some(q) = req.image_quality {
+            params.push(("imageQuality", q.to_string()));
+        }
+        Ok(params)
+    }
+
     // -- STOW-RS ---------------------------------------------------------
 
     /// Store instances (`POST /studies[/{study_uid}]`).
@@ -417,6 +511,61 @@ impl DicomWebClient {
     }
 }
 
+/// WADO-URI retrieve parameters (PS3.18 §6, retired).
+#[derive(Clone, Debug, Default)]
+pub struct WadoUriRequest {
+    /// Study Instance UID (required).
+    pub study_uid: String,
+    /// Series Instance UID (required).
+    pub series_uid: String,
+    /// SOP Instance UID (required).
+    pub object_uid: String,
+    /// Response MIME type (e.g. `application/dicom`, `image/jpeg`).
+    pub content_type: Option<String>,
+    /// Transfer Syntax UID (only with `application/dicom`).
+    pub transfer_syntax: Option<String>,
+    /// Request de-identification (`anonymize=yes`).
+    pub anonymize: bool,
+    /// Burned-in annotation (`patient`, `technique`, or both).
+    pub annotation: Option<String>,
+    /// Rendered rows.
+    pub rows: Option<u32>,
+    /// Rendered columns.
+    pub columns: Option<u32>,
+    /// Rendered region as `x1,y1,x2,y2` fractions of the image.
+    pub region: Option<String>,
+    /// VOI window center (DS decimal string).
+    pub window_center: Option<String>,
+    /// VOI window width (DS decimal string).
+    pub window_width: Option<String>,
+    /// Rendered frame (1-based).
+    pub frame_number: Option<u32>,
+    /// Rendered image quality 1–100.
+    pub image_quality: Option<u8>,
+    /// Presentation State SOP Instance UID to apply.
+    pub presentation_uid: Option<String>,
+    /// Presentation State Series UID to apply.
+    pub presentation_series_uid: Option<String>,
+    /// Character set for text annotation (e.g. `ISO_IR 192`).
+    pub charset: Option<String>,
+}
+
+impl WadoUriRequest {
+    /// Request for one object; the rest stays optional.
+    pub fn new(
+        study_uid: impl Into<String>,
+        series_uid: impl Into<String>,
+        object_uid: impl Into<String>,
+    ) -> Self {
+        Self {
+            study_uid: study_uid.into(),
+            series_uid: series_uid.into(),
+            object_uid: object_uid.into(),
+            ..Self::default()
+        }
+    }
+}
+
 /// STOW-RS store response.
 #[derive(Clone, Debug)]
 pub struct StowResponse {
@@ -428,4 +577,99 @@ pub struct StowResponse {
     pub content_type: String,
     /// Raw response body.
     pub raw_body: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn params(req: &WadoUriRequest) -> Vec<(String, String)> {
+        DicomWebClient::wado_uri_params(req)
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
+    }
+
+    #[test]
+    fn wado_uri_minimal_params() {
+        let p = params(&WadoUriRequest::new("1.2.1", "1.2.2", "1.2.3"));
+        assert_eq!(
+            p,
+            vec![
+                ("requestType".to_string(), "WADO".to_string()),
+                ("studyUID".to_string(), "1.2.1".to_string()),
+                ("seriesUID".to_string(), "1.2.2".to_string()),
+                ("objectUID".to_string(), "1.2.3".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn wado_uri_full_params() {
+        let req = WadoUriRequest {
+            content_type: Some("image/jpeg".into()),
+            transfer_syntax: Some("1.2.840.10008.1.2.4.50".into()),
+            anonymize: true,
+            annotation: Some("patient,technique".into()),
+            rows: Some(512),
+            columns: Some(512),
+            region: Some("0,0,1,1".into()),
+            window_center: Some("40".into()),
+            window_width: Some("400".into()),
+            frame_number: Some(2),
+            image_quality: Some(90),
+            presentation_uid: Some("1.2.9".into()),
+            presentation_series_uid: Some("1.2.10".into()),
+            charset: Some("ISO_IR 192".into()),
+            ..WadoUriRequest::new("1.2.1", "1.2.2", "1.2.3")
+        };
+        let p = params(&req);
+        let get = |k: &str| p.iter().find(|(kk, _)| kk == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("requestType"), Some("WADO"));
+        assert_eq!(get("contentType"), Some("image/jpeg"));
+        assert_eq!(get("transferSyntax"), Some("1.2.840.10008.1.2.4.50"));
+        assert_eq!(get("anonymize"), Some("yes"));
+        assert_eq!(get("annotation"), Some("patient,technique"));
+        assert_eq!(get("rows"), Some("512"));
+        assert_eq!(get("region"), Some("0,0,1,1"));
+        assert_eq!(get("windowCenter"), Some("40"));
+        assert_eq!(get("frameNumber"), Some("2"));
+        assert_eq!(get("imageQuality"), Some("90"));
+        assert_eq!(get("presentationUID"), Some("1.2.9"));
+        assert_eq!(get("presentationSeriesUID"), Some("1.2.10"));
+        assert_eq!(get("charset"), Some("ISO_IR 192"));
+    }
+
+    #[test]
+    fn wado_uri_anonymize_omitted_when_false() {
+        let p = params(&WadoUriRequest::new("1.2.1", "1.2.2", "1.2.3"));
+        assert!(!p.iter().any(|(k, _)| k == "anonymize"));
+    }
+
+    #[test]
+    fn wado_uri_validation() {
+        let bad_uids = WadoUriRequest::new("", "1.2.2", "1.2.3");
+        assert!(DicomWebClient::wado_uri_params(&bad_uids).is_err());
+        for quality in [0, 101] {
+            let req = WadoUriRequest {
+                image_quality: Some(quality),
+                ..WadoUriRequest::new("1.2.1", "1.2.2", "1.2.3")
+            };
+            assert!(DicomWebClient::wado_uri_params(&req).is_err(), "{quality}");
+        }
+        for (rows, columns, frame) in [
+            (Some(0), None, None),
+            (None, Some(0), None),
+            (None, None, Some(0)),
+        ] {
+            let req = WadoUriRequest {
+                rows,
+                columns,
+                frame_number: frame,
+                ..WadoUriRequest::new("1.2.1", "1.2.2", "1.2.3")
+            };
+            assert!(DicomWebClient::wado_uri_params(&req).is_err());
+        }
+    }
 }

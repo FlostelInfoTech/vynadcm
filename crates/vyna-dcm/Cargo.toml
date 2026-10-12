@@ -100,4 +100,24 @@ name = "dcmdir"
 path = "src/bin/dcmdir.rs"
 required-features = ["cli"]
 
+[[bin]]
+name = "movescu"
+path = "src/bin/movescu.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "getscu"
+path = "src/bin/getscu.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "mppsscu"
+path = "src/bin/mppsscu.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "stgcmtscu"
+path = "src/bin/stgcmtscu.rs"
+required-features = ["cli"]
+
 [dev-dependencies]

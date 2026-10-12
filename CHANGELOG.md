@@ -46,6 +46,15 @@ the workspace crate version (`Cargo.toml`).
   `dcmdir` CLI): offset-exact links via measured item capture,
   patient → study → series → instance trees, reported skips;
   171 tests green.
+- WADO-URI client (`WadoUriRequest`, `wado_uri`,
+  `wado_uri_dataset`) for legacy PACS retrieve; 176 tests green.
+- Missing SCU tools: `movescu` (C-MOVE to `--dest`), `getscu`
+  (C-GET into `--output-dir`), `mppsscu` (MPPS N-CREATE + N-SET
+  with generated UIDs and UTC dates), `stgcmtscu` (Storage
+  Commitment `--file`/`--instance` request + report wait), sharing
+  the `-k` query builder and filename sanitizer with
+  `findscu`/`storescp`; new `Association::storage_commit`
+  request-with-report helper; 191 tests green.
 
 ## [0.1.0] — 2026-10-11
 

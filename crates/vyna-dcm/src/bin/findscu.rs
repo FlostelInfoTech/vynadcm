@@ -4,9 +4,9 @@
 mod common;
 
 use clap::Parser;
-use common::{ConnArgs, anyhowish::Result};
-use vyna_dcm::core::{Tag, lookup_keyword, sop_class};
-use vyna_dcm::{DataSet, Vr, dump_dataset};
+use common::{ConnArgs, anyhowish::Result, build_qr_query};
+use vyna_dcm::core::sop_class;
+use vyna_dcm::dump_dataset;
 
 /// C-FIND SCU (Q/R + Modality Worklist).
 #[derive(Parser, Debug)]
@@ -41,7 +41,7 @@ async fn main() -> Result<()> {
         }
     };
     let is_mwl = sop == sop_class::MODALITY_WORKLIST_FIND;
-    let query = build_query(&args.keys, is_mwl)?;
+    let query = build_qr_query(&args.keys, is_mwl)?;
 
     let mut assoc = args
         .conn
@@ -72,56 +72,46 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn build_query(keys: &[String], is_mwl: bool) -> Result<DataSet> {
-    let mut ds = DataSet::new();
-    for key in keys {
-        let (name, value) = key
-            .split_once('=')
-            .ok_or_else(|| format!("key {key:?} must be KEY=value"))?;
-        let tag = parse_key(name)?;
-        // Look up the VR from the dictionary; default to LO for unknowns.
-        let vr = vyna_dcm::core::dictionary_vr(tag).unwrap_or(Vr::Lo);
-        if tag == vyna_dcm::tags::PATIENT_NAME {
-            ds.put_person_name(tag, vec![value.parse().map_err(|e| format!("{e:?}"))?]);
-        } else {
-            ds.put_text(tag, vr, value);
-        }
-    }
-    // Q/R models require Query/Retrieve Level; derive it from the keys
-    // (MWL identifiers must not carry it).
-    if !is_mwl && !ds.contains(vyna_dcm::tags::QUERY_RETRIEVE_LEVEL) {
-        use vyna_dcm::tags as t;
-        let level = if ds.contains(t::SOP_INSTANCE_UID) {
-            "IMAGE"
-        } else if ds.contains(t::SERIES_INSTANCE_UID) {
-            "SERIES"
-        } else if ds.contains(t::STUDY_INSTANCE_UID) {
-            "STUDY"
-        } else {
-            "PATIENT"
-        };
-        ds.put_text(t::QUERY_RETRIEVE_LEVEL, Vr::Cs, level);
-    }
-    Ok(ds)
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vyna_dcm::tags;
 
-fn parse_key(name: &str) -> Result<Tag> {
-    if let Some(e) = lookup_keyword(name) {
-        return Ok(e.tag);
+    fn keys(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
     }
-    if let Some(e) = vyna_dcm::core::ENTRIES
-        .iter()
-        .find(|e| e.keyword.eq_ignore_ascii_case(name))
-    {
-        return Ok(e.tag);
+
+    #[test]
+    fn level_derives_from_deepest_uid() {
+        let q = build_qr_query(&keys(&[]), false).unwrap();
+        assert_eq!(q.string(tags::QUERY_RETRIEVE_LEVEL), Some("PATIENT"));
+        let q = build_qr_query(&keys(&["StudyInstanceUID=1.2.3"]), false).unwrap();
+        assert_eq!(q.string(tags::QUERY_RETRIEVE_LEVEL), Some("STUDY"));
+        let q = build_qr_query(&keys(&["SeriesInstanceUID=1.2.3.4"]), false).unwrap();
+        assert_eq!(q.string(tags::QUERY_RETRIEVE_LEVEL), Some("SERIES"));
+        let q = build_qr_query(&keys(&["SOPInstanceUID=1.2.3.4.5"]), false).unwrap();
+        assert_eq!(q.string(tags::QUERY_RETRIEVE_LEVEL), Some("IMAGE"));
     }
-    let hex: String = name.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if hex.len() == 8 {
-        let g = u16::from_str_radix(&hex[0..4], 16).unwrap();
-        let e = u16::from_str_radix(&hex[4..8], 16).unwrap();
-        return Ok(Tag::new(g, e));
+
+    #[test]
+    fn mwl_carries_no_level() {
+        let q = build_qr_query(&keys(&["Modality=ECG"]), true).unwrap();
+        assert!(!q.contains(tags::QUERY_RETRIEVE_LEVEL));
+        assert_eq!(q.string(tags::MODALITY), Some("ECG"));
     }
-    Err(common::anyhowish::Error::msg(format!(
-        "unknown query key {name:?}"
-    )))
+
+    #[test]
+    fn keys_accept_keywords_and_hex_tags() {
+        let q = build_qr_query(&keys(&["PatientID=E123", "00100010=Doe^Jane"]), false).unwrap();
+        assert_eq!(q.string(tags::PATIENT_ID), Some("E123"));
+        let names = q.person_names(tags::PATIENT_NAME).unwrap();
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].to_dicom_string(), "Doe^Jane");
+    }
+
+    #[test]
+    fn bad_keys_fail() {
+        assert!(build_qr_query(&keys(&["NoEquals"]), false).is_err());
+        assert!(build_qr_query(&keys(&["BogusKey=x"]), false).is_err());
+    }
 }

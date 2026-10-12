@@ -184,4 +184,128 @@ mod tests {
         assert_eq!(all.len(), 1);
         assert_eq!(store.len(), 2);
     }
+
+    /// Minimal percent-decoder for asserting query values.
+    fn pct_decode(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '%' {
+                let hi = chars.next().unwrap_or('0');
+                let lo = chars.next().unwrap_or('0');
+                let b = u8::from_str_radix(&format!("{hi}{lo}"), 16).unwrap_or(b'?');
+                out.push(b as char);
+            } else if c == '+' {
+                out.push(' ');
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn wado_uri_against_stub() {
+        use crate::client::WadoUriRequest;
+        use std::sync::Mutex;
+
+        let dicom = test_file("1.2.9", "1.2.9.1", "1.2.9.1.1", 4, 4);
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let (seen, dicom) = (seen2.clone(), dicom.clone());
+                tokio::spawn(async move {
+                    let io = TokioIo::new(tcp);
+                    let svc = service_fn(move |req: Request<hyper::body::Incoming>| {
+                        let (seen, dicom) = (seen.clone(), dicom.clone());
+                        async move {
+                            let query = req.uri().query().map(pct_decode).unwrap_or_default();
+                            seen.lock().unwrap().push(query.clone());
+                            let get = |k: &str| {
+                                query.split('&').find_map(|p| {
+                                    p.split_once('=')
+                                        .filter(|(kk, _)| *kk == k)
+                                        .map(|(_, v)| v.to_string())
+                                })
+                            };
+                            let (status, ct, body): (u16, &str, Vec<u8>) =
+                                if get("requestType").as_deref() != Some("WADO") {
+                                    (400, "text/plain", b"want requestType=WADO".to_vec())
+                                } else if get("objectUID").as_deref() == Some("1.9.9.9") {
+                                    (404, "text/plain", b"no such object".to_vec())
+                                } else if get("contentType").as_deref() == Some("image/jpeg") {
+                                    (200, "image/jpeg", b"fake-jpeg-bytes".to_vec())
+                                } else {
+                                    (200, "application/dicom", dicom)
+                                };
+                            let mut resp = Response::new(Full::new(Bytes::from(body)));
+                            *resp.status_mut() = hyper::StatusCode::from_u16(status).unwrap();
+                            resp.headers_mut().insert(
+                                hyper::header::CONTENT_TYPE,
+                                hyper::header::HeaderValue::from_str(ct).unwrap(),
+                            );
+                            Ok::<_, hyper::Error>(resp)
+                        }
+                    });
+                    http1::Builder::new().serve_connection(io, svc).await.ok();
+                });
+            }
+        });
+
+        let client = DicomWebClient::new(format!("http://{addr}/wado")).unwrap();
+        // DICOM retrieve parses into a dataset.
+        let req = WadoUriRequest {
+            content_type: Some("application/dicom".into()),
+            transfer_syntax: Some("1.2.840.10008.1.2.1".into()),
+            anonymize: true,
+            ..WadoUriRequest::new("1.2.9", "1.2.9.1", "1.2.9.1.1")
+        };
+        let (meta, ds) = client.wado_uri_dataset(&req).await.unwrap();
+        assert_eq!(ds.string(vyna_dcm_core::tags::PATIENT_ID), Some("W123"));
+        assert_eq!(meta.transfer_syntax_uid, "1.2.840.10008.1.2.1");
+        // The stub saw the full query.
+        {
+            let queries = seen.lock().unwrap();
+            assert_eq!(queries.len(), 1);
+            for want in [
+                "requestType=WADO",
+                "studyUID=1.2.9",
+                "seriesUID=1.2.9.1",
+                "objectUID=1.2.9.1.1",
+                "contentType=application/dicom",
+                "transferSyntax=1.2.840.10008.1.2.1",
+                "anonymize=yes",
+            ] {
+                assert!(queries[0].contains(want), "{}", queries[0]);
+            }
+        }
+        // Rendered retrieve passes content through untouched.
+        let req = WadoUriRequest {
+            content_type: Some("image/jpeg".into()),
+            rows: Some(64),
+            frame_number: Some(1),
+            ..WadoUriRequest::new("1.2.9", "1.2.9.1", "1.2.9.1.1")
+        };
+        let (ct, body) = client.wado_uri(&req).await.unwrap();
+        assert_eq!(ct, "image/jpeg");
+        assert_eq!(body, b"fake-jpeg-bytes");
+        assert!(
+            seen.lock().unwrap()[1].contains("frameNumber=1"),
+            "frame param sent"
+        );
+        // Rendered bytes are not a dataset.
+        assert!(client.wado_uri_dataset(&req).await.is_err());
+        // Unknown object surfaces the status.
+        let missing = WadoUriRequest::new("1.2.9", "1.2.9.1", "1.9.9.9");
+        match client.wado_uri(&missing).await {
+            Err(crate::Error::Status { status, .. }) => assert_eq!(status, 404),
+            other => panic!("expected 404 status, got {other:?}"),
+        }
+    }
 }

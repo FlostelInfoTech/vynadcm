@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "VynaDCM DICOMweb: WADO-RS, STOW-RS, QIDO-RS"
+description = "VynaDCM DICOMweb: WADO-RS, STOW-RS, QIDO-RS, WADO-URI"
 
 [features]
 default = ["server"]

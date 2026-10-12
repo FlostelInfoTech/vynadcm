@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use common::{ListenArgs, anyhowish::Result};
+use common::{ListenArgs, anyhowish::Result, safe_instance_filename};
 use tokio::net::TcpListener;
 use vyna_dcm::net::AeTitle;
 use vyna_dcm::net::service::{AcceptorOptions, Handlers, RequestContext, ScpOptions, accept};
@@ -45,16 +45,7 @@ impl Handlers for StoreScp {
         let meta = FileMeta::new(&class, &inst, ts);
         match vyna_dcm::write_part10(&meta, &dataset) {
             Ok(bytes) => {
-                let safe: String = inst
-                    .chars()
-                    .map(|c| {
-                        if c.is_ascii_alphanumeric() || c == '.' {
-                            c
-                        } else {
-                            '_'
-                        }
-                    })
-                    .collect();
+                let safe = safe_instance_filename(&inst);
                 let path = self.directory.join(format!("{safe}.dcm"));
                 match std::fs::write(&path, bytes) {
                     Ok(()) => {
@@ -147,5 +138,20 @@ async fn main() -> Result<()> {
                 Err(e) => println!("association from {peer} ended: {e}"),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filename_keeps_uid_chars() {
+        assert_eq!(safe_instance_filename("1.2.840.10008.5"), "1.2.840.10008.5");
+    }
+
+    #[test]
+    fn filename_sanitizes_separators() {
+        assert_eq!(safe_instance_filename("../1.2/3\\4"), ".._1.2_3_4");
     }
 }

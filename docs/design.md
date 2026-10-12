@@ -128,6 +128,15 @@ spec adds component contracts, algorithms, sequences, and invariants.
   `move_config`, C-MOVE fails with Move Destination Unknown.
 - C-GET: same instance flow over the *same* association; a C-CANCEL
   for the GET aborts delivery and answers CANCEL.
+- `storage_commit` (`scu.rs`): N-ACTION request (action type 1),
+  then a single `recv` for the same-association N-EVENT-REPORT
+  (event type 1 only); acknowledges it SUCCESS and parses the
+  result. A failed N-ACTION returns `(status, None)` without
+  waiting; the association read timeout bounds the wait.
+- SCU CLIs (`movescu`, `getscu`, `mppsscu`, `stgcmtscu`) share
+  `common.rs` helpers with `findscu`/`storescp`: `build_qr_query`
+  (`-k KEY=value` with derived Query/Retrieve Level) and
+  `safe_instance_filename`.
 - `dimse::status` predicates partition the 16-bit space into
   success / warning / failure / pending / cancel for response logic.
 
@@ -135,6 +144,8 @@ spec adds component contracts, algorithms, sequences, and invariants.
 
 - `DicomWebClient`: sync-constructed, `async` ops; base URL + optional
   Basic/Bearer auth; HTTPS via OS trust store (see §7).
+  WADO-URI via `WadoUriRequest` (validated params) → raw bytes or
+  parsed dataset; rendering knobs pass through verbatim.
 - `dispatch(store, public_base, req)`: pure function
   `HttpRequest → HttpResponse` over `&dyn DicomWebStore`; no HTTP
   framework types leak into the core. Unknown routes → 404.
