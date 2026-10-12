@@ -21,6 +21,7 @@ jpeg-encoder.workspace = true
 pure_jpegls.workspace = true
 pure_jpegli.workspace = true
 openjp2.workspace = true
+encoding_rs.workspace = true
 
 [dev-dependencies]
 pure_jpeg2k = "2"

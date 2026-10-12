@@ -11,13 +11,15 @@
 Revision history: 0.1.0 (2026-10-11) — initial issue (201
 components); Unreleased — bundled JPEG codecs + IOD validator + PDF
 helpers: 212 components (8 workspace, 204 third-party), incl.
-vendored `openjp2` (BSD-2-Clause, patched in-tree).
+vendored `openjp2` (BSD-2-Clause, patched in-tree); Unreleased —
+deid/atna crates + charset conversion (`encoding_rs`): 218
+components (10 workspace, 208 third-party).
 
 ## 1. Artifact
 
 `docs/sbom.cyclonedx.json` is the authoritative bill of materials in
 [CycloneDX](https://cyclonedx.org/) 1.5 JSON format. It currently lists
-**8 workspace members** (proprietary) and **204 third-party crates**,
+**10 workspace members** (proprietary) and **208 third-party crates**,
 each with name, version, Package URL, SPDX license, and (for registry
 crates) the SHA-256 checksum from `Cargo.lock`. One third-party
 component, `openjp2` 0.6.1, is vendored under `vendor/` with a VynaDCM

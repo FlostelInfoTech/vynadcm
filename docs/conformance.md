@@ -176,20 +176,24 @@ authentication unless the embedding application installs the
 
 ## 5. Character sets
 
-- Text values are decoded as UTF-8 (lossy replacement on invalid
-  bytes) and encoded back as UTF-8 bytes; Specific Character Set
-  is carried as a normal data element but not interpreted for
-  code-extension conversion.
-- Creation sets `ISO_IR 192` only where the builder knows the text
-  needs it (Encapsulated PDF instances with non-ASCII text).
+- Text values (PN/LO/SH/ST/LT/UT) decode per the top-level
+  Specific Character Set, inherited by nested sequences:
+  `ISO_IR 6/100/101/109/110/126/127/138/144/148/166/192`,
+  `ISO_IR 13`, Japanese `ISO 2022 IR 13/87/159` pairs, Korean
+  `ISO 2022 IR 149`, `GBK`/`GB18030`; UC/UR stay UTF-8, and
+  undeclared/unknown sets fall back to Latin-1.
+- Encoding mirrors decoding (one code-extension run per value,
+  `?` for unmappable characters); creation sets `ISO_IR 192`
+  only where the builder knows the text needs it (Encapsulated
+  PDF instances with non-ASCII text).
 
 ## 6. Security
 
 - Association security relies on DICOM TLS (see §4.1); the library
   defaults to WebPKI roots with optional private CA.
-- Not implemented: ATNA audit-trail emission, de-identification
-  profiles, and User Identity on the SCU side (see roadmap P2 for
-  the first two).
+- Not implemented: the ATNA ARR (server) side, full E.1
+  transcription beyond the basic de-identification profile,
+  and User Identity on the SCU side.
 
 ## 7. Configuration
 

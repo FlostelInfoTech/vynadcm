@@ -286,6 +286,26 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   per PS3.15/DCMR; peer socket IPs not plumbed (AE titles only
   from handlers); movescu/getscu/mppsscu/stgcmtscu not yet wired.
 
+### 3.11 Specific Character Set conversion (`vyna-dcm-codec`)
+
+- **FR-CHARSET-01 (M)** Decode PN/LO/SH/ST/LT/UT values per the
+  top-level Specific Character Set (0008,0005), inherited by nested
+  sequence items: `ISO_IR 6/100/101/109/110/126/127/138/144/148/
+  166/192`, `ISO_IR 13`, Japanese code-extension pairs (`ISO 2022
+  IR 13/87/159`), Korean `ISO 2022 IR 149` (SO/SI + KS X 1001 in
+  G1), `GBK`/`GB18030`. Whole-value conversion (code-extension
+  state spans the value) with delimiters split in Unicode space
+  afterwards; UC/UR stay UTF-8; undeclared or unknown sets keep
+  the historical Latin-1 fallback.
+- **FR-CHARSET-02 (M)** Encode mirror: text/PN values are written
+  in the dataset's declared set (one code-extension run per value
+  or name, `?` for unmappable characters); pure-ASCII traffic is
+  byte-identical with or without a declaration.
+- **FR-CHARSET-03 (S)** Scope honesty: no ISO 8859-10/13/14/15/16,
+  no UTF-16, no vendor code pages; multi-term sets outside the
+  Japanese/Korean pairs fall back to Latin-1 on decode and pass
+  UTF-8 bytes through on encode.
+
 ## 4. Non-functional requirements
 
 - **NFR-01 (M)** Toolchain: Rust 1.98+, edition 2024; MSRV changes are
@@ -339,5 +359,6 @@ ATNA audit-trail emission.
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
 | FR-DEID-01…03 | `every_action_fires`, `shift_keeps_longitudinal_intervals`, `datetimes_shift_or_dummy_by_vr`, `burned_in_annotation_refuses_before_mutation`, `uid_maps_stay_consistent_across_datasets`, `shifts_cross_month_year_and_leap_day`, profile self-checks, CLI `output_plans_*` + `process_file_round_trip`, `deidentified_ecg_validates_with_identical_samples` |
 | FR-ATNA-01…04 | `event_code_triples_are_pinned`, `transferred_xml_has_shape_and_roles`, `values_escape`, `urls_parse_with_scheme_defaults`, UDP/TCP/TLS loopbacks (+ untrusted rejection), CLI `flow_messages_*` + `subcommands_parse`, wired `audit_flags_parse` ×3, `statuses_map_to_outcomes`, live UDP/TCP/TLS ARR-stub runs |
+| FR-CHARSET-01…03 | `oracle_vectors_decode`, `oracle_vectors_round_trip` (CPython latin-1/8859-2/8859-5/8859-7/cp1254/cp874/iso2022-jp/iso2022-kr/gb18030 vectors), `jis_x_0201_is_mechanical`, `ascii_and_fallbacks_behave`, `unmappable_encodes_to_question_mark`, `round_trips_latin1_patient_name`, `round_trips_japanese_pn_component_groups`, `sequence_items_inherit_charset`, `decodes_oracle_gb18030_bytes`, `dcmdump` CJK smoke runs |
 | NFR-04 | `rejects_garbage`, `rejects_non_part10`, `rejects_bad_json`, `rejects_missing_boundary`, unknown-route 404 tests |
 | NFR-07 | CI-equivalent gate run per change (see §4) |

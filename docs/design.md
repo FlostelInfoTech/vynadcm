@@ -64,6 +64,14 @@ spec adds component contracts, algorithms, sequences, and invariants.
   the four uncompressed syntaxes (implicit/explicit LE, explicit BE,
   deflated). Encode is canonical: elements in dataset order, correct
   padding (space for text, zero for binary), no group lengths.
+- Text values convert per Specific Character Set (0008,0005):
+  `charset::parse_specific_character_set` maps the top-level terms
+  to a `Decoding` (threaded `&mut` through decode, inheriting into
+  sequence items; recomputed per dataset on encode); whole-value
+  `decode_text`/`encode_text` so ISO-2022 state spans the value,
+  delimiters split in Unicode space afterwards. ASCII stays on a
+  fast path except under stateful sets (ISO-2022-JP/KR escapes and
+  JIS X 0201 Yen/overline live in ASCII range).
 - VR resolution order for implicit VR: delimiter rules → dictionary
   → contextual rules (`resolve_ambiguous` for Pixel/Waveform data,
   `US/SS` from Pixel Representation) → `UN` fallback.

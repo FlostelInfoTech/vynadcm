@@ -67,6 +67,10 @@ hyper. There are no DICOM dependencies outside this workspace.
   `PixelCodec` (`BundledCodec::default()` covers all six bundled
   syntaxes; `Error::UnsupportedTransferSyntax` if none is installed).
 - `dump.rs` — `dump_dataset` human-readable text dump (backs `dcmdump`).
+- `charset.rs` — Specific Character Set conversion: `Decoding` from
+  the top-level (0008,0005) terms, whole-value `decode_text` /
+  `encode_text` (ISO_IR sets via `encoding_rs`, JIS X 0201 +
+  ISO-2022-KR in-tree); ASCII fast path except stateful sets.
 
 ## vyna-dcm-net — DIMSE networking
 

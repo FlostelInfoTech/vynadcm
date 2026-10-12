@@ -13,7 +13,10 @@ use vyna_dcm_core::{
     dictionary_vr, is_context_dependent_vr, tags,
 };
 
-use crate::{Error, Result};
+use crate::{
+    Error, Result,
+    charset::{Decoding, Single, decode_text, parse_specific_character_set},
+};
 
 /// Undefined length marker (`0xFFFFFFFF`).
 pub const UNDEFINED_LENGTH: u32 = 0xFFFF_FFFF;
@@ -115,7 +118,8 @@ fn decode_up_to_capture(
         explicit: ts.is_explicit_vr() || ts.is_encapsulated(),
         encapsulated: ts.is_encapsulated(),
     };
-    let ds = decode_elements(&mut r, bytes.len(), 0, stop_before, capture)?;
+    let mut charset = Decoding::Default;
+    let ds = decode_elements(&mut r, bytes.len(), 0, stop_before, capture, &mut charset)?;
     Ok((ds, r.pos))
 }
 
@@ -175,6 +179,7 @@ fn decode_elements(
     depth: usize,
     stop_before: Option<Tag>,
     capture: &mut ItemCapture,
+    charset: &mut Decoding,
 ) -> Result<DataSet> {
     if depth > MAX_DEPTH {
         return Err(Error::BadSequence {
@@ -199,7 +204,13 @@ fn decode_elements(
             break;
         }
         let (vr, len) = read_header(r, tag, elem_offset, &ds)?;
-        let value = read_value(r, tag, vr, len, elem_offset, depth, capture)?;
+        let value = read_value(r, tag, vr, len, elem_offset, depth, capture, &mut *charset)?;
+        if depth == 0
+            && tag == tags::SPECIFIC_CHARACTER_SET
+            && let Value::Text(values) = &value
+        {
+            *charset = parse_specific_character_set(values);
+        }
         ds.insert(DataElement::new(tag, vr, value));
     }
     Ok(ds)
@@ -277,6 +288,7 @@ fn resolve_ambiguous(tag: Tag, ds: &DataSet) -> Vr {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_value(
     r: &mut Reader<'_>,
     tag: Tag,
@@ -285,9 +297,10 @@ fn read_value(
     offset: usize,
     depth: usize,
     capture: &mut ItemCapture,
+    charset: &mut Decoding,
 ) -> Result<Value> {
     if len == UNDEFINED_LENGTH {
-        return read_undefined(r, tag, vr, offset, depth, capture);
+        return read_undefined(r, tag, vr, offset, depth, capture, charset);
     }
     let len = len as usize;
     if vr == Vr::Sq {
@@ -297,10 +310,11 @@ fn read_value(
             depth,
             tag,
             capture,
+            charset,
         )?));
     }
     let raw = r.take(len, "element value")?.to_vec();
-    decode_primitive(tag, vr, &raw, r.little)
+    decode_primitive(tag, vr, &raw, r.little, charset)
 }
 
 fn read_undefined(
@@ -310,22 +324,23 @@ fn read_undefined(
     offset: usize,
     depth: usize,
     capture: &mut ItemCapture,
+    charset: &mut Decoding,
 ) -> Result<Value> {
     match vr {
         Vr::Sq => Ok(Value::Sequence(read_undefined_items(
-            r, depth, tag, capture,
+            r, depth, tag, capture, charset,
         )?)),
         Vr::Ob | Vr::Ow => {
             // Encapsulated syntaxes: BOT item + fragments. Native
             // syntaxes: concatenated item bytes (retired but seen).
-            read_fragments_or_bytes(r, tag, vr, offset, r.encapsulated)
+            read_fragments_or_bytes(r, tag, vr, offset, r.encapsulated, charset)
         }
         Vr::Un => {
             // Try sequence first (implicit-VR unknown sequences arrive as
             // UN); fall back to concatenated item bytes.
             let save = r.pos;
             let captured = capture.offsets.len();
-            match read_undefined_items(r, depth, tag, capture) {
+            match read_undefined_items(r, depth, tag, capture, charset) {
                 Ok(items) => Ok(Value::Sequence(items)),
                 Err(_) => {
                     r.pos = save;
@@ -336,7 +351,7 @@ fn read_undefined(
         }
         Vr::Od | Vr::Of | Vr::Ol | Vr::Ov | Vr::Uc | Vr::Ur | Vr::Ut => {
             let bytes = read_concatenated_items(r)?;
-            decode_primitive(tag, vr, &bytes, r.little)
+            decode_primitive(tag, vr, &bytes, r.little, charset)
         }
         _ => Err(Error::BadUndefinedLength { tag, vr, offset }),
     }
@@ -349,6 +364,7 @@ fn read_defined_items(
     depth: usize,
     seq_tag: Tag,
     capture: &mut ItemCapture,
+    charset: &mut Decoding,
 ) -> Result<Vec<DataSet>> {
     if depth + 1 > MAX_DEPTH {
         return Err(Error::BadSequence {
@@ -375,7 +391,12 @@ fn read_defined_items(
         capture.record(seq_tag, at);
         let len = r.u32("item length")?;
         if len == UNDEFINED_LENGTH {
-            items.push(read_until_item_delimiter(r, depth + 1, capture)?);
+            items.push(read_until_item_delimiter(
+                r,
+                depth + 1,
+                capture,
+                &mut *charset,
+            )?);
         } else {
             let item_end = r.pos + len as usize;
             if item_end > end {
@@ -397,6 +418,7 @@ fn read_defined_items(
                 depth + 1,
                 None,
                 capture,
+                &mut *charset,
             )?);
             r.pos = item_end;
         }
@@ -410,6 +432,7 @@ fn read_undefined_items(
     depth: usize,
     seq_tag: Tag,
     capture: &mut ItemCapture,
+    charset: &mut Decoding,
 ) -> Result<Vec<DataSet>> {
     if depth + 1 > MAX_DEPTH {
         return Err(Error::BadSequence {
@@ -440,7 +463,12 @@ fn read_undefined_items(
         capture.record(seq_tag, at);
         let len = r.u32("item length")?;
         if len == UNDEFINED_LENGTH {
-            items.push(read_until_item_delimiter(r, depth + 1, capture)?);
+            items.push(read_until_item_delimiter(
+                r,
+                depth + 1,
+                capture,
+                &mut *charset,
+            )?);
         } else {
             let item_end = r.pos + len as usize;
             if item_end > r.buf.len() {
@@ -462,6 +490,7 @@ fn read_undefined_items(
                 depth + 1,
                 None,
                 capture,
+                &mut *charset,
             )?);
             r.pos = item_end;
         }
@@ -473,6 +502,7 @@ fn read_until_item_delimiter(
     r: &mut Reader<'_>,
     depth: usize,
     capture: &mut ItemCapture,
+    charset: &mut Decoding,
 ) -> Result<DataSet> {
     if depth > MAX_DEPTH {
         return Err(Error::BadSequence {
@@ -501,7 +531,7 @@ fn read_until_item_delimiter(
             });
         }
         let (vr, len) = read_header(r, tag, at, &ds)?;
-        let value = read_value(r, tag, vr, len, at, depth, capture)?;
+        let value = read_value(r, tag, vr, len, at, depth, capture, &mut *charset)?;
         ds.insert(DataElement::new(tag, vr, value));
     }
 }
@@ -513,6 +543,7 @@ fn read_fragments_or_bytes(
     vr: Vr,
     offset: usize,
     encapsulated: bool,
+    charset: &Decoding,
 ) -> Result<Value> {
     let mut items: Vec<Vec<u8>> = Vec::new();
     loop {
@@ -553,7 +584,7 @@ fn read_fragments_or_bytes(
         for item in &items {
             bytes.extend_from_slice(item);
         }
-        return decode_primitive(tag, vr, &bytes, r.little);
+        return decode_primitive(tag, vr, &bytes, r.little, charset);
     }
     // Encapsulated: first item is the Basic Offset Table.
     let bot_bytes = &items[0];
@@ -607,7 +638,13 @@ fn read_concatenated_items(r: &mut Reader<'_>) -> Result<Vec<u8>> {
 }
 
 /// Decode defined-length value bytes for one VR.
-fn decode_primitive(tag: Tag, vr: Vr, raw: &[u8], little: bool) -> Result<Value> {
+fn decode_primitive(
+    tag: Tag,
+    vr: Vr,
+    raw: &[u8],
+    little: bool,
+    charset: &Decoding,
+) -> Result<Value> {
     if raw.is_empty() {
         return Ok(Value::Empty);
     }
@@ -615,7 +652,7 @@ fn decode_primitive(tag: Tag, vr: Vr, raw: &[u8], little: bool) -> Result<Value>
     match vr {
         Vr::Sq => Err(bad("SQ must use sequence framing".into())),
         Vr::Pn => Ok(Value::PersonName(
-            split_text(raw, vr)
+            split_text(raw, vr, charset)
                 .into_iter()
                 .map(|s| PersonName::parse(&s))
                 .collect(),
@@ -635,7 +672,7 @@ fn decode_primitive(tag: Tag, vr: Vr, raw: &[u8], little: bool) -> Result<Value>
         | Vr::Uc
         | Vr::Ui
         | Vr::Ur
-        | Vr::Ut) => Ok(Value::Text(split_text(raw, text))),
+        | Vr::Ut) => Ok(Value::Text(split_text(raw, text, charset))),
         Vr::At => {
             if !raw.len().is_multiple_of(4) {
                 return Err(bad(format!("AT length {} not a multiple of 4", raw.len())));
@@ -729,7 +766,7 @@ fn f64_from(c: &[u8], little: bool) -> f64 {
 }
 
 /// Split a text value on backslashes (except single-valued `LT ST UT UR`).
-fn split_text(raw: &[u8], vr: Vr) -> Vec<String> {
+fn split_text(raw: &[u8], vr: Vr, charset: &Decoding) -> Vec<String> {
     let mut bytes = raw;
     // Strip value padding (DICOM pads to even length).
     while bytes.last() == Some(&vr.padding_byte()) && !bytes.is_empty() {
@@ -742,19 +779,33 @@ fn split_text(raw: &[u8], vr: Vr) -> Vec<String> {
             bytes = &bytes[..bytes.len() - 1];
         }
     }
-    let decode = |b: &[u8]| {
-        if b.is_ascii() {
-            // Fast path; DICOM default repertoire is ASCII.
-            String::from_utf8_lossy(b).into_owned()
-        } else {
-            // No Specific Character Set decoding yet: fall back to Latin-1
-            // so European text survives instead of becoming U+FFFD.
-            b.iter().map(|c| *c as char).collect()
-        }
+    // Pure-ASCII bytes still need conversion under stateful charsets:
+    // ISO-2022 escape sequences live entirely in the ASCII range,
+    // and JIS X 0201 Roman maps 0x5C/0x7E to Yen/overline.
+    let ascii_transparent = !matches!(
+        charset,
+        Decoding::Iso2022Jp | Decoding::Iso2022Kr | Decoding::Single(Single::JisX0201)
+    );
+    if bytes.is_ascii() && ascii_transparent {
+        // Fast path; identical under every remaining character set.
+        return split_values(&String::from_utf8_lossy(bytes), vr);
+    }
+    // Decode the whole value first (code-extension state spans it),
+    // then split delimiters in Unicode space.
+    let text = match vr {
+        Vr::Pn | Vr::Lo | Vr::Sh | Vr::St | Vr::Lt | Vr::Ut => decode_text(bytes, charset),
+        // UC/UR are always UTF-8, regardless of Specific Character Set.
+        Vr::Uc | Vr::Ur => String::from_utf8_lossy(bytes).into_owned(),
+        // Historical Latin-1 fallback for the remaining text VRs.
+        _ => decode_text(bytes, &Decoding::Default),
     };
+    split_values(&text, vr)
+}
+
+fn split_values(text: &str, vr: Vr) -> Vec<String> {
     match vr {
-        Vr::Lt | Vr::St | Vr::Ut | Vr::Ur => vec![decode(bytes)],
-        _ => bytes.split(|b| *b == b'\\').map(decode).collect(),
+        Vr::Lt | Vr::St | Vr::Ut | Vr::Ur => vec![text.to_string()],
+        _ => text.split('\\').map(str::to_string).collect(),
     }
 }
 

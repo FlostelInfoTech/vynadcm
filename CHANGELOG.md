@@ -74,6 +74,13 @@ the workspace crate version (`Cargo.toml`).
   with hostname verification) plus the `auditsend` CLI and wired
   `storescp`/`storescu`/`findscu` emission (best-effort,
   status-mapped outcomes); 233 tests green.
+- Specific Character Set conversion (DCMTK `oficonv`-like):
+  `codec::charset` (`Decoding`, whole-value `decode_text`/
+  `encode_text` over `encoding_rs`) wired through decode/encode
+  with sequence inheritance — `ISO_IR` Latin/Greek/Arabic/Hebrew/
+  Cyrillic/Thai sets, UTF-8, JIS X 0201, Japanese ISO-2022 pairs,
+  Korean ISO 2022 IR 149, GBK/GB18030; CPython-oracle vectors,
+  dataset round-trip tests, `dcmdump` CJK smoke; 242 tests green.
 
 ## [0.1.0] — 2026-10-11
 

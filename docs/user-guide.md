@@ -175,6 +175,14 @@ also verifies file-meta SOP UIDs match the dataset. Exit 0 means
 no errors (warnings allowed), 1 means errors, 2 means the SOP
 Class is not supported.
 
+CJK and accented names render decoded: `dcmdump` interprets
+Specific Character Set (Japanese ISO-2022 pairs, Korean ISO 2022
+IR 149, GBK/GB18030, the `ISO_IR` Latin/Greek/Arabic/Hebrew/
+Cyrillic/Thai sets, UTF-8), including multi-group person names
+(`Alphabetic=Ideographic=Phonetic`); files without the tag keep
+the Latin-1 fallback. `dcmodify` and `json2dcm` write text back
+in the dataset's declared set.
+
 `pdf2dcm` wraps a PDF (e.g. an ECG report) in an Encapsulated PDF
 instance: Study/Series/SOP UIDs are generated unless `--study-uid` /
 `--series-uid` / `--sop-uid` are given, `--title` defaults to the

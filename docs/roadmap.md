@@ -153,8 +153,16 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   with XML well-formedness check, 233/233 tests, clippy clean.
   Out of scope (documented): peer socket IPs in handler audits,
   movescu/getscu/mppsscu/stgcmtscu wiring, ARR (server) side.
-- **Specific Character Set conversion** (DCMTK `oficonv`-like):
-  correct text decoding for CJK patient names.
+- **Specific Character Set conversion** (DCMTK `oficonv`-like)
+  — DONE: shipped `codec::charset` (`Decoding` + whole-value
+  `decode_text`/`encode_text` over `encoding_rs`, wired through
+  decode/encode with sequence inheritance) covering the `ISO_IR`
+  Latin/Greek/Arabic/Hebrew/Cyrillic/Thai sets, UTF-8, JIS X 0201,
+  Japanese ISO-2022 pairs, Korean ISO 2022 IR 149, and GBK/GB18030.
+  Accepted: CPython-oracle vectors, 4 dataset round-trip tests,
+  `dcmdump` JP/CN smoke runs, 242/242 tests, clippy clean. Out of
+  scope (documented): ISO 8859-10/13/14/15/16, UTF-16, vendor code
+  pages.
 - **XML presentation** (`dcm2xml`/`xml2dcm`): debugging and transforms.
 - **UPS / IAN**: adopt if customers demand; niche otherwise.
 

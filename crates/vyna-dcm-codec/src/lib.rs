@@ -23,6 +23,7 @@
 
 #![warn(missing_docs)]
 
+pub mod charset;
 mod decode;
 pub mod dicomdir;
 mod dump;

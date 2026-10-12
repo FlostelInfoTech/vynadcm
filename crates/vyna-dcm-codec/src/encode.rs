@@ -13,9 +13,12 @@
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use std::io::Write;
-use vyna_dcm_core::{DataSet, FragmentSequence, Tag, TransferSyntax, Value, Vr, delimiter};
+use vyna_dcm_core::{DataSet, FragmentSequence, Tag, TransferSyntax, Value, Vr, delimiter, tags};
 
-use crate::{Error, Result, UNDEFINED_LENGTH};
+use crate::{
+    Error, Result, UNDEFINED_LENGTH,
+    charset::{Decoding, encode_text, parse_specific_character_set},
+};
 
 /// Default fragment size for [`fragment_payload`] (64 KiB).
 pub const DEFAULT_FRAGMENT_LEN: usize = 65536;
@@ -58,6 +61,18 @@ pub(crate) fn encode_dataset_capture_items(
     Ok((bytes, capture.offsets))
 }
 
+/// Character-set decoding for one dataset: the top-level
+/// Specific Character Set, inherited by every nested sequence.
+fn charset_of(ds: &DataSet) -> Decoding {
+    match ds.get(tags::SPECIFIC_CHARACTER_SET) {
+        Some(el) => match &el.value {
+            Value::Text(terms) => parse_specific_character_set(terms),
+            _ => Decoding::Default,
+        },
+        None => Decoding::Default,
+    }
+}
+
 fn encode_dataset_inner(
     ds: &DataSet,
     ts: TransferSyntax,
@@ -73,6 +88,7 @@ fn encode_dataset_inner(
     let little = ts.is_little_endian();
     let explicit = ts.is_explicit_vr() || ts.is_encapsulated();
     let mut out = Vec::new();
+    let charset = charset_of(ds);
     for (tag, el) in ds.iter() {
         if tag.is_group_length() {
             continue; // retired; never re-emitted
@@ -86,6 +102,7 @@ fn encode_dataset_inner(
             ts.is_encapsulated(),
             &mut out,
             capture,
+            &charset,
         )?;
     }
     Ok(out)
@@ -102,6 +119,7 @@ fn encode_element(
     encapsulated: bool,
     out: &mut Vec<u8>,
     capture: &mut ItemCapture,
+    charset: &Decoding,
 ) -> Result<()> {
     put_tag(out, tag, little);
     let unencodable = |message: String| Error::Unencodable { tag, vr, message };
@@ -139,7 +157,7 @@ fn encode_element(
                 capture.record(tag, out.len());
                 put_tag(out, delimiter::ITEM, little);
                 put_u32(out, UNDEFINED_LENGTH, little);
-                let bytes = encode_dataset_in(item, little, false, capture)?;
+                let bytes = encode_dataset_in(item, little, false, capture, charset)?;
                 out.extend_from_slice(&bytes);
                 put_tag(out, delimiter::ITEM_DELIMITATION, little);
                 put_u32(out, 0, little);
@@ -162,7 +180,7 @@ fn encode_element(
                 rel.push(body.len());
             }
             put_tag(&mut body, delimiter::ITEM, little);
-            let bytes = encode_dataset_in(item, little, true, capture)?;
+            let bytes = encode_dataset_in(item, little, true, capture, charset)?;
             put_u32(&mut body, bytes.len() as u32, little);
             body.extend_from_slice(&bytes);
         }
@@ -179,7 +197,7 @@ fn encode_element(
         return Err(unencodable("sequence value with non-SQ VR".into()));
     }
 
-    let bytes = encode_primitive(tag, vr, value, little)?;
+    let bytes = encode_primitive(tag, vr, value, little, charset)?;
     if !explicit && bytes.len() > u32::MAX as usize {
         return Err(unencodable("value exceeds 32-bit length".into()));
     }
@@ -199,6 +217,7 @@ fn encode_dataset_in(
     little: bool,
     explicit: bool,
     capture: &mut ItemCapture,
+    charset: &Decoding,
 ) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for (tag, el) in ds.iter() {
@@ -206,7 +225,7 @@ fn encode_dataset_in(
             continue;
         }
         encode_element(
-            tag, el.vr, &el.value, little, explicit, false, &mut out, capture,
+            tag, el.vr, &el.value, little, explicit, false, &mut out, capture, charset,
         )?;
     }
     Ok(out)
@@ -241,7 +260,13 @@ pub fn fragment_payload(data: &[u8], fragment_len: usize) -> FragmentSequence {
 }
 
 /// Encode a defined-length value for one VR.
-fn encode_primitive(tag: Tag, vr: Vr, value: &Value, little: bool) -> Result<Vec<u8>> {
+fn encode_primitive(
+    tag: Tag,
+    vr: Vr,
+    value: &Value,
+    little: bool,
+    charset: &Decoding,
+) -> Result<Vec<u8>> {
     let unencodable = |message: String| Error::Unencodable { tag, vr, message };
     match value {
         Value::Empty => Ok(Vec::new()),
@@ -260,18 +285,37 @@ fn encode_primitive(tag: Tag, vr: Vr, value: &Value, little: bool) -> Result<Vec
                     return Err(unencodable(format!("invalid UID {s:?}")));
                 }
             }
-            Ok(pad(v.join("\\").into_bytes(), vr.padding_byte()))
+            let raw = match vr {
+                // One code-extension run per value, joined by backslash.
+                Vr::Lo | Vr::Sh | Vr::St | Vr::Lt | Vr::Ut => {
+                    let mut raw = Vec::new();
+                    for (i, text) in v.iter().enumerate() {
+                        if i > 0 {
+                            raw.push(b'\\');
+                        }
+                        raw.extend_from_slice(&encode_text(text, charset));
+                    }
+                    raw
+                }
+                // UC/UR are always UTF-8; the rest keep the historical
+                // UTF-8 passthrough.
+                _ => v.join("\\").into_bytes(),
+            };
+            Ok(pad(raw, vr.padding_byte()))
         }
         Value::PersonName(names) => {
             if vr != Vr::Pn {
                 return Err(unencodable(format!("person names with {vr}")));
             }
-            let joined = names
-                .iter()
-                .map(|n| n.to_dicom_string())
-                .collect::<Vec<_>>()
-                .join("\\");
-            Ok(pad(joined.into_bytes(), 0x20))
+            let mut raw = Vec::new();
+            for (i, name) in names.iter().enumerate() {
+                if i > 0 {
+                    raw.push(b'\\');
+                }
+                // One code-extension run per name, spanning its groups.
+                raw.extend_from_slice(&encode_text(&name.to_dicom_string(), charset));
+            }
+            Ok(pad(raw, 0x20))
         }
         Value::Tags(tags) => {
             if vr != Vr::At {
@@ -522,5 +566,90 @@ mod tests {
         let mut ds = DataSet::new();
         ds.put_text(tags::SOP_INSTANCE_UID, Vr::Ui, "not a uid!!");
         assert!(encode_dataset(&ds, TransferSyntax::ExplicitVrLittleEndian).is_err());
+    }
+
+    fn with_scs(ds: &mut DataSet, terms: &[&str]) {
+        ds.insert(DataElement::texts(
+            tags::SPECIFIC_CHARACTER_SET,
+            Vr::Cs,
+            terms.iter().map(ToString::to_string).collect(),
+        ));
+    }
+
+    #[test]
+    fn round_trips_latin1_patient_name() {
+        // Oracle (CPython latin-1): "Müller^Jörg".
+        let mut ds = DataSet::new();
+        with_scs(&mut ds, &["ISO_IR 100"]);
+        ds.insert(DataElement::person_name(
+            tags::PATIENT_NAME,
+            vec![PersonName::parse("Müller^Jörg")],
+        ));
+        let ts = TransferSyntax::ExplicitVrLittleEndian;
+        let bytes = encode_dataset(&ds, ts).unwrap();
+        let oracle = "Müller^Jörg".chars().map(|c| c as u8).collect::<Vec<_>>();
+        assert!(bytes.windows(oracle.len()).any(|w| w == oracle));
+        let back = decode_dataset(&bytes, ts).unwrap();
+        assert_eq!(
+            back.person_names(tags::PATIENT_NAME).unwrap()[0].to_dicom_string(),
+            "Müller^Jörg"
+        );
+    }
+
+    #[test]
+    fn round_trips_japanese_pn_component_groups() {
+        // Oracle (CPython iso2022-jp): 3-group PN.
+        let name = "Yamada^Tarou=山田^太郎=やまだ^たろう";
+        let mut ds = DataSet::new();
+        with_scs(&mut ds, &["ISO 2022 IR 13", "ISO 2022 IR 87"]);
+        ds.insert(DataElement::person_name(
+            tags::PATIENT_NAME,
+            vec![PersonName::parse(name)],
+        ));
+        let ts = TransferSyntax::ExplicitVrLittleEndian;
+        let bytes = encode_dataset(&ds, ts).unwrap();
+        // ISO-2022 escape sequences are on the wire.
+        assert!(bytes.windows(3).any(|w| w == b"\x1b$B"));
+        let back = decode_dataset(&bytes, ts).unwrap();
+        assert_eq!(
+            back.person_names(tags::PATIENT_NAME).unwrap()[0].to_dicom_string(),
+            name
+        );
+    }
+
+    #[test]
+    fn sequence_items_inherit_charset() {
+        // Oracle (CPython gbk): 王伟.
+        let mut ds = DataSet::new();
+        with_scs(&mut ds, &["GBK"]);
+        let mut item = DataSet::new();
+        item.put_text(tags::PATIENT_ID, Vr::Lo, "王伟");
+        ds.insert(DataElement::sequence(
+            tags::REFERENCED_IMAGE_SEQUENCE,
+            vec![item],
+        ));
+        let ts = TransferSyntax::ExplicitVrLittleEndian;
+        let bytes = encode_dataset(&ds, ts).unwrap();
+        assert!(bytes.windows(4).any(|w| w == b"\xcd\xf5\xce\xb0"));
+        let back = decode_dataset(&bytes, ts).unwrap();
+        let items = back.sequence(tags::REFERENCED_IMAGE_SEQUENCE).unwrap();
+        assert_eq!(items[0].string(tags::PATIENT_ID), Some("王伟"));
+    }
+
+    #[test]
+    fn decodes_oracle_gb18030_bytes() {
+        // SCS "GB18030 " + PN 王伟 as CPython gb18030 emits them.
+        let mut bytes = vec![
+            0x08, 0x00, 0x05, 0x00, b'C', b'S', 0x08, 0x00, b'G', b'B', b'1', b'8', b'0', b'3',
+            b'0', b' ',
+        ];
+        bytes.extend([
+            0x10, 0x00, 0x10, 0x00, b'P', b'N', 0x04, 0x00, 0xcd, 0xf5, 0xce, 0xb0,
+        ]);
+        let ds = decode_dataset(&bytes, TransferSyntax::ExplicitVrLittleEndian).unwrap();
+        assert_eq!(
+            ds.person_names(tags::PATIENT_NAME).unwrap()[0].to_dicom_string(),
+            "王伟"
+        );
     }
 }
