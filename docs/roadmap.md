@@ -18,7 +18,8 @@ with dcm4che, DCMTK, pydicom (+pynetdicom), and fo-dicom.
 - [3. Priority 0: interoperability foundations](#3-priority-0-interoperability-foundations)
 - [4. Priority 1: interface-engine depth](#4-priority-1-interface-engine-depth)
 - [5. Priority 2: deployment and robustness](#5-priority-2-deployment-and-robustness)
-- [6. Deliberate non-goals](#6-deliberate-non-goals)
+- [6. Cross-toolkit comparison rounds](#6-cross-toolkit-comparison-rounds)
+- [7. Deliberate non-goals](#7-deliberate-non-goals)
 
 ## 1. Method
 
@@ -183,7 +184,37 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   emission, verification against a real peer (dcm4chee UPS SCP) —
   self-loopback alone proves little for a workflow protocol.
 
-## 6. Deliberate non-goals
+## 6. Cross-toolkit comparison rounds
+
+- **dicom-rs comparison** — DONE: shipped the three gaps found —
+  the `GB2312` Specific Character Set term (via its GBK superset,
+  with a CPython oracle vector), single-frame PNG export/import
+  (`codec::img` over the `image` crate plus `dcm2img`/`img2dcm`
+  CLIs; MONO 8/16-bit and RGB 8-bit, no windowing), and a vendored
+  real-file regression corpus (`vendor/dicom-corpus`, 5 MIT
+  pydicom-data files + README) with `codec::corpus` tests. The
+  corpus immediately paid off: RLE MSB-first component-major
+  segment order (was little-endian), even-length segment padding
+  tolerated/emitted, bogus basic offset tables validated with
+  fragment-per-frame fallback, subsampled (422) RLE refused.
+  Accepted: oracle vectors, CLI round-trip byte-identical,
+  cross-codec agreement tests, 256/256 tests, clippy clean. Out of
+  scope (documented): windowing/display, `dcm2img` multi-frame.
+- **dcm4che/DCMTK comparison** — DONE: shipped the two gaps found —
+  QR/MWL SCP (`net::qrdb` file-backed index with PS3.4 matching
+  and level grouping, `findscp` with QR FIND/MOVE/GET plus
+  `--route` AE table, `mwlscp` worklist FIND; `get_with` threaded
+  with each instance's transfer syntax so `getscu` transcodes
+  encapsulated arrivals, C-GET storage proposals extended) and
+  DICOMweb CLIs (`qidors` with `-k` keys/limit/offset/text-JSON,
+  `wadors` instance/metadata/frames/bulkdata, `stowrs` multipart
+  store, `wadorsd` stub server over a directory). Accepted: 11
+  qrdb unit tests + 4 SCP tests, 4 web loopback tests over real
+  HTTP, live findscp/move/getscu and wadorsd CLI smokes, 271/271
+  tests, clippy clean. Out of scope (documented): persistent
+  archive behind `wadorsd` (STOW lands in memory), UPS/IAN (§5).
+
+## 7. Deliberate non-goals
 
 Image display/windowing, RT/SR specialty modules, print management,
 HL7 (covered by the RS7 library), LDAP configuration management,
