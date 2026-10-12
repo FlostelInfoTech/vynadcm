@@ -5,6 +5,8 @@ the workspace crate version (`Cargo.toml`).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-12
+
 ### Added
 
 - Full PS3.6 2026d dictionary (5,239 entries, retired flags,

@@ -3,13 +3,14 @@
 | Field | Value |
 |---|---|
 | Document | Integration guide (living) |
-| Version | 0.1.0 |
-| Date | 2026-10-11 |
+| Version | 0.2.0 |
+| Date | 2026-10-12 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.1.0 |
+| Applies to | VynaDCM workspace v0.2.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue. Every snippet
-below is compile-checked against the workspace (see §12).
+below is compile-checked against the workspace (see §12);
+0.2.0 (2026-10-12) — version bump, snippets re-checked.
 
 Audience: Rust developers embedding VynaDCM in VynaECG and VynaLink.
 Operators should start with `docs/user-guide.md`.

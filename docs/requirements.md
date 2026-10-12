@@ -3,14 +3,16 @@
 | Field | Value |
 |---|---|
 | Document | SRS (living) |
-| Version | 0.1.0 |
-| Date | 2026-10-11 |
+| Version | 0.2.0 |
+| Date | 2026-10-12 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.1.0 (crates `vyna-dcm-*`) |
+| Applies to | VynaDCM workspace v0.2.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
 implemented baseline (176 tests green, IOD validator + PDF helpers
-+ tag editor + transcoder + DICOMDIR + WADO-URI applied).
++ tag editor + transcoder + DICOMDIR + WADO-URI applied);
+0.2.0 (2026-10-12) — version bump; FR-WEB-04 + QR/MWL SCP +
+charset/XML/img requirements folded in since 0.1.0.
 
 ## Contents
 

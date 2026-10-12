@@ -3,13 +3,14 @@
 | Field | Value |
 |---|---|
 | Document | SDS (living) |
-| Version | 0.1.0 |
-| Date | 2026-10-11 |
+| Version | 0.2.0 |
+| Date | 2026-10-12 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.1.0 |
+| Applies to | VynaDCM workspace v0.2.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue; full-dictionary
-(P0.1) update applied same day (generated tables, private dict, `SV`).
+(P0.1) update applied same day (generated tables, private dict, `SV`);
+0.2.0 (2026-10-12) — version bump, no design change.
 
 ## Contents
 

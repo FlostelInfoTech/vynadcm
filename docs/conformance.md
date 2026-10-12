@@ -1,6 +1,6 @@
 # VynaDCM DICOM Conformance Statement
 
-Product: VynaDCM `0.1.0` (workspace crates `vyna-dcm-*`).
+Product: VynaDCM `0.2.0` (workspace crates `vyna-dcm-*`).
 Generated from the implemented capabilities by
 `docs/generate-conformance.py` — do not hand-edit; rerun the script.
 
@@ -10,7 +10,7 @@ This statement describes the DICOM networking, media, and DICOMweb
 behaviour of the VynaDCM command-line Application Entities and the
 library defaults behind them, following the structure of PS3.2.
 Implementation Class UID
-`2.25.46417651854989365804951432447169401540`, Implementation Version Name `VYNA_DCM_010`.
+`2.25.46417651854989365804951432447169401540`, Implementation Version Name `VYNA_DCM_020`.
 
 ## 2. Implementation model
 
@@ -154,7 +154,7 @@ authentication unless the embedding application installs the
 ### 3.3 Association policies
 
 - Application Context Name: `1.2.840.10008.3.1.1.1`.
-- Implementation Class UID `2.25.46417651854989365804951432447169401540`, Version Name `VYNA_DCM_010`.
+- Implementation Class UID `2.25.46417651854989365804951432447169401540`, Version Name `VYNA_DCM_020`.
 - Presentation contexts: the SCU proposes one context per SOP Class,
   each with the offered transfer syntaxes; the SCP accepts at most
   one syntax per context from its accepted list.
@@ -304,4 +304,4 @@ authentication unless the embedding application installs the
 ## Annex C — Implementation identifying attributes
 
 - Implementation Class UID: `2.25.46417651854989365804951432447169401540`.
-- Implementation Version Name: `VYNA_DCM_010`.
+- Implementation Version Name: `VYNA_DCM_020`.

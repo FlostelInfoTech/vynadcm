@@ -1,6 +1,6 @@
 [package]
 name = "vyna-dcm"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -17,15 +17,15 @@ ecg = ["vyna-dcm-ecg"]
 cli = ["clap"]
 
 [dependencies]
-vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.1" }
-vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.1" }
-vyna-dcm-iod = { path = "../vyna-dcm-iod", version = "0.1" }
-vyna-dcm-pdf = { path = "../vyna-dcm-pdf", version = "0.1" }
-vyna-dcm-deid = { path = "../vyna-dcm-deid", version = "0.1" }
-vyna-dcm-atna = { path = "../vyna-dcm-atna", version = "0.1" }
-vyna-dcm-net = { path = "../vyna-dcm-net", version = "0.1", optional = true }
-vyna-dcm-web = { path = "../vyna-dcm-web", version = "0.1", optional = true }
-vyna-dcm-ecg = { path = "../vyna-dcm-ecg", version = "0.1", optional = true }
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.2" }
+vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.2" }
+vyna-dcm-iod = { path = "../vyna-dcm-iod", version = "0.2" }
+vyna-dcm-pdf = { path = "../vyna-dcm-pdf", version = "0.2" }
+vyna-dcm-deid = { path = "../vyna-dcm-deid", version = "0.2" }
+vyna-dcm-atna = { path = "../vyna-dcm-atna", version = "0.2" }
+vyna-dcm-net = { path = "../vyna-dcm-net", version = "0.2", optional = true }
+vyna-dcm-web = { path = "../vyna-dcm-web", version = "0.2", optional = true }
+vyna-dcm-ecg = { path = "../vyna-dcm-ecg", version = "0.2", optional = true }
 thiserror.workspace = true
 serde_json.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros"] }

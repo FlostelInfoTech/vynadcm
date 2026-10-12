@@ -20,7 +20,7 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | `vyna-dcm-pdf` | Encapsulated PDF SOP-instance builders and extractors |
 | `vyna-dcm-deid` | Basic-profile de-identification for research exports |
 | `vyna-dcm-atna` | ATNA audit-trail emission over syslog |
-| `vyna-dcm` | Facade re-exporting the above, plus 20 CLI tools and 3 examples |
+| `vyna-dcm` | Facade re-exporting the above, plus 30 CLI tools and 3 examples |
 
 ## Documentation
 
@@ -78,12 +78,20 @@ cargo run -p vyna-dcm --example link_route -- 127.0.0.1:11115 127.0.0.1:11114 PA
 | `echoscu` / `echoscp` | C-ECHO SCU / SCP |
 | `storescu` / `storescp` | C-STORE sender / receiver into a directory |
 | `findscu` | C-FIND query, prints matches |
+| `findscp` | QR C-FIND/C-MOVE/C-GET server over a directory |
+| `mwlscp` | Modality Worklist C-FIND server over a directory |
 | `movescu` | C-MOVE retrieve to a destination AE |
 | `getscu` | C-GET retrieve into a directory |
 | `mppsscu` | MPPS N-CREATE + N-SET |
 | `stgcmtscu` | Storage Commitment request + report wait |
+| `qidors` | QIDO-RS search, prints matches |
+| `wadors` | WADO-RS retrieve (instance/metadata/frames/bulkdata) |
+| `stowrs` | STOW-RS store files |
+| `wadorsd` | DICOMweb stub server over a directory |
 | `dcmdump` | Part-10 file text dump |
 | `dcm2json` / `json2dcm` | Part-10 <-> DICOM JSON conversion |
+| `dcm2xml` / `xml2dcm` | Part-10 <-> Native DICOM Model XML conversion |
+| `dcm2img` / `img2dcm` | Frame <-> PNG export/import |
 | `dcmvalidate` | IOD conformance check (exit 0 clean, 1 errors, 2 unsupported SOP) |
 | `pdf2dcm` | Wrap a PDF in an Encapsulated PDF file (with IOD self-check) |
 | `dcm2pdf` | Extract the PDF from an Encapsulated PDF file |
@@ -93,7 +101,8 @@ cargo run -p vyna-dcm --example link_route -- 127.0.0.1:11115 127.0.0.1:11114 PA
 | `deidentify` | De-identify Part-10 files (basic profile) |
 | `auditsend` | Send one ATNA audit message |
 
-Network tools need features `cli,net`; file tools need only `cli`.
+DIMSE tools need features `cli,net`; DICOMweb tools need `cli,web`;
+file tools need only `cli`.
 
 ## Features
 

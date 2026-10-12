@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | Software bill of materials (living) |
-| Version | 0.1.0 |
-| Date | 2026-10-11 |
+| Version | 0.2.0 |
+| Date | 2026-10-12 |
 | Status | Living — regenerated on every dependency change |
-| Applies to | VynaDCM workspace v0.1.0 |
+| Applies to | VynaDCM workspace v0.2.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue (201
 components); Unreleased — bundled JPEG codecs + IOD validator + PDF
@@ -16,7 +16,8 @@ deid/atna crates + charset conversion (`encoding_rs`): 218
 components (10 workspace, 208 third-party); Unreleased — XML
 presentation (`quick-xml`): 219 components (10 workspace, 209
 third-party); Unreleased — PNG export/import (`image` + PNG stack):
-227 components (10 workspace, 217 third-party).
+227 components (10 workspace, 217 third-party);
+0.2.0 (2026-10-12) — version bump, dependency set unchanged.
 
 ## 1. Artifact
 

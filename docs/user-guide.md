@@ -3,13 +3,14 @@
 | Field | Value |
 |---|---|
 | Document | User guide (living) |
-| Version | 0.1.0 |
-| Date | 2026-10-11 |
+| Version | 0.2.0 |
+| Date | 2026-10-12 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.1.0, `vyna-dcm` CLI tools |
+| Applies to | VynaDCM workspace v0.2.0, `vyna-dcm` CLI tools |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue. Flag
-reference below is transcribed from `--help` output.
+reference below is transcribed from `--help` output;
+0.2.0 (2026-10-12) — version bump, 30 CLI tools covered.
 
 Audience: operators and support engineers running connectivity checks,
 storage, queries, and file conversions. Developers embedding the

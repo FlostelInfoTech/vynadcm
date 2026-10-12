@@ -3,13 +3,15 @@
 | Field | Value |
 |---|---|
 | Document | Roadmap (living) |
-| Version | 0.1.0 |
-| Date | 2026-10-11 |
+| Version | 0.2.0 |
+| Date | 2026-10-12 |
 | Status | Living — reprioritized as VynaECG/VynaLink needs evolve |
-| Applies to | VynaDCM workspace v0.1.0 |
+| Applies to | VynaDCM workspace v0.2.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, from comparison
-with dcm4che, DCMTK, pydicom (+pynetdicom), and fo-dicom.
+with dcm4che, DCMTK, pydicom (+pynetdicom), and fo-dicom;
+0.2.0 (2026-10-12) — version bump; all P0–P2 items and both
+comparison rounds DONE.
 
 ## Contents
 
