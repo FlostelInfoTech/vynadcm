@@ -18,9 +18,7 @@
 // (follow-on resolution errors still collect below it); drop this
 // block if a rebase completes the port.
 #[cfg(not(feature = "std"))]
-compile_error!(
-  "vyna-openjp2 requires the `std` feature: no_std is unfinished upstream work"
-);
+compile_error!("vyna-openjp2 requires the `std` feature: no_std is unfinished upstream work");
 
 #[cfg(not(feature = "std"))]
 #[macro_use]

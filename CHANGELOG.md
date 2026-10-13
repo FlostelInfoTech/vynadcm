@@ -3,6 +3,21 @@
 All notable changes to VynaDCM are documented here. Versions follow
 the workspace crate version (`Cargo.toml`).
 
+## [Unreleased]
+
+### Fixed
+
+- C-ECHO-RQ/RSP now carry the mandatory Affected SOP Class UID
+  (`1.2.840.10008.1.1`); without it DCMTK `storescp` aborts the
+  association on command parse. Found by the new cross-vendor
+  matrix (DCMTK 3.6.7: C-ECHO/C-STORE both directions, C-FIND,
+  C-MOVE all passing; see conformance §4.0). Pinned by
+  `echo_rq_golden_bytes` plus a constructor-coverage test.
+- `vyna-openjp2` without `std` now fails with one explicit
+  `compile_error!` (upstream's `no_std` port is unfinished —
+  upstream 0.6.1 fails identically) instead of ~28 confusing
+  resolution errors; position documented in the fork README.
+
 ## [0.5.0] — 2026-10-13
 
 ### Fixed

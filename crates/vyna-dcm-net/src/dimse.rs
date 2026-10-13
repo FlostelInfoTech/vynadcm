@@ -5,7 +5,7 @@
 //! VR Little Endian with a leading Command Group Length element.
 
 use vyna_dcm_codec::{decode_dataset, encode_dataset};
-use vyna_dcm_core::{DataSet, Tag, TransferSyntax, tags};
+use vyna_dcm_core::{DataSet, Tag, TransferSyntax, sop_class, tags};
 
 use crate::{Error, Result};
 
@@ -382,19 +382,22 @@ impl Command {
         }
     }
 
-    /// C-ECHO-RQ.
+    /// C-ECHO-RQ (Affected SOP Class UID is mandatory; DCMTK aborts
+    /// associations whose C-ECHO-RQ omits it).
     #[must_use]
     pub fn echo_rq(message_id: u16) -> Self {
         let mut c = Self::base(command_field::C_ECHO_RQ);
         c.message_id = Some(message_id);
+        c.affected_sop_class_uid = Some(sop_class::VERIFICATION.to_string());
         c
     }
 
-    /// C-ECHO-RSP.
+    /// C-ECHO-RSP (always for the Verification SOP Class).
     #[must_use]
     pub fn echo_rsp(message_id_rsp: u16, status: u16) -> Self {
         let mut c = Self::base(command_field::C_ECHO_RSP);
         c.message_id_rsp = Some(message_id_rsp);
+        c.affected_sop_class_uid = Some(sop_class::VERIFICATION.to_string());
         c.status = Some(status);
         c
     }
@@ -776,6 +779,98 @@ mod tests {
             let back = decode_command(&bytes).unwrap();
             assert_eq!(back, cmd);
         }
+    }
+
+    #[test]
+    fn echo_rq_golden_bytes() {
+        // Byte-exact C-ECHO-RQ: group length, null-padded affected
+        // UID, field, message id, priority, dataset-null. DCMTK aborts
+        // the association when (0000,0002) is missing, so pin it here.
+        let mut expected = vec![
+            0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x42, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x02, 0x00, 0x12, 0x00, 0x00, 0x00,
+        ];
+        expected.extend_from_slice(b"1.2.840.10008.1.1\0");
+        expected.extend_from_slice(&[
+            0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x30, 0x00, //
+            0x00, 0x00, 0x10, 0x01, 0x02, 0x00, 0x00, 0x00, 0x01, 0x00, //
+            0x00, 0x00, 0x00, 0x07, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, //
+            0x00, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x00, 0x01, 0x01, //
+        ]);
+        assert_eq!(encode_command(&Command::echo_rq(1)).unwrap(), expected);
+    }
+
+    #[test]
+    fn every_command_carries_its_sop_class() {
+        let with_class = [
+            Command::echo_rq(1),
+            Command::echo_rsp(1, status::SUCCESS),
+            Command::store_rq(1, priority::MEDIUM, "1.2.3", "1.2.3.4"),
+            Command::store_rsp(
+                1,
+                Some("1.2.3".into()),
+                Some("1.2.3.4".into()),
+                status::SUCCESS,
+            ),
+            Command::find_rq(1, priority::MEDIUM, "1.2.3"),
+            Command::find_rsp(1, Some("1.2.3".into()), status::SUCCESS, false),
+            Command::move_rq(1, priority::MEDIUM, "1.2.3", "DEST"),
+            Command::move_get_rsp(true, 1, Some("1.2.3".into()), status::SUCCESS, 0, 0, 0, 0),
+            Command::get_rq(1, priority::MEDIUM, "1.2.3"),
+            Command::n_create_rq(1, "1.2.3", "1.2.3.4", false),
+            Command::n_create_rsp(
+                1,
+                Some("1.2.3".into()),
+                Some("1.2.3.4".into()),
+                status::SUCCESS,
+            ),
+            Command::n_set_rq(1, "1.2.3", "1.2.3.4"),
+            Command::n_set_rsp(
+                1,
+                Some("1.2.3".into()),
+                Some("1.2.3.4".into()),
+                status::SUCCESS,
+            ),
+            Command::n_get_rq(1, "1.2.3", "1.2.3.4", vec![]),
+            Command::n_get_rsp(
+                1,
+                Some("1.2.3".into()),
+                Some("1.2.3.4".into()),
+                status::SUCCESS,
+                false,
+            ),
+            Command::n_action_rq(1, "1.2.3", "1.2.3.4", 1, false),
+            Command::n_action_rsp(
+                1,
+                Some("1.2.3".into()),
+                Some("1.2.3.4".into()),
+                status::SUCCESS,
+            ),
+            Command::n_delete_rq(1, "1.2.3", "1.2.3.4"),
+            Command::n_delete_rsp(
+                1,
+                Some("1.2.3".into()),
+                Some("1.2.3.4".into()),
+                status::SUCCESS,
+            ),
+            Command::n_event_report_rq(1, "1.2.3", "1.2.3.4", 1, false),
+            Command::n_event_report_rsp(
+                1,
+                Some("1.2.3".into()),
+                Some("1.2.3.4".into()),
+                status::SUCCESS,
+            ),
+        ];
+        for cmd in with_class {
+            let ds = cmd.to_dataset();
+            let has_class = ds.contains(tags::AFFECTED_SOP_CLASS_UID)
+                || ds.contains(tags::REQUESTED_SOP_CLASS_UID);
+            assert!(has_class, "field {:04X} lacks a SOP Class UID", cmd.field);
+        }
+        // C-CANCEL-RQ is the only command without one.
+        let cancel = Command::cancel_rq(1).to_dataset();
+        assert!(!cancel.contains(tags::AFFECTED_SOP_CLASS_UID));
+        assert!(!cancel.contains(tags::REQUESTED_SOP_CLASS_UID));
     }
 
     #[test]

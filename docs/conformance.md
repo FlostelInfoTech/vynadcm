@@ -192,10 +192,21 @@ authentication unless the embedding application installs the
 - Association interop is covered by loopback self-tests (every
   SCU tool against its SCP twin) plus third-party-encoded
   fixtures (DCMTK/GDCM writers; see the `tests/data` READMEs).
-- A command-line matrix against DCMTK (`echoscu`, `storescu`,
-  `findscu`, `movescu`) is planned but not yet run: no DCMTK
-  binaries are installed in CI, so no cross-vendor results are
-  claimed here.
+- Cross-vendor matrix vs DCMTK 3.6.7 (Ubuntu noble, 2026-10-14),
+  all passing, loopback, Explicit LE: C-ECHO both directions
+  (DCMTK `echoscu` → `echoscp`; `echoscu` → DCMTK `storescp`,
+  0x0000 both); C-STORE both directions (`storescu` → DCMTK
+  `storescp` and back; landed files re-parse under `dcmdump`
+  with matching SOP Class/Instance UIDs); C-FIND Study Root
+  (DCMTK `findscu -S` → `findscp`, matches returned); C-MOVE
+  (DCMTK `movescu -S` → `findscp --route` → DCMTK `storescp`,
+  both instances delivered). DCMTK does not auto-send
+  Query/Retrieve Level: pass `-k 0008,0052=STUDY` explicitly
+  (our SCP correctly rejects level-less identifiers 0xA900).
+  The matrix caught one real bug: our C-ECHO-RQ/RSP omitted the
+  mandatory Affected SOP Class UID (DCMTK aborted); fixed and
+  pinned by `echo_rq_golden_bytes`. Not in CI (no DCMTK
+  binaries installed there); re-run manually to refresh.
 
 ### 4.1 TCP/IP and DICOM TLS
 
