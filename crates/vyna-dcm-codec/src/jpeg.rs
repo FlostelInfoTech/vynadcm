@@ -136,7 +136,17 @@ impl PixelCodec for JpegCodec {
                 )));
             }
         };
-        let expected_len = rows as usize * columns as usize * samples_per_pixel as usize;
+        // Checked like the decode path: the u16 triple can overflow
+        // 32-bit usize, which would gate the length against a wrapped
+        // value.
+        let expected_len = (rows as usize)
+            .checked_mul(columns as usize)
+            .and_then(|n| n.checked_mul(samples_per_pixel as usize))
+            .ok_or_else(|| {
+                PixelCodecError::Geometry(format!(
+                    "jpeg geometry {rows}x{columns}x{samples_per_pixel} overflows address space"
+                ))
+            })?;
         if raw.len() != expected_len {
             return Err(PixelCodecError::Geometry(format!(
                 "raw frame is {} bytes, expected {expected_len}",

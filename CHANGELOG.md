@@ -3,7 +3,7 @@
 All notable changes to VynaDCM are documented here. Versions follow
 the workspace crate version (`Cargo.toml`).
 
-## [Unreleased]
+## [0.5.0] — 2026-10-13
 
 ### Fixed
 
@@ -58,6 +58,36 @@ the workspace crate version (`Cargo.toml`).
   DICOM Model XML maps illegal controls to U+FFFD; examples carry
   `required-features`; intra-doc links fixed (`cargo doc` clean
   under `-D warnings`).
+- Second review batch (29 major + minors): de-identification is a
+  full 636-row PS3.15 E.1 transcription (generator + pinned
+  snapshot, `ShiftDateOrZero`, VR-aware dummies, curve/overlay/
+  private rules, marker gating, burned-in tri-state); ATNA gains
+  the `AuditSourceIdentification` child, `EventTypeCode`s, and
+  syslog mTLS/`close_notify`/UDP cap; JPEG 2000 pre-checks the SIZ
+  grid and the stream callbacks use 32-bit-safe math with clamped
+  seeks; the `vyna-openjp2` port no longer panics (IMF/alloc paths
+  return errors); DICOM JSON writes per-group person names and
+  U64/I64 floats; DICOMDIR covers WAVEFORM/ENCAP SOPs; C-GET
+  stashes release, compiled C-FIND identifiers cap at 10,000
+  values, commitment tracks a held set; QIDO dedups after match,
+  STOW returns `FailedSOPSequence`, frames/Accept yield 404/406;
+  ECG fixes charset scanning, `OB`/`OW` selection, and pad bytes;
+  PDF extraction requires the `%PDF-` magic; `dcmdir` is contained
+  to its root; SCU/SCP TLS flags are honored (silent-TLS configs
+  error); SCP accept loops back off; all CLI outputs write
+  atomically; `storescu --priority` validates 0|1|2 and `wadors`
+  rejects `-o -` plus conflicting modes.
+- **Fixed:** the DICOMweb client configured no TLS roots, so every
+  HTTPS request failed verification; it now verifies against the
+  OS certificate store via `rustls-platform-verifier` (loopback
+  test proves both the trusted and untrusted directions), matching
+  the long-documented behavior. `tokio` is optional without the
+  `server` feature.
+- Tally corrections: 5,217 dictionary entries (was 5,239), 636-row
+  de-id profile (was 197-tag); conformance gains an extracted
+  protocol-limits section (§8) and an honest DCMTK-matrix-planned
+  note; CI runs `--all-targets` plus a no-default feature matrix;
+  user guide documents the remaining tool flags.
 
 ### Changed
 
@@ -81,6 +111,17 @@ the workspace crate version (`Cargo.toml`).
   + `Handlers::{on_move_plan, on_get_plan}`, `MAX_FIND_MATCHES`/
   `MAX_FIND_BYTES`, `Error::{TooManyMatches, MatchesTooLarge}`,
   `Error::NotPdf`.
+- **Breaking (pre-1.0):** second-batch API sealing: `Action`,
+  `Transport`, `AssociationOptions`, `AcceptorOptions`,
+  `ScpOptions`, and the ECG/PDF metadata structs are
+  `#[non_exhaustive]` (downstream literals/matches need `..`/a
+  wildcard arm). New additive API: `Action::ShiftDateOrZero`,
+  `DUMMY_TIME`/`DUMMY_AGE`, generated `BASIC_PROFILE`,
+  `read_part10_header`, syslog `with_client_cert`/
+  `with_webpki_roots`, `STOW_FAILURE_PROCESSING`, `InvalidMeta`.
+  De-id marker semantics tightened: custom profiles, retained
+  privates, and engine warnings withhold the de-identified
+  markers, and code 113105 is stamped only when dates shift.
 
 ### Changed
 

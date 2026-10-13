@@ -172,15 +172,26 @@ SCP_PDU_EXPR = cli_default(LISTEN_SRC, "ListenArgs", "max_pdu", r"default_value_
 assert SCU_PDU_EXPR == SCP_PDU_EXPR, "conformance: SCU/SCP max_pdu differ"
 
 
-def human_bytes(expr: str) -> str:
+def const_value(expr: str) -> int:
     n = 1
     for part in expr.split("*"):
         n *= int(part.strip())
+    return n
+
+
+def human_bytes(expr: str) -> str:
+    n = const_value(expr)
+    if n % (1024 * 1024 * 1024) == 0:
+        return f"{n // (1024 * 1024 * 1024)} GiB"
     if n % (1024 * 1024) == 0:
         return f"{n // (1024 * 1024)} MiB"
     if n % 1024 == 0:
         return f"{n // 1024} KiB"
     return f"{n} bytes"
+
+
+def human_count(expr: str) -> str:
+    return f"{const_value(expr):,}"
 
 
 MAX_PDU = human_bytes(SCU_PDU_EXPR)
@@ -191,6 +202,45 @@ assert MAX_PDU_LIB.replace(" ", "") == SCU_PDU_EXPR.replace(" ", ""), (
 assert "tls_client_ca" in common_src and "tls_cert" in common_src, (
     "conformance: TLS flags moved"
 )
+
+# -- protocol limits --------------------------------------------------------
+
+WEB = WORKSPACE / "crates" / "vyna-dcm-web" / "src"
+CODEC = WORKSPACE / "crates" / "vyna-dcm-codec" / "src"
+ATNA = WORKSPACE / "crates" / "vyna-dcm-atna" / "src"
+
+
+def rust_const(path: Path, name: str) -> str:
+    return must_find(
+        rf"{name}:\s*\w+\s*=\s*([^;]+);", path.read_text(), f"{path.name}::{name}"
+    ).group(1).strip()
+
+
+QR_MATCHES = human_count(rust_const(NET / "qrdb.rs", "MAX_QR_MATCHES"))
+QR_DEPTH = human_count(rust_const(NET / "qrdb.rs", "MAX_SCAN_DEPTH"))
+QR_VALUES = human_count(rust_const(NET / "qrdb.rs", "MAX_QUERY_VALUES"))
+DEC_DEPTH = human_count(rust_const(CODEC / "decode.rs", "MAX_DEPTH"))
+INFLATED = human_bytes(rust_const(CODEC / "decode.rs", "MAX_INFLATED_LEN"))
+PIXEL_BYTES = human_bytes(rust_const(CODEC / "lib.rs", "MAX_PIXEL_BYTES"))
+FRAGMENT = human_bytes(rust_const(CODEC / "transcode.rs", "MAX_FRAGMENT"))
+JSON_DEPTH = human_count(rust_const(CODEC / "json.rs", "MAX_JSON_DEPTH"))
+XML_DEPTH = human_count(rust_const(CODEC / "xml.rs", "MAX_XML_DEPTH"))
+RESP_BYTES = human_bytes(rust_const(WEB / "client.rs", "MAX_RESPONSE_BYTES"))
+SRV_BODY = human_bytes(rust_const(WEB / "hyper_server.rs", "MAX_BODY_LEN"))
+SRV_CONN_SECS = human_count(rust_const(WEB / "hyper_server.rs", "MAX_CONN_SECS"))
+SRV_CONN_N = human_count(rust_const(WEB / "hyper_server.rs", "MAX_CONNECTIONS"))
+MPARTS = human_count(rust_const(WEB / "multipart.rs", "MAX_PARTS"))
+MPART_HDRS = human_count(rust_const(WEB / "multipart.rs", "MAX_PART_HEADERS"))
+BULK_N = human_count(rust_const(WEB / "server.rs", "MAX_BULK_BLOBS"))
+BULK_BYTES = human_bytes(rust_const(WEB / "server.rs", "MAX_BULK_BYTES"))
+INST_N = human_count(rust_const(WEB / "server.rs", "MAX_INSTANCES"))
+INST_BYTES = human_bytes(rust_const(WEB / "server.rs", "MAX_INSTANCE_BYTES"))
+UDP_FRAME = human_count(rust_const(ATNA / "syslog.rs", "MAX_UDP_FRAME"))
+AUDIT_TIMEOUT = must_find(
+    r"DEFAULT_TIMEOUT: Duration = Duration::from_secs\((\d+)\)",
+    (ATNA / "syslog.rs").read_text(),
+    "syslog DEFAULT_TIMEOUT",
+).group(1)
 
 # -- negotiation posture -----------------------------------------------------
 
@@ -456,6 +506,16 @@ add("  C-GET aborts delivery when cancel arrives with the C-STORE-RSP.")
 add("")
 add("## 4. Communication profiles")
 add("")
+add("### 4.0 Peer interop testing")
+add("")
+add("- Association interop is covered by loopback self-tests (every")
+add("  SCU tool against its SCP twin) plus third-party-encoded")
+add("  fixtures (DCMTK/GDCM writers; see the `tests/data` READMEs).")
+add("- A command-line matrix against DCMTK (`echoscu`, `storescu`,")
+add("  `findscu`, `movescu`) is planned but not yet run: no DCMTK")
+add("  binaries are installed in CI, so no cross-vendor results are")
+add("  claimed here.")
+add("")
 add("### 4.1 TCP/IP and DICOM TLS")
 add("")
 add("- DIMSE runs over TCP/IP. DICOM TLS (PS3.15) is compiled in by")
@@ -515,6 +575,29 @@ add(f"| SCP bind | `{BIND}` | `--bind` |")
 add(f"| Max PDU | {MAX_PDU} | `--max-pdu` |")
 add(f"| SCU read timeout | {SCU_TIMEOUT} s | `--timeout-secs` |")
 add(f"| SCP read timeout | {SCP_TIMEOUT} s | `--timeout-secs` |")
+add("")
+add("## 8. Protocol limits (DoS bounds)")
+add("")
+add("Hard caps from the sources (requests past them fail or evict;")
+add("nothing truncates silently except where noted):")
+add("")
+add(f"- Query/retrieve: at most {QR_MATCHES} C-FIND matches per query")
+add(f"  (past that: out-of-resources, no partial list), {QR_VALUES}")
+add(f"  match values per compiled identifier, directory scans {QR_DEPTH}")
+add("  levels deep.")
+add(f"- File decode: dataset nesting {DEC_DEPTH} levels, deflated")
+add(f"  inflation {INFLATED}, pixel payloads {PIXEL_BYTES}, encoded")
+add(f"  fragments {FRAGMENT} (PS3.5 §8.2); DICOM JSON/XML nesting")
+add(f"  {JSON_DEPTH}/{XML_DEPTH} levels.")
+add(f"- DICOMweb client: response bodies {RESP_BYTES}.")
+add(f"- DICOMweb server: request bodies {SRV_BODY}, {SRV_CONN_N}")
+add(f"  concurrent connections, {SRV_CONN_SECS} s per connection;")
+add(f"  `multipart/related` bodies {MPARTS} parts with {MPART_HDRS}")
+add("  headers each. `MemoryStore` evicts oldest-first past")
+add(f"  {BULK_N} bulk blobs / {BULK_BYTES} and {INST_N} instances /")
+add(f"  {INST_BYTES}.")
+add(f"- ATNA syslog: UDP frames {UDP_FRAME} bytes (larger audits need TCP")
+add(f"  or TLS); {AUDIT_TIMEOUT} s connect/write timeout.")
 add("")
 add("## Annex A — SOP Classes")
 add("")

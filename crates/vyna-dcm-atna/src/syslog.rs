@@ -14,6 +14,7 @@ use crate::message::{AuditMessage, Outcome};
 
 /// Syslog transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Transport {
     /// UDP, one datagram per message (RFC 5426).
     Udp,
@@ -51,7 +52,9 @@ impl FromStr for SyslogTarget {
             }
             _ => return Err(Error::BadUrl(url.to_string())),
         };
-        if rest.is_empty() || rest.contains('/') || rest.contains('?') {
+        // Syslog URLs carry no userinfo, path, or query: reject them
+        // at parse time instead of failing late in DNS.
+        if rest.is_empty() || rest.contains(['/', '?', '@']) {
             return Err(Error::BadUrl(url.to_string()));
         }
         let (host, port) = if let Some(bracketed) = rest.strip_prefix('[') {
@@ -77,7 +80,7 @@ impl FromStr for SyslogTarget {
                 _ => return Err(Error::BadUrl(url.to_string())),
             }
         };
-        if host.is_empty() {
+        if host.is_empty() || port == 0 {
             return Err(Error::BadUrl(url.to_string()));
         }
         Ok(Self {
@@ -130,8 +133,12 @@ pub fn syslog_frame(
 }
 
 /// Replace header-hostile characters (whitespace, controls, DEL)
-/// with `_` (RFC 5424 fields admit no spaces).
+/// with `_` (RFC 5424 fields admit no spaces); empty fields become
+/// the NILVALUE `-` so the frame stays well-formed.
 fn sanitize_field(s: &str) -> String {
+    if s.is_empty() {
+        return "-".to_string();
+    }
     s.chars()
         .map(|c| {
             if c.is_whitespace() || c.is_control() {
@@ -152,6 +159,10 @@ pub fn octet_frame(frame: &str) -> String {
 /// Default connect/write timeout.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Largest UDP syslog payload: 65535 minus the 20-byte IP and 8-byte
+/// UDP headers (RFC 5426 sends one datagram per message).
+const MAX_UDP_FRAME: usize = 65507;
+
 /// Syslog sender for audit messages (blocking; safe to share).
 #[derive(Clone, Debug)]
 pub struct SyslogSender {
@@ -160,6 +171,8 @@ pub struct SyslogSender {
     hostname: String,
     ca_pem: Option<Vec<u8>>,
     server_name: Option<String>,
+    client_cert: Option<(Vec<u8>, Vec<u8>)>,
+    webpki_roots: bool,
     timeout: Duration,
 }
 
@@ -173,6 +186,8 @@ impl SyslogSender {
             hostname: hostname.into(),
             ca_pem: None,
             server_name: None,
+            client_cert: None,
+            webpki_roots: true,
             timeout: DEFAULT_TIMEOUT,
         }
     }
@@ -195,6 +210,24 @@ impl SyslogSender {
     #[must_use]
     pub fn with_server_name(mut self, name: impl Into<String>) -> Self {
         self.server_name = Some(name.into());
+        self
+    }
+
+    /// Client certificate (PEM) plus private key (PEM, PKCS#8/RSA/SEC1)
+    /// for mutual TLS (ATNA node authentication).
+    #[must_use]
+    pub fn with_client_cert(mut self, cert_pem: Vec<u8>, key_pem: Vec<u8>) -> Self {
+        self.client_cert = Some((cert_pem, key_pem));
+        self
+    }
+
+    /// Trust the WebPKI roots for `tls://` servers (default: true).
+    /// Disable for private-CA-only ATNA deployments so a public CA can
+    /// never validate the audit repository; combine with
+    /// [`SyslogSender::with_ca_pem`].
+    #[must_use]
+    pub fn with_webpki_roots(mut self, enabled: bool) -> Self {
+        self.webpki_roots = enabled;
         self
     }
 
@@ -232,6 +265,12 @@ impl SyslogSender {
     }
 
     fn send_udp(&self, frame: &str) -> Result<()> {
+        if frame.len() > MAX_UDP_FRAME {
+            return Err(Error::Transport(format!(
+                "UDP syslog frame ({} bytes) exceeds the {MAX_UDP_FRAME}-byte datagram limit",
+                frame.len()
+            )));
+        }
         // Resolve first and bind a matching family: an IPv4 socket
         // cannot send to an IPv6 server.
         let mut last_err = None;
@@ -244,8 +283,12 @@ impl SyslogSender {
             } else {
                 "0.0.0.0:0"
             };
-            match UdpSocket::bind(bind).and_then(|s| s.send_to(frame.as_bytes(), addr).map(|_| ()))
-            {
+            let attempt = (|| {
+                let sock = UdpSocket::bind(bind)?;
+                sock.set_write_timeout(Some(self.timeout))?;
+                sock.send_to(frame.as_bytes(), addr).map(|_| ())
+            })();
+            match attempt {
                 Ok(()) => return Ok(()),
                 Err(e) => last_err = Some(e),
             }
@@ -294,16 +337,34 @@ impl SyslogSender {
 
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        if self.webpki_roots {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
         if let Some(pem) = &self.ca_pem {
             for cert in rustls_pemfile::certs(&mut BufReader::new(&pem[..])) {
                 let cert = cert.map_err(|e| Error::Tls(e.to_string()))?;
                 roots.add(cert).map_err(|e| Error::Tls(e.to_string()))?;
             }
         }
-        let config = rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth();
+        let config = if let Some((cert_pem, key_pem)) = &self.client_cert {
+            let chain: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(&cert_pem[..]))
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| Error::Tls(format!("client cert: {e}")))?;
+            if chain.is_empty() {
+                return Err(Error::Tls("client cert: no certificates".to_string()));
+            }
+            let key = rustls_pemfile::private_key(&mut BufReader::new(&key_pem[..]))
+                .map_err(|e| Error::Tls(format!("client key: {e}")))?
+                .ok_or_else(|| Error::Tls("client key: no private key".to_string()))?;
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| Error::Tls(e.to_string()))?
+        } else {
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth()
+        };
         let name = self
             .server_name
             .clone()
@@ -328,6 +389,10 @@ impl SyslogSender {
                     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
                     tls.write_all(octet_frame(frame).as_bytes())
                         .map_err(|e| Error::Tls(e.to_string()))?;
+                    tls.flush().map_err(|e| Error::Tls(e.to_string()))?;
+                    // Clean shutdown so the repository sees EOF, not a
+                    // truncated stream (then drop; no reply is read).
+                    tls.conn.send_close_notify();
                     tls.flush().map_err(|e| Error::Tls(e.to_string()))?;
                     return Ok(());
                 }
@@ -374,6 +439,29 @@ mod tests {
         assert_eq!(t.transport, Transport::Udp);
         let t: SyslogTarget = "TLS://arr.example".parse().unwrap();
         assert_eq!((t.transport, t.port), (Transport::Tls, 6514));
+        // Port 0 and userinfo fail at parse time, not late in DNS/IO.
+        assert!("udp://h:0".parse::<SyslogTarget>().is_err());
+        assert!("tls://[::1]:0".parse::<SyslogTarget>().is_err());
+        assert!("udp://user@h:514".parse::<SyslogTarget>().is_err());
+        assert!("tcp://user:pass@h".parse::<SyslogTarget>().is_err());
+    }
+
+    #[test]
+    fn empty_header_fields_become_nilvalue() {
+        let frame = syslog_frame(5, "", "", "", "", "<m/>");
+        assert_eq!(frame, "<109>1 - - - - - - <m/>");
+        let frame = syslog_frame(5, "t", "h", "", "M", "<m/>");
+        assert!(frame.contains(" h - - M - <m/>"), "{frame}");
+    }
+
+    #[test]
+    fn udp_oversize_frame_is_rejected_before_send() {
+        let target: SyslogTarget = "udp://127.0.0.1:514".parse().unwrap();
+        let sender = SyslogSender::new(target, "h");
+        let big = "x".repeat(65508);
+        let err = sender.send_frame(&big).unwrap_err();
+        assert!(matches!(err, Error::Transport(_)), "{err:?}");
+        assert!(err.to_string().contains("65507"), "{err:?}");
     }
 
     #[test]
@@ -479,7 +567,8 @@ mod tests {
                 match tls.read(&mut chunk) {
                     Ok(0) => break,
                     Ok(n) => buf.extend_from_slice(&chunk[..n]),
-                    // The sender drops without close_notify by design.
+                    // close_notify ends the stream cleanly; tolerate a
+                    // truncated close too.
                     Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
                     Err(e) => panic!("tls read: {e}"),
                 }
@@ -586,5 +675,183 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(sender.emit(&msg).is_err());
         assert!(start.elapsed() < Duration::from_secs(10), "emit hung");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_private_ca_only_trusts_no_webpki() {
+        use std::io::Read as _;
+        use std::sync::Arc;
+
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let cert_der = certified.cert.der().to_vec();
+        let key_der = certified.signing_key.serialize_der();
+        let cert_pem = certified.cert.pem().into_bytes();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![rustls::pki_types::CertificateDer::from(cert_der)],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(key_der),
+                    ),
+                )
+                .unwrap();
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+            let mut buf = Vec::new();
+            let _ = tls.read_to_end(&mut buf);
+            String::from_utf8(buf).unwrap()
+        });
+
+        // WebPKI roots disabled: only the pinned private CA validates.
+        let target: SyslogTarget = format!("tls://127.0.0.1:{port}").parse().unwrap();
+        let sender = SyslogSender::new(target, "testhost")
+            .with_ca_pem(cert_pem)
+            .with_webpki_roots(false)
+            .with_timeout(Duration::from_secs(10));
+        let msg = AuditMessage::actor_activity("APP", None, "SRC", true);
+        sender.emit(&msg).unwrap();
+        let got = server.join().unwrap();
+        assert!(got.contains("code=\"110100\""), "{got}");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_mutual_auth_presents_client_cert() {
+        use std::io::Read as _;
+        use std::sync::Arc;
+
+        let server_cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let server_der = server_cert.cert.der().to_vec();
+        let server_key = server_cert.signing_key.serialize_der();
+        let server_pem = server_cert.cert.pem().into_bytes();
+        let client_cert = rcgen::generate_simple_self_signed(vec!["atna-node".into()]).unwrap();
+        let client_der = client_cert.cert.der().to_vec();
+        let client_pem = client_cert.cert.pem().into_bytes();
+        let client_key_pem = client_cert.signing_key.serialize_pem().into_bytes();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let mut client_roots = rustls::RootCertStore::empty();
+            client_roots
+                .add(rustls::pki_types::CertificateDer::from(client_der))
+                .unwrap();
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+                .build()
+                .unwrap();
+            let config = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![rustls::pki_types::CertificateDer::from(server_der)],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(server_key),
+                    ),
+                )
+                .unwrap();
+            let (mut sock, _) = listener.accept().unwrap();
+            sock.set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+            let mut buf = Vec::new();
+            let _ = tls.read_to_end(&mut buf);
+            let peer = conn.peer_certificates().is_some_and(|c| !c.is_empty());
+            (peer, String::from_utf8(buf).unwrap())
+        });
+
+        let target: SyslogTarget = format!("tls://127.0.0.1:{port}").parse().unwrap();
+        let sender = SyslogSender::new(target, "testhost")
+            .with_ca_pem(server_pem)
+            .with_webpki_roots(false)
+            .with_client_cert(client_pem, client_key_pem)
+            .with_timeout(Duration::from_secs(10));
+        let msg = AuditMessage::actor_activity("APP", None, "SRC", true);
+        sender.emit(&msg).unwrap();
+        let (peer_cert_seen, got) = server.join().unwrap();
+        assert!(peer_cert_seen, "server saw no client certificate");
+        assert!(got.contains("code=\"110100\""), "{got}");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_mutual_auth_requires_client_cert() {
+        use std::io::Read as _;
+        use std::sync::Arc;
+
+        let server_cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let server_der = server_cert.cert.der().to_vec();
+        let server_key = server_cert.signing_key.serialize_der();
+        let server_pem = server_cert.cert.pem().into_bytes();
+        let client_cert = rcgen::generate_simple_self_signed(vec!["atna-node".into()]).unwrap();
+        let client_der = client_cert.cert.der().to_vec();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+            let mut client_roots = rustls::RootCertStore::empty();
+            client_roots
+                .add(rustls::pki_types::CertificateDer::from(client_der))
+                .unwrap();
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(client_roots))
+                .build()
+                .unwrap();
+            let config = rustls::ServerConfig::builder()
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(
+                    vec![rustls::pki_types::CertificateDer::from(server_der)],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(server_key),
+                    ),
+                )
+                .unwrap();
+            let Ok((mut sock, _)) = listener.accept() else {
+                return (false, Vec::new());
+            };
+            sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut conn = rustls::ServerConnection::new(Arc::new(config)).unwrap();
+            let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+            let mut buf = Vec::new();
+            let _ = tls.read_to_end(&mut buf);
+            let peer = conn.peer_certificates().is_some_and(|c| !c.is_empty());
+            (peer, buf)
+        });
+
+        // No client certificate against a verifier that demands one.
+        // Syslog is fire-and-forget (no reply is read), so the local
+        // write succeeds; the assertion is server-side: the handshake
+        // is rejected and no payload is delivered.
+        let target: SyslogTarget = format!("tls://127.0.0.1:{port}").parse().unwrap();
+        let sender = SyslogSender::new(target, "h")
+            .with_ca_pem(server_pem)
+            .with_webpki_roots(false)
+            .with_timeout(Duration::from_secs(5));
+        let msg = AuditMessage::actor_activity("APP", None, "SRC", true);
+        let _ = sender.emit(&msg);
+        let (peer_cert_seen, delivered) = server.join().unwrap();
+        assert!(!peer_cert_seen, "server saw a client certificate");
+        assert!(delivered.is_empty(), "server received payload");
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_garbage_client_pem_is_an_error() {
+        let target: SyslogTarget = "tls://127.0.0.1:6514".parse().unwrap();
+        let sender = SyslogSender::new(target, "h")
+            .with_client_cert(b"not pem".to_vec(), b"not pem".to_vec())
+            .with_timeout(Duration::from_secs(5));
+        let msg = AuditMessage::actor_activity("APP", None, "SRC", true);
+        // Parsing fails before any connection attempt.
+        assert!(matches!(sender.emit(&msg), Err(Error::Tls(_))));
     }
 }

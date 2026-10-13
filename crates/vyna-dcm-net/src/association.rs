@@ -2,8 +2,8 @@
 //!
 //! [`Association`] owns a framed byte stream (plain TCP or TLS) plus the
 //! negotiated presentation contexts, and sends/receives [`DimseMessage`]s
-//! with P-DATA-TF fragmentation. SCU operations live in [`crate::service`]
-//! as `impl Association` methods; the SCP dispatch loop is
+//! with P-DATA-TF fragmentation. SCU operations live in the private
+//! `scu` module as `impl Association` methods; the SCP dispatch loop is
 //! [`crate::service::run_scp`].
 
 use std::collections::VecDeque;
@@ -26,6 +26,7 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
 /// Options for requesting (SCU) or accepting (SCP) associations.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct AssociationOptions {
     /// Our max receive PDU length, declared to the peer.
     pub max_pdu_len: u32,
@@ -297,10 +298,8 @@ impl Association {
     /// Next outgoing message ID (wraps `1..=65535`, never 0).
     pub fn next_message_id(&mut self) -> u16 {
         let id = self.next_id;
+        // 65535 wraps to 0, clamped back to 1.
         self.next_id = self.next_id.wrapping_add(1).max(1);
-        if self.next_id == 0 {
-            self.next_id = 1;
-        }
         id
     }
 

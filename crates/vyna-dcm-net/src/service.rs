@@ -38,6 +38,7 @@ pub type UserIdentityAuth = Arc<dyn Fn(&crate::pdu::UserIdentity) -> Option<Vec<
 /// [`AcceptorOptions::user_identity_auth`] (see
 /// [`AcceptorOptions::strict`] for the Called-AE half).
 #[derive(Clone)]
+#[non_exhaustive]
 pub struct AcceptorOptions {
     /// Our AE title.
     pub ae_title: AeTitle,
@@ -451,10 +452,10 @@ impl AeDirectory for HashMapDirectory {
     }
 }
 
-/// How long the SCP waits for a C-CANCEL between pending responses.
-/// Local peers answer in microseconds; the wait also yields to the
-/// executor so the peer task runs between responses.
-const CANCEL_POLL_WAIT: Duration = Duration::from_millis(1);
+/// C-CANCEL poll between pending responses is a non-blocking check:
+/// a 1 ms sleep here would make a 10k-match FIND take 10+ s. The
+/// explicit yield lets the peer task run between responses instead.
+const CANCEL_POLL_WAIT: Duration = Duration::ZERO;
 
 /// Outcome of polling for C-CANCEL during a multi-response operation.
 enum CancelPoll {
@@ -471,6 +472,9 @@ enum CancelPoll {
 /// the peer sends mid-operation (e.g. RELEASE-RQ) is stashed back for
 /// the dispatch loop — never swallowed.
 async fn poll_cancel(assoc: &mut Association, message_id: u16) -> Result<CancelPoll> {
+    // Let the peer task run first so an in-flight C-CANCEL lands in
+    // the socket buffer before the non-blocking check below.
+    tokio::task::yield_now().await;
     match assoc.poll_event(CANCEL_POLL_WAIT).await? {
         None => Ok(CancelPoll::KeepGoing),
         Some(DimseEvent::Released) => {
@@ -527,6 +531,7 @@ pub struct ScpMoveConfig {
 
 /// SCP run options.
 #[derive(Clone, Default)]
+#[non_exhaustive]
 pub struct ScpOptions {
     /// C-MOVE delivery config; without it, C-MOVE fails cleanly.
     pub move_config: Option<ScpMoveConfig>,
@@ -1097,7 +1102,13 @@ async fn handle_get<H: Handlers>(
                     got: m.command.name().to_string(),
                 });
             }
-            DimseEvent::Released => return Err(Error::Released),
+            // Peer released mid-GET: stash for the dispatch loop and
+            // stop quietly like FIND/MOVE — erroring here would make
+            // run_scp send A-ABORT after the release completed.
+            DimseEvent::Released => {
+                assoc.stash(DimseEvent::Released);
+                return Ok(());
+            }
         };
         if status::is_success(store_status) {
             done_ok = done_ok.saturating_add(1);

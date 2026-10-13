@@ -13,3 +13,6 @@ categories = ["multimedia"]
 [dependencies]
 vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.5" }
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

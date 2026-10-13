@@ -187,6 +187,16 @@ authentication unless the embedding application installs the
 
 ## 4. Communication profiles
 
+### 4.0 Peer interop testing
+
+- Association interop is covered by loopback self-tests (every
+  SCU tool against its SCP twin) plus third-party-encoded
+  fixtures (DCMTK/GDCM writers; see the `tests/data` READMEs).
+- A command-line matrix against DCMTK (`echoscu`, `storescu`,
+  `findscu`, `movescu`) is planned but not yet run: no DCMTK
+  binaries are installed in CI, so no cross-vendor results are
+  claimed here.
+
 ### 4.1 TCP/IP and DICOM TLS
 
 - DIMSE runs over TCP/IP. DICOM TLS (PS3.15) is compiled in by
@@ -246,6 +256,29 @@ authentication unless the embedding application installs the
 | Max PDU | 256 KiB | `--max-pdu` |
 | SCU read timeout | 30 s | `--timeout-secs` |
 | SCP read timeout | 300 s | `--timeout-secs` |
+
+## 8. Protocol limits (DoS bounds)
+
+Hard caps from the sources (requests past them fail or evict;
+nothing truncates silently except where noted):
+
+- Query/retrieve: at most 10,000 C-FIND matches per query
+  (past that: out-of-resources, no partial list), 10,000
+  match values per compiled identifier, directory scans 64
+  levels deep.
+- File decode: dataset nesting 64 levels, deflated
+  inflation 512 MiB, pixel payloads 1 GiB, encoded
+  fragments 64 KiB (PS3.5 §8.2); DICOM JSON/XML nesting
+  64/64 levels.
+- DICOMweb client: response bodies 1 GiB.
+- DICOMweb server: request bodies 1 GiB, 1,024
+  concurrent connections, 300 s per connection;
+  `multipart/related` bodies 100,000 parts with 100
+  headers each. `MemoryStore` evicts oldest-first past
+  10,000 bulk blobs / 1 GiB and 10,000 instances /
+  1 GiB.
+- ATNA syslog: UDP frames 65,507 bytes (larger audits need TCP
+  or TLS); 10 s connect/write timeout.
 
 ## Annex A — SOP Classes
 

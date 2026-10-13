@@ -54,17 +54,22 @@ fn deidentified_ecg_validates_with_identical_samples() {
     let post = validate(&deid, &class, None).unwrap();
     assert!(!post.has_errors(), "de-identified must validate: {post:?}");
 
-    assert_eq!(deid.string(tags::PATIENT_ID), Some("ANONYMIZED"));
+    // E.1 `Z`: zeroed (kept but emptied), not dummied.
+    assert_eq!(deid.string(tags::PATIENT_ID), None);
+    assert!(deid.contains(tags::PATIENT_ID));
     assert_eq!(deid.string(tags::ACCESSION_NUMBER), None);
-    assert_eq!(deid.string(tags::PATIENT_BIRTH_DATE), None);
+    // E.1 `Z/D` with an offset configured: shifted, not emptied.
+    assert_eq!(deid.string(tags::PATIENT_BIRTH_DATE), Some("19800403"));
     assert_eq!(deid.string(tags::CONTENT_DATE), Some("20261110"));
     assert_eq!(deid.string(tags::STUDY_DATE), Some("20261110"));
     assert_eq!(
         deid.string(tags::ACQUISITION_DATE_TIME),
         Some("20261110120000")
     );
-    assert_eq!(deid.string(tags::CONTENT_TIME), Some("120000")); // TM kept
-    assert_eq!(deid.string(tags::STUDY_TIME), Some("120000")); // TM kept
+    // TM is never shifted: Type 1 dummied, Type 2 zeroed.
+    assert_eq!(deid.string(tags::CONTENT_TIME), Some("000000"));
+    assert_eq!(deid.string(tags::STUDY_TIME), None);
+    assert!(deid.contains(tags::STUDY_TIME));
     assert!(!deid.contains(tags::INSTITUTION_NAME));
     assert_eq!(deid.string(tags::SERIES_DESCRIPTION), None);
     assert_eq!(deid.string(tags::STUDY_ID), None);

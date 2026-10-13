@@ -4,7 +4,8 @@
 //! carries the dataset's transfer syntax (NEMA PS3.10).
 
 use vyna_dcm_core::{
-    DataSet, TransferSyntax, VYNA_IMPLEMENTATION_CLASS_UID, VYNA_IMPLEMENTATION_VERSION_NAME, tags,
+    DataSet, TransferSyntax, VYNA_IMPLEMENTATION_CLASS_UID, VYNA_IMPLEMENTATION_VERSION_NAME, Vr,
+    tags,
 };
 
 use crate::{Error, Result, decode_dataset, decode_up_to, encode_dataset};
@@ -132,6 +133,25 @@ impl FileMeta {
 
 /// Read a Part-10 file into `(meta, dataset)`.
 pub fn read_part10(bytes: &[u8]) -> Result<(FileMeta, DataSet)> {
+    let (meta, body, meta_len) = read_meta(bytes)?;
+    let ts = meta.transfer_syntax()?;
+    let dataset = decode_dataset(&body[meta_len..], ts)?;
+    Ok((meta, dataset))
+}
+
+/// Read file meta plus the dataset header, stopping before Pixel Data
+/// (which — and anything after it — is never decoded): for indexes and
+/// tools that only need header keys. Standard query keys all sort
+/// before group `0x7FE0`, so nothing a header scan needs is lost.
+pub fn read_part10_header(bytes: &[u8]) -> Result<(FileMeta, DataSet)> {
+    let (meta, body, meta_len) = read_meta(bytes)?;
+    let ts = meta.transfer_syntax()?;
+    let (dataset, _) = decode_up_to(&body[meta_len..], ts, Some(tags::PIXEL_DATA))?;
+    Ok((meta, dataset))
+}
+
+/// Prefix check plus file-meta walk shared by both readers.
+fn read_meta(bytes: &[u8]) -> Result<(FileMeta, &[u8], usize)> {
     if bytes.len() < PREFIX_LEN {
         return Err(Error::NotPart10("file shorter than 132-byte prefix"));
     }
@@ -143,9 +163,7 @@ pub fn read_part10(bytes: &[u8]) -> Result<(FileMeta, DataSet)> {
     let (meta_ds, meta_len) =
         decode_up_to(body, TransferSyntax::ExplicitVrLittleEndian, Some(stop))?;
     let meta = FileMeta::from_dataset(&meta_ds)?;
-    let ts = meta.transfer_syntax()?;
-    let dataset = decode_dataset(&body[meta_len..], ts)?;
-    Ok((meta, dataset))
+    Ok((meta, body, meta_len))
 }
 
 /// Encode the file-meta section: group length element + meta elements.
@@ -153,7 +171,14 @@ fn encode_meta_section(meta: &FileMeta) -> Result<Vec<u8>> {
     let meta_ds = meta.to_dataset();
     // Encode once to measure, then prepend the group length.
     let mut meta_body = encode_dataset(&meta_ds, TransferSyntax::ExplicitVrLittleEndian)?;
-    let group_len = meta_body.len() as u32;
+    let group_len = u32::try_from(meta_body.len()).map_err(|_| Error::Unencodable {
+        tag: Tag::new(0x0002, 0x0000),
+        vr: Vr::Ul,
+        message: format!(
+            "file meta ({} bytes) exceeds the u32 group length",
+            meta_body.len()
+        ),
+    })?;
     let mut meta_full = Vec::with_capacity(meta_body.len() + 12);
     meta_full.extend_from_slice(&[0x02, 0x00, 0x00, 0x00]); // (0002,0000)
     meta_full.extend_from_slice(b"UL");

@@ -101,7 +101,7 @@ use vyna_dcm::TransferSyntax;
 
 let mut assoc = Association::request(
     &AssociationOptions::default(),
-    &AeTitle::new("VYNA_SCU").unwrap(),
+    &AeTitle::new("DEMO_SCU").unwrap(),
     &AeTitle::new("PACS").unwrap(),
     "127.0.0.1:11112",
     propose(
@@ -179,7 +179,7 @@ impl Handlers for StoreScp {
 
 let listener = TcpListener::bind("127.0.0.1:11112").await.unwrap();
 let acceptor = AcceptorOptions {
-    ae_title: AeTitle::new("VYNA_SCP").unwrap(),
+    ae_title: AeTitle::new("DEMO_SCP").unwrap(),
     ..Default::default()
 };
 let handlers = Arc::new(StoreScp);

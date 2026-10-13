@@ -17,14 +17,17 @@ clippy:
 
 test:
   stage: test
-  script: cargo test --workspace
+  script: cargo test --workspace --all-targets
 
 # Every feature combination must build (guards feature-gate drift
 # between the bins and the optional net/web/ecg dependencies).
 features:
   stage: test
   script:
-    - cargo check -p vyna-dcm --no-default-features
-    - cargo check -p vyna-dcm --no-default-features --features cli
-    - cargo check -p vyna-dcm --no-default-features --features cli,net
-    - cargo check -p vyna-dcm --no-default-features --features cli,web
+    - cargo check -p vyna-dcm --no-default-features --all-targets
+    - cargo check -p vyna-dcm --no-default-features --features cli --all-targets
+    - cargo check -p vyna-dcm --no-default-features --features cli,net --all-targets
+    - cargo check -p vyna-dcm --no-default-features --features cli,web --all-targets
+    - cargo check -p vyna-dcm-net --no-default-features --all-targets
+    - cargo check -p vyna-dcm-web --no-default-features --all-targets
+    - cargo check -p vyna-dcm-atna --no-default-features --all-targets

@@ -1,6 +1,8 @@
 //! Loopback tests: real HTTP between `hyper_server` and `DicomWebClient`
 //! over a store seeded from `tests/data`.
 
+#![cfg(feature = "server")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use vyna_dcm_core::tags;

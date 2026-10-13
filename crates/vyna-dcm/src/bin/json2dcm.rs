@@ -1,7 +1,7 @@
 //! `json2dcm`: convert DICOM JSON back to a Part-10 file.
 
-#[path = "common.rs"]
-mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 use std::path::PathBuf;
 
@@ -63,6 +63,6 @@ fn run(args: &Args) -> Result<(), String> {
         .to_string();
     let meta = FileMeta::new(class, inst, ts);
     let bytes = write_part10(&meta, &ds).map_err(|e| e.to_string())?;
-    common::write_atomic(&args.output, &bytes).map_err(|e| e.to_string())?;
+    iocommon::write_atomic(&args.output, &bytes).map_err(|e| e.to_string())?;
     Ok(())
 }

@@ -84,6 +84,10 @@ impl PixelCodec for Jpeg2000Codec {
         let mut image = codec
             .read_header(raw)
             .ok_or_else(|| PixelCodecError::Codec("jpeg 2000 header unreadable".into()))?;
+        // Pre-validate the SIZ grid before decode(): a tiny frame
+        // claiming huge dimensions must fail fast instead of
+        // triggering SIZ-sized tile allocations.
+        check_component_grid(&image, rows, columns, samples_per_pixel)?;
         if codec.decode(raw, &mut image) == 0 {
             return Err(PixelCodecError::Codec("jpeg 2000 decode failed".into()));
         }
@@ -278,14 +282,17 @@ fn build_image(
     Ok(image)
 }
 
-/// Validate a decoded image against the dataset geometry and pack it.
-fn pack_image(
+/// Validate the SIZ component grid against the dataset geometry.
+///
+/// Runs twice: right after `read_header` (so a lying SIZ fails before
+/// any tile allocation) and again in [`pack_image`] (defense in depth
+/// after decode). Reads header fields only — never component data.
+fn check_component_grid(
     image: &opj_image,
     rows: u16,
     columns: u16,
     samples: u16,
-    bits: u16,
-) -> std::result::Result<Vec<u8>, PixelCodecError> {
+) -> std::result::Result<(), PixelCodecError> {
     let comps = image
         .comps()
         .ok_or_else(|| PixelCodecError::Codec("jpeg 2000 image has no components".into()))?;
@@ -295,8 +302,6 @@ fn pack_image(
             comps.len()
         )));
     }
-    let count = rows as usize * columns as usize;
-    let mut planes: Vec<Vec<u16>> = Vec::with_capacity(comps.len());
     for comp in comps {
         if comp.w != columns as u32 || comp.h != rows as u32 {
             return Err(PixelCodecError::Geometry(format!(
@@ -315,6 +320,31 @@ fn pack_image(
                 "subsampled jpeg 2000 components are not supported".into(),
             ));
         }
+    }
+    Ok(())
+}
+
+/// Validate a decoded image against the dataset geometry and pack it.
+fn pack_image(
+    image: &opj_image,
+    rows: u16,
+    columns: u16,
+    samples: u16,
+    bits: u16,
+) -> std::result::Result<Vec<u8>, PixelCodecError> {
+    check_component_grid(image, rows, columns, samples)?;
+    let comps = image
+        .comps()
+        .ok_or_else(|| PixelCodecError::Codec("jpeg 2000 image has no components".into()))?;
+    // Checked: the u16 product can overflow 32-bit usize (and would
+    // panic in debug builds).
+    let count = (rows as usize)
+        .checked_mul(columns as usize)
+        .ok_or_else(|| {
+            PixelCodecError::Geometry(format!("geometry {rows}x{columns} overflows address space"))
+        })?;
+    let mut planes: Vec<Vec<u16>> = Vec::with_capacity(comps.len());
+    for comp in comps {
         let data = comp
             .data()
             .ok_or_else(|| PixelCodecError::Codec("jpeg 2000 component has no data".into()))?;
@@ -330,7 +360,15 @@ fn pack_image(
     if samples == 1 {
         return samples_to_packed(&planes[0], bits);
     }
-    let mut out = Vec::with_capacity(count * samples as usize * bits.div_ceil(8) as usize);
+    let capacity = count
+        .checked_mul(samples as usize)
+        .and_then(|n| n.checked_mul(bits.div_ceil(8) as usize))
+        .ok_or_else(|| {
+            PixelCodecError::Geometry(format!(
+                "geometry {rows}x{columns}x{samples} overflows address space"
+            ))
+        })?;
+    let mut out = Vec::with_capacity(capacity);
     for i in 0..count {
         for plane in &planes {
             push_sample(&mut out, plane[i], bits);
@@ -396,7 +434,13 @@ fn signed_fits(value: i32, bits: u16) -> bool {
 }
 
 fn samples_to_packed(samples: &[u16], bits: u16) -> std::result::Result<Vec<u8>, PixelCodecError> {
-    let mut out = Vec::with_capacity(samples.len() * bits.div_ceil(8) as usize);
+    let capacity = samples
+        .len()
+        .checked_mul(bits.div_ceil(8) as usize)
+        .ok_or_else(|| {
+            PixelCodecError::Geometry(format!("{} samples overflows address space", samples.len()))
+        })?;
+    let mut out = Vec::with_capacity(capacity);
     for &s in samples {
         push_sample(&mut out, s, bits);
     }
@@ -417,6 +461,9 @@ struct MemState {
     data: Vec<u8>,
     out: Rc<RefCell<Vec<u8>>>,
     pos: usize,
+    /// Reader seeks clamp to `data.len()`; the writer (empty `data`)
+    /// must not be clamped, so the callbacks need the direction.
+    writable: bool,
 }
 
 /// RAII handle over a raw fork memory stream.
@@ -437,6 +484,7 @@ impl MemStream {
             data,
             out: Rc::new(RefCell::new(Vec::new())),
             pos: 0,
+            writable: false,
         });
         // SAFETY: `opj_stream_default_create` returns an owned boxed `Stream`
         // (or null on allocation failure); the callbacks only dereference
@@ -462,6 +510,7 @@ impl MemStream {
             data: Vec::new(),
             out,
             pos: 0,
+            writable: true,
         });
         // SAFETY: as in `reader`.
         unsafe {
@@ -535,9 +584,17 @@ unsafe extern "C" fn mem_write(buf: *mut c_void, nb: OPJ_SIZE_T, data: *mut c_vo
     let src = unsafe { std::slice::from_raw_parts(buf as *const u8, nb) };
     let mut out = state.out.borrow_mut();
     if state.pos > out.len() {
+        // The encoder writes sequentially and backpatches lengths; a
+        // forward jump past EOF would zero-fill an unbounded gap, so a
+        // wild seek fails the encode instead of ballooning memory.
+        if state.pos - out.len() > 1024 * 1024 {
+            return OPJ_SIZE_T::MAX;
+        }
         out.resize(state.pos, 0);
     }
-    let end = state.pos + nb;
+    let Some(end) = state.pos.checked_add(nb) else {
+        return OPJ_SIZE_T::MAX;
+    };
     if end > out.len() {
         out.resize(end, 0);
     }
@@ -552,8 +609,15 @@ unsafe extern "C" fn mem_skip(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_OFF_T {
     }
     let state = unsafe { &mut *data.cast::<MemState>() };
     if nb >= 0 {
-        state.pos = state.pos.saturating_add(nb as usize);
+        // `try_from`: a bare `as usize` truncates past 4 GiB on 32-bit.
+        let step = usize::try_from(nb).unwrap_or(usize::MAX);
+        state.pos = state.pos.saturating_add(step);
+        if !state.writable {
+            state.pos = state.pos.min(state.data.len());
+        }
     }
+    // `pos` never exceeds a `Vec` length (`<= isize::MAX`), so the
+    // narrowing to `i64` is exact on every platform.
     state.pos as OPJ_OFF_T
 }
 
@@ -561,8 +625,17 @@ unsafe extern "C" fn mem_seek(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_BOOL {
     if data.is_null() || nb < 0 {
         return 0;
     }
+    let Ok(off) = usize::try_from(nb) else {
+        return 0;
+    };
     let state = unsafe { &mut *data.cast::<MemState>() };
-    state.pos = nb as usize;
+    state.pos = if state.writable {
+        off
+    } else {
+        // Reads past EOF already fail in `mem_read`; clamping keeps
+        // `pos` a valid index instead of a wrapped/truncated one.
+        off.min(state.data.len())
+    };
     1
 }
 
@@ -570,6 +643,52 @@ unsafe extern "C" fn mem_seek(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_BOOL {
 mod tests {
     use super::*;
     use crate::jpeg::mean_abs_diff;
+
+    #[test]
+    fn stream_callbacks_clamp_and_cap() {
+        // Reader: seeks/skips past EOF clamp to the input length.
+        let mut st = MemState {
+            data: vec![0u8; 16],
+            out: Rc::new(RefCell::new(Vec::new())),
+            pos: 0,
+            writable: false,
+        };
+        let p = (&mut st as *mut MemState).cast::<c_void>();
+        unsafe {
+            assert_eq!(mem_seek(100, p), 1);
+            assert_eq!(st.pos, 16);
+            st.pos = 0;
+            assert_eq!(mem_skip(100, p), 16);
+            assert_eq!(st.pos, 16);
+            assert_eq!(mem_seek(-1, p), 0);
+            assert_eq!(st.pos, 16);
+            // Negative skips leave the position alone.
+            assert_eq!(mem_skip(-5, p), 16);
+        }
+        // Writer: a wild forward jump fails the write instead of
+        // zero-filling gigabytes; a small gap still works.
+        let out = Rc::new(RefCell::new(Vec::new()));
+        let mut wst = MemState {
+            data: Vec::new(),
+            out: out.clone(),
+            pos: 0,
+            writable: true,
+        };
+        let wp = (&mut wst as *mut MemState).cast::<c_void>();
+        let buf = [7u8; 4];
+        unsafe {
+            assert_eq!(mem_seek(i64::MAX, wp), 1);
+            assert_eq!(
+                mem_write(buf.as_ptr() as *mut c_void, 4, wp),
+                OPJ_SIZE_T::MAX
+            );
+            assert!(out.borrow().is_empty());
+            wst.pos = 0;
+            assert_eq!(mem_seek(8, wp), 1);
+            assert_eq!(mem_write(buf.as_ptr() as *mut c_void, 4, wp), 4);
+            assert_eq!(out.borrow().len(), 12);
+        }
+    }
 
     fn pattern(w: u16, h: u16, samples: u16, bits: u16) -> Vec<u8> {
         let mut out = Vec::new();
@@ -770,6 +889,42 @@ mod tests {
             .decode_frame(TransferSyntax::Jpeg2000Part2, &garbage, 8, 8, 1, 8)
             .unwrap_err();
         assert!(matches!(err, PixelCodecError::Unsupported(_)), "{err:?}");
+    }
+
+    #[test]
+    fn lying_siz_fails_before_tile_alloc() {
+        let codec = Jpeg2000Codec::default();
+        let raw = pattern(4, 4, 1, 8);
+        let frags = codec
+            .encode_frame(TransferSyntax::Jpeg2000Lossless, &raw, 4, 4, 1, 8)
+            .unwrap();
+        let mut lying = frags.joined();
+        // SOC + SIZ, then Lsiz/Rsiz; Xsiz/Ysiz are BE u32 at [8..16].
+        assert_eq!(&lying[..4], &[0xFF, 0x4F, 0xFF, 0x51]);
+        let mut decode_patched = |w: u32, h: u32| {
+            lying[8..12].copy_from_slice(&w.to_be_bytes());
+            lying[12..16].copy_from_slice(&h.to_be_bytes());
+            let cut = FragmentSequence {
+                basic_offset_table: vec![],
+                fragments: vec![lying.clone()],
+            };
+            codec.decode_frame(TransferSyntax::Jpeg2000Lossless, &cut, 4, 4, 1, 8)
+        };
+        // A sane-but-wrong SIZ parses, then the grid pre-check rejects
+        // it before decode() can act on the claimed grid.
+        let err = decode_patched(8, 8).unwrap_err();
+        assert!(matches!(err, PixelCodecError::Geometry(_)), "{err:?}");
+        // A 10^10-sample SIZ claim: the port's own header validation
+        // rejects it during read_header, so no tile alloc is attempted
+        // at any layer (either layer failing fast is acceptable).
+        let err = decode_patched(100_000, 100_000).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                PixelCodecError::Geometry(_) | PixelCodecError::Codec(_)
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

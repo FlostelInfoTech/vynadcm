@@ -2,6 +2,8 @@
 
 #[path = "common.rs"]
 mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -139,7 +141,7 @@ impl Handlers for StoreScp {
             Ok(bytes) => {
                 let safe = safe_instance_filename(&inst);
                 let path = self.directory.join(format!("{safe}.dcm"));
-                match common::write_atomic(&path, &bytes) {
+                match iocommon::write_atomic(&path, &bytes) {
                     Ok(()) => {
                         // Patient names are PHI: only log them with --verbose.
                         if self.verbose {
@@ -231,8 +233,7 @@ async fn main() -> Result<()> {
     let tls = args.listen.tls_acceptor()?;
 
     let mut acceptor = AcceptorOptions::default();
-    acceptor.ae_title =
-        AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?;
+    acceptor.ae_title = AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?;
     acceptor.association = args.listen.assoc_options();
     acceptor.check_called_ae = args.listen.strict_ae;
     let exec = args

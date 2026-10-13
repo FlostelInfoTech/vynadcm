@@ -19,6 +19,7 @@ pub const SOP_GENERAL_ECG: &str = "1.2.840.10008.5.1.4.1.1.9.1.2";
 
 /// Identifying metadata for a complete ECG SOP instance.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EcgInstanceMeta {
     /// SOP Class UID (12-lead or General ECG).
     pub sop_class_uid: String,
@@ -146,6 +147,20 @@ impl EcgInstanceMeta {
     }
 }
 
+/// True when any recording text (lead labels/units/codes, multiplex
+/// label, amplifier type) needs non-ASCII encoding. Checked alongside
+/// the header scan so a fully ASCII header with non-ASCII lead text
+/// still declares UTF-8.
+fn recording_needs_utf8(rec: &EcgRecording) -> bool {
+    rec.multiplex_label.as_ref().is_some_and(|s| !s.is_ascii())
+        || rec.amplifier_type.as_ref().is_some_and(|s| !s.is_ascii())
+        || rec.leads.iter().any(|l| {
+            !l.label.is_ascii()
+                || !l.units.is_ascii()
+                || l.mdc_code.as_ref().is_some_and(|s| !s.is_ascii())
+        })
+}
+
 /// Convert a recording into one Waveform Sequence item.
 pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
     if !matches!(rec.bits_allocated, 8 | 16) {
@@ -171,6 +186,14 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
         return Err(Error::Waveform(format!(
             "bad sampling frequency {}",
             rec.sampling_frequency_hz
+        )));
+    }
+    // Waveform Originality is a closed enumerated pair (C.10.9.1.4):
+    // anything else would emit a non-conformant item.
+    if !matches!(rec.originality.as_str(), "ORIGINAL" | "DERIVED") {
+        return Err(Error::InvalidMeta(format!(
+            "Waveform Originality {:?} (want ORIGINAL or DERIVED)",
+            rec.originality
         )));
     }
     // Format a DS field, refusing non-finite floats (NaN/inf are not
@@ -259,7 +282,13 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
         _ => unreachable!(),
     };
     item.put_text(tags::WAVEFORM_SAMPLE_INTERPRETATION, Vr::Cs, interp);
-    item.put_bytes(tags::WAVEFORM_DATA, Vr::Ow, interleave(rec)?);
+    // PS3.5 §8.3: 8-bit samples ride OB, 16-bit samples OW.
+    let data_vr = if rec.bits_allocated == 8 {
+        Vr::Ob
+    } else {
+        Vr::Ow
+    };
+    item.put_bytes(tags::WAVEFORM_DATA, data_vr, interleave(rec)?);
     if let Some(f) = rec.powerline_hz {
         item.put_text(
             tags::POWERLINE_FREQUENCY,
@@ -302,7 +331,7 @@ fn units_item(units: &str) -> DataSet {
     item
 }
 
-/// Format an `f64` as a `DS` value (≤ 16 chars, no exponent);
+/// Format an `f64` as a `DS` value (≤ 16 chars);
 /// `None` for non-finite inputs (never written: NaN/inf are not DS).
 fn ds_format(v: f64) -> Option<String> {
     if !v.is_finite() {
@@ -313,9 +342,10 @@ fn ds_format(v: f64) -> Option<String> {
     }
     // Full precision first, then fewer decimals until the 16-char DS
     // limit holds. A blind truncate would corrupt the value (or leave
-    // a trailing dot); absurd magnitudes fall back to scientific
-    // notation, which DS permits.
-    for prec in (0..=9).rev() {
+    // a trailing dot). A fixed-point spelling that collapses a nonzero
+    // value to zero is skipped (not returned), so tiny values fall
+    // through to scientific notation, which DS permits.
+    for prec in (0..=15).rev() {
         let mut s = format!("{v:.prec$}");
         if s.contains('.') {
             while s.ends_with('0') {
@@ -325,7 +355,7 @@ fn ds_format(v: f64) -> Option<String> {
                 s.pop();
             }
         }
-        if s.len() <= 16 {
+        if s.len() <= 16 && s.parse::<f64>().is_ok_and(|back| back != 0.0) {
             return Some(s);
         }
     }
@@ -414,7 +444,11 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
     // u64 math: channels/samples come from the wire and their product
     // overflows 32-bit usize.
     let want = channels as u64 * samples as u64 * bytes_per_sample as u64;
-    if raw.len() as u64 != want {
+    // Accept one trailing pad byte: odd-sized 8-bit waveforms carry a
+    // wire pad that must not fail the round trip (its value is
+    // unchecked — encoders must write 0x00 — and it is never indexed).
+    let len = raw.len() as u64;
+    if len != want && len != want + 1 {
         return Err(Error::Waveform(format!(
             "waveform data {} bytes, want {want}",
             raw.len(),
@@ -516,9 +550,50 @@ fn waveform_bytes(item: &DataSet) -> Result<Vec<u8>> {
 /// datetimes are [`Error::Missing`], never fabricated) and every
 /// Type 2 attribute is at least present, so the result validates
 /// against the ECG IODs.
+///
+/// Validated here: UID syntax for all four UID fields, Patient Sex
+/// (`M`/`F`/`O` when non-empty), Waveform Originality (in the item
+/// builder), and the per-SOP-class channel caps (12-lead ≤ 13,
+/// General ECG ≤ 12). Other free-text fields (dates, names, labels,
+/// descriptions) are the caller's responsibility and are written
+/// verbatim: garbage in, non-conformant out.
 pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Result<DataSet> {
     let mut meta = meta.clone();
     meta.fill_uids();
+    for (what, uid) in [
+        ("SOP Class UID", &meta.sop_class_uid),
+        ("SOP Instance UID", &meta.sop_instance_uid),
+        ("Study Instance UID", &meta.study_uid),
+        ("Series Instance UID", &meta.series_uid),
+    ] {
+        if !vyna_dcm_core::is_valid_uid(uid) {
+            return Err(Error::InvalidMeta(format!("bad {what} {uid:?}")));
+        }
+    }
+    if let Some(sex) = &meta.sex
+        && !sex.is_empty()
+        && !matches!(sex.as_str(), "M" | "F" | "O")
+    {
+        return Err(Error::InvalidMeta(format!(
+            "Patient Sex {sex:?} (want M, F, or O)"
+        )));
+    }
+    // Per-SOP-class channel caps (A.34.3.4.4 / A.34.5.4.3); other
+    // waveform SOP classes pass through uncapped.
+    let cap = match meta.sop_class_uid.as_str() {
+        SOP_12_LEAD_ECG => Some(13),
+        SOP_GENERAL_ECG => Some(12),
+        _ => None,
+    };
+    if let Some(max) = cap
+        && rec.leads.len() > max
+    {
+        return Err(Error::InvalidMeta(format!(
+            "{} leads exceed the {max}-channel cap for {}",
+            rec.leads.len(),
+            meta.sop_class_uid
+        )));
+    }
     // Type 1 datetimes: required with real values.
     for (tag, v) in [
         (tags::CONTENT_DATE, &meta.content_date),
@@ -530,7 +605,7 @@ pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Resul
         }
     }
     let mut ds = DataSet::new();
-    if meta.needs_utf8() {
+    if meta.needs_utf8() || recording_needs_utf8(rec) {
         ds.put_text(tags::SPECIFIC_CHARACTER_SET, Vr::Cs, "ISO_IR 192");
     }
     ds.put_uid(tags::SOP_CLASS_UID, meta.sop_class_uid.clone());
@@ -829,5 +904,146 @@ mod tests {
                 "{bad} must not parse"
             );
         }
+    }
+
+    #[test]
+    fn ds_format_tiny_values_go_scientific() {
+        // 1e-10 collapses to "0" in fixed point: must fall through to
+        // scientific, never return a zero that loses the value.
+        let s = ds_format(1e-10).unwrap();
+        assert_ne!(s, "0");
+        assert!((s.parse::<f64>().unwrap() - 1e-10).abs() < 1e-16, "{s}");
+        assert!(s.len() <= 16, "{s}");
+        // Values that fit in fixed point stay there.
+        assert_eq!(ds_format(1e-7).as_deref(), Some("0.0000001"));
+        // Sub-unit precision uses the full 16-char budget (past the
+        // old 9-decimal cap).
+        let s = ds_format(0.123456789012345).unwrap();
+        assert!(s.len() <= 16, "{s}");
+        assert_ne!(s, "0.123456789", "precision capped at 9 decimals: {s}");
+        assert!((s.parse::<f64>().unwrap() - 0.123456789012345).abs() < 1e-12);
+        // Negative tiny values behave the same.
+        let s = ds_format(-2.5e-12).unwrap();
+        assert!(s.parse::<f64>().unwrap() < 0.0);
+        assert!((s.parse::<f64>().unwrap() - -2.5e-12).abs() < 1e-18, "{s}");
+    }
+
+    fn dated_meta() -> EcgInstanceMeta {
+        let mut meta = EcgInstanceMeta::new(PersonName::parse("Doe^Jane"), "E123");
+        meta.content_date = Some("20261011".into());
+        meta.content_time = Some("120000".into());
+        meta.acquisition_datetime = Some("20261011120000".into());
+        meta
+    }
+
+    #[test]
+    fn eight_bit_waveform_uses_ob_and_survives_part10() {
+        // Odd total bytes (1 lead x 3 samples): the wire pad byte must
+        // not fail the decode.
+        let leads = vec![EcgLead::new("II", vec![0, 100, -100], 0.001)];
+        let mut rec = EcgRecording::new(leads, 250.0).unwrap();
+        rec.sample_interpretation = SampleInterpretation::Signed;
+        rec.bits_allocated = 8;
+        let item = recording_to_waveform_item(&rec).unwrap();
+        assert_eq!(
+            item.get(tags::WAVEFORM_DATA).unwrap().vr,
+            vyna_dcm_core::Vr::Ob
+        );
+        let mut meta = dated_meta();
+        meta.sop_class_uid = SOP_GENERAL_ECG.to_string();
+        let ds = recording_to_dataset(&rec, &meta).unwrap();
+        let ts = vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian;
+        let bytes =
+            vyna_dcm_codec::write_part10(&file_meta_for_dataset(&ds, ts).unwrap(), &ds).unwrap();
+        let (_, back) = vyna_dcm_codec::read_part10(&bytes).unwrap();
+        let wave = &back.sequence(tags::WAVEFORM_SEQUENCE).unwrap()[0];
+        let rec2 = recording_from_waveform_item(wave).unwrap();
+        assert_eq!(rec2.bits_allocated, 8);
+        assert_eq!(rec2.leads[0].samples, vec![0, 100, -100]);
+    }
+
+    #[test]
+    fn general_ecg_validates() {
+        let leads: Vec<EcgLead> = ["I", "II", "V1", "V2"]
+            .iter()
+            .map(|l| EcgLead::new(*l, vec![0, 10, -10, 5], 0.001))
+            .collect();
+        let rec = EcgRecording::new(leads, 500.0).unwrap();
+        let mut meta = dated_meta();
+        meta.sop_class_uid = SOP_GENERAL_ECG.to_string();
+        let ds = recording_to_dataset(&rec, &meta).unwrap();
+        let report = vyna_dcm_iod::validate(&ds, SOP_GENERAL_ECG, None).unwrap();
+        assert!(!report.has_errors(), "{report:?}");
+    }
+
+    #[test]
+    fn non_ascii_recording_declares_utf8() {
+        let mut rec = twelve_lead();
+        rec.leads[0].label = "II-\u{5BFC}\u{8054}".to_string();
+        rec.leads[0].units = "mV-\u{6BEB}\u{4F0F}".to_string();
+        let meta = dated_meta();
+        let ds = recording_to_dataset(&rec, &meta).unwrap();
+        assert_eq!(ds.string(tags::SPECIFIC_CHARACTER_SET), Some("ISO_IR 192"));
+        let report = vyna_dcm_iod::validate(&ds, SOP_12_LEAD_ECG, None).unwrap();
+        assert!(!report.has_errors(), "{report:?}");
+        // ASCII-only recording: no charset stamped.
+        let ds = recording_to_dataset(&twelve_lead(), &meta).unwrap();
+        assert!(ds.get(tags::SPECIFIC_CHARACTER_SET).is_none());
+    }
+
+    #[test]
+    fn metadata_validation_rejects_garbage() {
+        let rec = twelve_lead();
+        // Bad UID syntax.
+        let mut meta = dated_meta();
+        meta.sop_instance_uid = "not a uid!".into();
+        assert!(matches!(
+            recording_to_dataset(&rec, &meta),
+            Err(Error::InvalidMeta(_))
+        ));
+        // Bad Patient Sex.
+        let mut meta = dated_meta();
+        meta.sex = Some("X".into());
+        assert!(matches!(
+            recording_to_dataset(&rec, &meta),
+            Err(Error::InvalidMeta(_))
+        ));
+        // Empty sex (Type 2 unknown) still passes.
+        let mut meta = dated_meta();
+        meta.sex = Some(String::new());
+        assert!(recording_to_dataset(&rec, &meta).is_ok());
+        // Bad originality.
+        let mut rec = twelve_lead();
+        rec.originality = "MAYBE".into();
+        assert!(matches!(
+            recording_to_waveform_item(&rec),
+            Err(Error::InvalidMeta(_))
+        ));
+        // Channel caps: 12-lead <= 13, General <= 12.
+        let many: Vec<EcgLead> = (0..14)
+            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
+            .collect();
+        let rec14 = EcgRecording::new(many, 500.0).unwrap();
+        let meta12 = dated_meta();
+        assert!(recording_to_dataset(&rec14, &meta12).is_err());
+        let mut meta_gen = dated_meta();
+        meta_gen.sop_class_uid = SOP_GENERAL_ECG.to_string();
+        assert!(recording_to_dataset(&rec14, &meta_gen).is_err());
+        // Boundaries hold: 13 on 12-lead, 12 on General.
+        let thirteen: Vec<EcgLead> = (0..13)
+            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
+            .collect();
+        let rec13 = EcgRecording::new(thirteen, 500.0).unwrap();
+        assert!(recording_to_dataset(&rec13, &dated_meta()).is_ok());
+        assert!(recording_to_dataset(&rec13, &meta_gen).is_err());
+        let twelve: Vec<EcgLead> = (0..12)
+            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
+            .collect();
+        let rec12 = EcgRecording::new(twelve, 500.0).unwrap();
+        assert!(recording_to_dataset(&rec12, &meta_gen).is_ok());
+        // Unknown waveform SOPs pass through uncapped.
+        let mut meta_other = dated_meta();
+        meta_other.sop_class_uid = "1.2.840.10008.5.1.4.1.1.9.2.2".into();
+        assert!(recording_to_dataset(&rec14, &meta_other).is_ok());
     }
 }

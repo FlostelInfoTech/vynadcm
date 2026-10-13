@@ -207,9 +207,11 @@ fn map_eof(e: std::io::Error) -> Error {
 /// Write one PDU.
 pub async fn write_pdu<W: AsyncWrite + Unpin>(w: &mut W, pdu: &Pdu) -> Result<()> {
     let (typ, payload) = encode_pdu(pdu)?;
+    let len = u32::try_from(payload.len())
+        .map_err(|_| Error::BadPdu(format!("PDU payload ({} bytes) exceeds u32", payload.len())))?;
     w.write_u8(typ).await?;
     w.write_u8(0).await?;
-    w.write_u32(payload.len() as u32).await?;
+    w.write_u32(len).await?;
     w.write_all(&payload).await?;
     w.flush().await?;
     Ok(())
@@ -269,7 +271,10 @@ fn encode_pdu(pdu: &Pdu) -> Result<(u8, Vec<u8>)> {
             let mut out = Vec::new();
             for pdv in pdvs {
                 let len = pdv.data.len() + 2;
-                out.extend_from_slice(&(len as u32).to_be_bytes());
+                let len = u32::try_from(len).map_err(|_| {
+                    Error::BadPdu(format!("PDV ({} bytes) exceeds u32", pdv.data.len()))
+                })?;
+                out.extend_from_slice(&len.to_be_bytes());
                 out.push(pdv.context_id);
                 out.push((pdv.is_command as u8) | ((pdv.is_last as u8) << 1));
                 out.extend_from_slice(&pdv.data);

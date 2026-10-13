@@ -3,8 +3,8 @@
 //! Exit status: 0 on success, 1 on failure. The built instance is
 //! validated against its IOD before writing; validation errors abort.
 
-#[path = "common.rs"]
-mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 use std::path::PathBuf;
 
@@ -222,7 +222,7 @@ fn run(args: &Args) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = common::write_atomic(&args.output, &file) {
+    if let Err(e) = iocommon::write_atomic(&args.output, &file) {
         eprintln!("pdf2dcm: {}: {e}", args.output.display());
         return 1;
     }

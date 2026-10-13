@@ -137,6 +137,9 @@ impl DataSet {
     }
 
     /// Parse the first `DS`/`IS`/numeric value as `f64`.
+    ///
+    /// 64-bit integers lose precision past 2⁵³ (documented, not
+    /// hidden: the `as f64` conversion rounds).
     #[must_use]
     pub fn float(&self, tag: Tag) -> Option<f64> {
         let e = self.get(tag)?;
@@ -146,8 +149,10 @@ impl DataSet {
             Value::F64(v) => v.first().copied(),
             Value::U16(v) => v.first().map(|f| *f as f64),
             Value::U32(v) => v.first().map(|f| *f as f64),
+            Value::U64(v) => v.first().map(|f| *f as f64),
             Value::I16(v) => v.first().map(|f| *f as f64),
             Value::I32(v) => v.first().map(|f| *f as f64),
+            Value::I64(v) => v.first().map(|f| *f as f64),
             _ => None,
         }
     }
@@ -166,8 +171,10 @@ impl DataSet {
             Some(Value::F64(v)) => Some(v.clone()),
             Some(Value::U16(v)) => Some(v.iter().map(|f| *f as f64).collect()),
             Some(Value::U32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
+            Some(Value::U64(v)) => Some(v.iter().map(|f| *f as f64).collect()),
             Some(Value::I16(v)) => Some(v.iter().map(|f| *f as f64).collect()),
             Some(Value::I32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
+            Some(Value::I64(v)) => Some(v.iter().map(|f| *f as f64).collect()),
             _ => None,
         }
     }
@@ -275,6 +282,24 @@ mod tests {
             Value::I16(vec![-2]),
         ));
         assert_eq!(ds.float_list(tags::SELECTOR_SS_VALUE), Some(vec![-2.0]));
+        // 64-bit integers convert (with f64 rounding past 2^53).
+        ds.insert(DataElement::new(
+            tags::SELECTOR_UV_VALUE,
+            Vr::Uv,
+            Value::U64(vec![7, 1 << 60]),
+        ));
+        assert_eq!(ds.float(tags::SELECTOR_UV_VALUE), Some(7.0));
+        assert_eq!(
+            ds.float_list(tags::SELECTOR_UV_VALUE),
+            Some(vec![7.0, (1u64 << 60) as f64])
+        );
+        ds.insert(DataElement::new(
+            tags::SELECTOR_SV_VALUE,
+            Vr::Sv,
+            Value::I64(vec![-9]),
+        ));
+        assert_eq!(ds.float(tags::SELECTOR_SV_VALUE), Some(-9.0));
+        assert_eq!(ds.float_list(tags::SELECTOR_SV_VALUE), Some(vec![-9.0]));
         assert_eq!(ds.string(tags::PATIENT_ID), None);
         assert!(ds.require_string(tags::PATIENT_ID).is_err());
 

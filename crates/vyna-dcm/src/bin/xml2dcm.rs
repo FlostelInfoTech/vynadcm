@@ -1,5 +1,8 @@
 //! `xml2dcm`: convert Native DICOM Model XML back to a Part-10 file.
 
+#[path = "iocommon.rs"]
+mod iocommon;
+
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -59,6 +62,6 @@ fn run(args: &Args) -> Result<(), String> {
         .to_string();
     let meta = FileMeta::new(class, inst, ts);
     let bytes = write_part10(&meta, &ds).map_err(|e| e.to_string())?;
-    std::fs::write(&args.output, bytes).map_err(|e| e.to_string())?;
+    iocommon::write_atomic(&args.output, &bytes).map_err(|e| e.to_string())?;
     Ok(())
 }

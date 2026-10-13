@@ -59,7 +59,7 @@ spec adds component contracts, algorithms, sequences, and invariants.
 | `Vr` | 35 variants (34 standard + retired `SI`); `is_text()`, fixed byte width where applicable |
 | `Value` | Sum type: text/numbers (per VR width) / bytes / sequences / fragments / tags / person names; `is_empty()` for QIDO pruning |
 | `DataSet` | Insertion-ordered map; typed getters return `Option` (never panic); `put_*` builders; `PartialEq` for round-trip asserts |
-| `ENTRIES` / `tags` | 5,239 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
+| `ENTRIES` / `tags` | 5,217 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
 | Private dict | 424 creators / 8,898 entries via `lookup_private(creator, group, suffix)` with block + group-wildcard fallbacks; `Tag::{private_block, private_creator_element, private_suffix}` mechanics |
 | `TransferSyntax` | 16 UIDs; `is_encapsulated()`, `is_deflated()`, endianness/VR-explicitness; `Default` = Explicit VR LE |
 | `PersonName`, `Da`, `Tm` | `PersonName::parse` is infallible; `Da`/`Tm` validate (`Tm`: `HH[MM[SS[.FFFFFF]]]`, colons optional) |
@@ -246,10 +246,12 @@ spec adds component contracts, algorithms, sequences, and invariants.
 
 ### 2.8 `vyna-dcm-deid` — de-identification
 
-- `Action::{Dummy, Zero, Remove, RemapUid, ShiftDate}` per-element
-  actions; `BASIC_PROFILE` is a 197-tag curated table (6/93/58/20/20
-  split). Unlisted tags keep; sequences recurse; odd groups
-  (private) and `0x6000..=0x60FF` (overlays) remove by rule.
+- `Action::{Dummy, Zero, Remove, RemapUid, ShiftDate,
+  ShiftDateOrZero}` per-element actions; `BASIC_PROFILE` is a
+  636-row E.1 transcription (406 remove / 63 dummy / 59 zero /
+  55 UID remap / 46 date shift / 7 shift-or-zero). Unlisted tags
+  keep; sequences recurse; odd groups (private), `0x6000..=0x60FF`
+  (overlays), and `0x5000..=0x50FE` (curves) remove by rule.
 - `Deidentifier`: dummies (`ANONYMIZED` defaults, PN-aware), one UID
   map per instance (consistent across files), optional whole-day
   `DA`/`DT` offset (Hinnant round-trip; time-of-day kept), dummy

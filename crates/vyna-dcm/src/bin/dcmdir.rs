@@ -2,8 +2,8 @@
 //!
 //! Exit status: 0 on success, 1 on failure.
 
-#[path = "common.rs"]
-mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 use std::path::{Component, Path, PathBuf};
 
@@ -272,7 +272,7 @@ fn run_create(output: &Path, file_set_id: Option<&str>, inputs: &[PathBuf]) -> i
             return 1;
         }
     };
-    if let Err(e) = common::write_atomic(output, &bytes) {
+    if let Err(e) = iocommon::write_atomic(output, &bytes) {
         eprintln!("dcmdir: {}: {e}", output.display());
         return 1;
     }

@@ -4,8 +4,10 @@
 //! - Each value object carries `"vr"` plus `"Value"` (or `"InlineBinary"`
 //!   for byte VRs, base64). Encapsulated data uses the compact joined
 //!   form (`"InlineBinary"` plus `"BasicOffsetTable"`).
-//! - `PN` values become `{"Alphabetic": "..."}` objects; `AT` values are
-//!   8-hex-digit strings; `DS`/`IS` accept numbers or strings on input.
+//! - `PN` values become `{"Alphabetic": ..., "Ideographic": ...,
+//!   "Phonetic": ...}` objects (each group optional per Annex F); `AT`
+//!   values are 8-hex-digit strings; `DS`/`IS` accept numbers or strings
+//!   on input.
 //! - Non-finite floats have no Annex F spelling: `FL`/`FD`/`OF`/`OD`
 //!   `NaN`/`±Infinity` encode as the strings `"NaN"`/`"Infinity"`/
 //!   `"-Infinity"` (and parse back), instead of silently becoming null.
@@ -79,7 +81,16 @@ fn element_to_json(el: &DataElement) -> Json {
                 .iter()
                 .map(|n| {
                     let mut o = Map::new();
-                    o.insert("Alphabetic".into(), Json::String(n.to_dicom_string()));
+                    o.insert(
+                        "Alphabetic".into(),
+                        Json::String(n.alphabetic.to_dicom_string()),
+                    );
+                    if let Some(g) = &n.ideographic {
+                        o.insert("Ideographic".into(), Json::String(g.to_dicom_string()));
+                    }
+                    if let Some(g) = &n.phonetic {
+                        o.insert("Phonetic".into(), Json::String(g.to_dicom_string()));
+                    }
                     Json::Object(o)
                 })
                 .collect();
@@ -228,8 +239,23 @@ fn element_from_json_depth(tag: Tag, obj: &Json, depth: usize) -> Result<DataEle
             for v in values {
                 match v {
                     Json::Object(o) => {
-                        let s = o.get("Alphabetic").and_then(Json::as_str).unwrap_or("");
-                        names.push(PersonName::parse(s));
+                        // Annex F: Alphabetic/Ideographic/Phonetic are
+                        // each optional; rebuild the `=`-joined form.
+                        let alpha = o.get("Alphabetic").and_then(Json::as_str).unwrap_or("");
+                        let ideo = o.get("Ideographic").and_then(Json::as_str);
+                        let phon = o.get("Phonetic").and_then(Json::as_str);
+                        let mut s = alpha.to_string();
+                        if ideo.is_some() || phon.is_some() {
+                            s.push('=');
+                            if let Some(g) = ideo {
+                                s.push_str(g);
+                            }
+                        }
+                        if let Some(g) = phon {
+                            s.push('=');
+                            s.push_str(g);
+                        }
+                        names.push(PersonName::parse(&s));
                     }
                     Json::String(s) => names.push(PersonName::parse(s)),
                     _ => return Err(bad("bad PN value")),
@@ -357,6 +383,48 @@ fn nonfinite_token(v: &Json) -> Option<f64> {
 mod tests {
     use super::*;
     use vyna_dcm_core::tags;
+
+    #[test]
+    fn pn_three_groups_roundtrip() {
+        // Annex F: each group is its own member, all optional.
+        let mut ds = DataSet::new();
+        ds.put_person_name(
+            tags::PATIENT_NAME,
+            vec![PersonName::parse("Doe^Jane=山田^太郎=やまだ^たろう")],
+        );
+        let j = dataset_to_json(&ds);
+        let v = &j["00100010"]["Value"][0];
+        assert_eq!(v["Alphabetic"], json!("Doe^Jane"));
+        assert_eq!(v["Ideographic"], json!("山田^太郎"));
+        assert_eq!(v["Phonetic"], json!("やまだ^たろう"));
+        let back = dataset_from_json(&j).unwrap();
+        assert_eq!(
+            back.person_names(tags::PATIENT_NAME).unwrap()[0].to_dicom_string(),
+            "Doe^Jane=山田^太郎=やまだ^たろう"
+        );
+        // Missing groups stay missing (no phantom `=` joins).
+        let mut ds = DataSet::new();
+        ds.put_person_name(tags::PATIENT_NAME, vec![PersonName::parse("Doe^Jane")]);
+        let j = dataset_to_json(&ds);
+        let v = &j["00100010"]["Value"][0];
+        assert_eq!(v["Alphabetic"], json!("Doe^Jane"));
+        assert!(v.get("Ideographic").is_none());
+        assert!(v.get("Phonetic").is_none());
+        let back = dataset_from_json(&j).unwrap();
+        let name = &back.person_names(tags::PATIENT_NAME).unwrap()[0];
+        assert_eq!(name.to_dicom_string(), "Doe^Jane");
+        assert!(name.ideographic.is_none() && name.phonetic.is_none());
+        // Phonetic without ideographic keeps its slot.
+        let j: Json = serde_json::from_str(
+            r#"{"00100010":{"vr":"PN","Value":[{"Alphabetic":"A","Phonetic":"C"}]}}"#,
+        )
+        .unwrap();
+        let back = dataset_from_json(&j).unwrap();
+        assert_eq!(
+            back.person_names(tags::PATIENT_NAME).unwrap()[0].to_dicom_string(),
+            "A==C"
+        );
+    }
 
     #[test]
     fn round_trips_json_model() {

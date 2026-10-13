@@ -1,12 +1,12 @@
 //! `wadors`: WADO-RS retrieve (instance, metadata, frames, bulk data).
 
-#[path = "common.rs"]
-mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 #[path = "webcommon.rs"]
 mod webcommon;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 use vyna_dcm::dataset_to_json;
@@ -93,7 +93,7 @@ async fn run_async(args: &Args) -> Result<(), String> {
             .as_ref()
             .ok_or("--output is required with --bulkdata")?;
         let (content_type, body) = client.wado_bulkdata(uri).await.map_err(|e| e.to_string())?;
-        common::write_atomic(output, &body).map_err(|e| e.to_string())?;
+        iocommon::write_atomic(output, &body).map_err(|e| e.to_string())?;
         println!("{} ({} bytes)", output.display(), content_type);
         return Ok(());
     }
@@ -136,16 +136,16 @@ async fn run_async(args: &Args) -> Result<(), String> {
         .wado_file(study, series, instance)
         .await
         .map_err(|e| e.to_string())?;
-    common::write_atomic(output, &bytes).map_err(|e| e.to_string())?;
+    iocommon::write_atomic(output, &bytes).map_err(|e| e.to_string())?;
     println!("{} ({} bytes)", output.display(), bytes.len());
     Ok(())
 }
 
 /// One part lands exactly at `output`; several fan out to
 /// `STEM_N.EXT`.
-fn write_parts(output: &PathBuf, parts: &[Vec<u8>]) -> Result<(), String> {
+fn write_parts(output: &Path, parts: &[Vec<u8>]) -> Result<(), String> {
     if parts.len() == 1 {
-        common::write_atomic(output, &parts[0]).map_err(|e| e.to_string())?;
+        iocommon::write_atomic(output, &parts[0]).map_err(|e| e.to_string())?;
         println!("{} ({} bytes)", output.display(), parts[0].len());
         return Ok(());
     }
@@ -154,13 +154,13 @@ fn write_parts(output: &PathBuf, parts: &[Vec<u8>]) -> Result<(), String> {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     for (i, part) in parts.iter().enumerate() {
-        let mut named = output.clone();
+        let mut named = output.to_path_buf();
         let ext = output
             .extension()
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
         named.set_file_name(format!("{stem}_{}{ext}", i + 1));
-        std::fs::write(&named, part).map_err(|e| e.to_string())?;
+        iocommon::write_atomic(&named, part).map_err(|e| e.to_string())?;
         println!("{} ({} bytes)", named.display(), part.len());
     }
     Ok(())

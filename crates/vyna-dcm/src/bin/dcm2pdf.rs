@@ -2,8 +2,8 @@
 //!
 //! Exit status: 0 on success, 1 on failure.
 
-#[path = "common.rs"]
-mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 use std::path::PathBuf;
 
@@ -49,7 +49,7 @@ fn run(args: &Args) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = common::write_atomic(&args.output, &pdf.bytes) {
+    if let Err(e) = iocommon::write_atomic(&args.output, &pdf.bytes) {
         eprintln!("dcm2pdf: {}: {e}", args.output.display());
         return 1;
     }

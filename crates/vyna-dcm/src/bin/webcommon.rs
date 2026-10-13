@@ -9,6 +9,7 @@ use vyna_dcm::web::DicomWebClient;
 #[derive(clap::Args, Debug)]
 pub struct WebArgs {
     /// DICOMweb base URL (e.g. `http://host:8080/dicomweb`).
+    /// `https://` verifies against the OS certificate store.
     #[arg(long)]
     pub url: String,
     /// Bearer token auth.

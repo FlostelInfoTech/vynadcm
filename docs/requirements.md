@@ -90,7 +90,7 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   (text, numbers, UIDs, sequences, fragments) and builders; value
   multiplicity preserved.
 - **FR-CORE-04 (M)** Dictionary: ship the full PS3.6 registry
-  (currently 5,239 entries from PS3.6 2026d plus the command group)
+  (currently 5,217 entries from PS3.6 2026d plus the command group)
   mapping tag → (VR, VM, keyword, name, retired flag), sorted for
   binary search, plus `tags` constants; repeating (`xx`) groups stay
   unlisted.
@@ -268,7 +268,7 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
 ### 3.8 De-identification (`vyna-dcm-deid`)
 
 - **FR-DEID-01 (M)** PS3.15 Annex E action semantics (dummy, zero,
-  remove, UID remap, date shift) over a curated 197-tag basic
+  remove, UID remap, date shift) over a 636-row E.1-transcribed basic
   profile: patient/staff/institution/device identity,
   visit/admission/order/trial data, icon/annotation free text, all
   instance UIDs, and clinical dates. Sequences recurse; private
@@ -393,7 +393,7 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   the design spec, integration and user guides, and the SBOM are
   maintained as living documents.
 
-## 5. Out of scope (v0.4)
+## 5. Out of scope (v0.5)
 
 JPEG Extended 12-bit (`.51`), JPEG 2000 Part 2, and HTJ2K pixel
 codecs; print management; image rendering/windowing; FIPS mode;
@@ -404,7 +404,7 @@ IPv6-specific handling.
 
 | Requirement | Evidence |
 |---|---|
-| FR-CORE-01…08 | `vyna-dcm-core` unit tests (29), incl. dictionary/VR/UID/TM/private tests |
+| FR-CORE-01…08 | `vyna-dcm-core` unit tests (30), incl. dictionary/VR/UID/TM/private tests |
 | FR-CODEC-01…04 | `round_trips_all_uncompressed_syntaxes`, `round_trips_part10`, `round_trips_implicit_and_deflated`, sequence/fragment tests |
 | FR-CODEC-05 | `packbits_known_vectors`, `packbits_round_trip`, `frame_round_trip_16bit`, `frame_round_trip_rgb_planar`, `frame_rejects_bad_headers` |
 | FR-CODEC-05-b | `bot_usable_rejects_header_counted_tables`, `rle_falls_back_on_bogus_bot`, `jpeg_bot_needs_codestream_starts`, corpus `lossless_family_agrees` (MSB-first planes, even-pad segments, validated BOT) |
@@ -415,14 +415,14 @@ IPv6-specific handling.
 | FR-CODEC-10 | `roundtrip_tree` (every link points at an item tag), `empty_dir_roundtrip`, `record_type_mapping`, `entry_validation`, `rejects_non_directory`, `walker_*` (skips, loops, dangling, deleted), `capture_points_at_item_tags`, CLI `dcmdir` create+list runs |
 | FR-CODEC-11 | `round_trips_mixed_dataset`, `person_name_component_groups`, `rejects_bad_inputs`, `liberal_parse_accepts_minimal`, CLI `dcm2xml` → `xml2dcm` JP round-trip run |
 | FR-CODEC-12 | `png_round_trip_mono16_signed`, `mono1_inverts_and_planar_rgb_renders`, `rejects_unsupported` (img), `corpus_renders_png`, CLI `dcm2img` → `img2dcm` byte-identical run |
-| FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, `loopback_find_cancel_truncates`, `loopback_storage_commit`, `storage_commit_skips_wait_on_action_failure`, PDU/DIMSE tests (8); live C-ECHO against third-party endpoint `0x0000`, live `findscu --cancel` vs `findscp` (FE00, exit 0) |
+| FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, `loopback_find_cancel_truncates`, `loopback_storage_commit`, `storage_commit_skips_wait_on_action_failure`, PDU/DIMSE unit tests (11), `qr_scp` integration tests (8); live C-ECHO against third-party endpoint `0x0000`, live `findscu --cancel` vs `findscp` (FE00, exit 0) |
 | FR-NET-07 | worklist/MPPS/commitment tests |
 | FR-NET-08 | `tls_loopback_echo`, `rejects_empty_chain_and_key` |
 | FR-NET-09…11 | `wildcard_and_range_match`, `pn_matches_leading_components`, `level_grouping_dedupes`, `responses_echo_requested_keys_only`, `sequence_keys_match_nested`, loopback `find_study_level_groups`, `find_missing_level_fails`, `move_delivers_to_destination`, `get_serves_over_same_association`, `mwl_matches_station`, `mpps_create_then_set_merges`, `mpps_rejects_bad_requests`, `mpps_final_states_reject_updates`, `mpps_reloads_persisted_steps`, `commitment_holds_partition`, `commitment_rejects_bad_requests`, loopback `loopback_mpps_create_set`, `loopback_storage_commit_push`, CLI `findscp`/`mwlscp`/`mppsscp`/`stgcmtscp` smoke runs |
 | FR-WEB-01…03 | `end_to_end_client_against_hyper`, `wado_uri_against_stub`, `wado_uri_*` param tests, dispatch/multipart tests |
 | FR-WEB-04 | `qido_finds_seeded_instance`, `wado_round_trips_file_metadata_frames`, `stow_lands_and_qido_sees_it`, wadors `frames_parse`, CLI smoke runs against `wadorsd` |
-| FR-ECG-01…03 | `vyna-dcm-ecg` tests (8); `ecg_write` example |
-| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `findscp`, `mwlscp`, `movescu`, `getscu`, `mppsscu`, `mppsscp`, `stgcmtscu`, `stgcmtscp`, `qidors`, `wadors`, `stowrs`, `wadorsd`, `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`, `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`); `link_route` example; `cancel_flag_parses`, `sequence_paths_parse`, `sequence_edits_apply_per_item`, `transfer_syntax_names_parse`, `quality_knobs_validate`, `injected_png_survives_lossless_targets`, `exec_template_parses_and_expands`, `exec_hook_runs_and_reports_exit`, `study_uid_prefers_top_level` |
+| FR-ECG-01…03 | `vyna-dcm-ecg` tests (18); `ecg_write` example |
+| FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `findscp`, `mwlscp`, `movescu`, `getscu`, `mppsscu`, `mppsscp`, `stgcmtscu`, `stgcmtscp`, `qidors`, `wadors`, `stowrs`, `wadorsd`, `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`, `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`, `deidentify`, `auditsend`); `link_route` example; `cancel_flag_parses`, `sequence_paths_parse`, `sequence_edits_apply_per_item`, `transfer_syntax_names_parse`, `quality_knobs_validate`, `injected_png_survives_lossless_targets`, `exec_template_parses_and_expands`, `exec_hook_runs_and_reports_exit`, `study_uid_prefers_top_level` |
 | FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
 | FR-DEID-01…03 | `every_action_fires`, `shift_keeps_longitudinal_intervals`, `datetimes_shift_or_dummy_by_vr`, `burned_in_annotation_refuses_before_mutation`, `uid_maps_stay_consistent_across_datasets`, `shifts_cross_month_year_and_leap_day`, profile self-checks, CLI `output_plans_*` + `process_file_round_trip`, `deidentified_ecg_validates_with_identical_samples` |

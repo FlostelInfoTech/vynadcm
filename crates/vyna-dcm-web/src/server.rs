@@ -8,7 +8,9 @@
 use bytes::Bytes;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
-use vyna_dcm_codec::{FileMeta, dataset_to_json, decode_pixels, read_part10, write_part10};
+use vyna_dcm_codec::{
+    FileMeta, dataset_to_json, decode_pixels, read_part10, read_part10_header, write_part10,
+};
 use vyna_dcm_core::{DataSet, Tag, TransferSyntax, Value, Vr, lookup, lookup_keyword, tags};
 
 use crate::multipart::{
@@ -271,17 +273,19 @@ impl DicomWebStore for MemoryStore {
             {
                 continue;
             }
+            if !filters
+                .iter()
+                .all(|(t, m)| match_attribute(&inst.dataset, *t, m))
+            {
+                continue;
+            }
+            // Dedup AFTER the match: an unmatched first instance must
+            // not claim its study/series and hide a later match.
             if scope.level == "STUDY" && !seen_studies.insert(inst.study.clone()) {
                 continue;
             }
             if scope.level == "SERIES"
                 && !seen_series.insert((inst.study.clone(), inst.series.clone()))
-            {
-                continue;
-            }
-            if !filters
-                .iter()
-                .all(|(t, m)| match_attribute(&inst.dataset, *t, m))
             {
                 continue;
             }
@@ -333,17 +337,19 @@ impl DicomWebStore for MemoryStore {
             .iter()
             .find(|i| i.study == study && i.series == series && i.instance == instance)?;
         let pixels = decode_pixels(&inst.dataset, inst.transfer_syntax).ok()?;
-        // decode_pixels already validated the frame count; absent means 1.
-        let count: usize = inst
-            .dataset
-            .string(tags::NUMBER_OF_FRAMES)
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1)
-            .max(1);
-        if pixels.len() % count.max(1) != 0 {
+        // Absent frame count means single-frame; present-but-garbage
+        // is a 404, not a license to serve all frames as frame 1.
+        let count: usize = match inst.dataset.string(tags::NUMBER_OF_FRAMES) {
+            None => 1,
+            Some(s) => match s.parse() {
+                Ok(n) if n >= 1 => n,
+                _ => return None,
+            },
+        };
+        if pixels.len() % count != 0 {
             return None;
         }
-        let frame_len = pixels.len() / count.max(1);
+        let frame_len = pixels.len() / count;
         let mut out = Vec::with_capacity(frames.len());
         for f in frames {
             if *f == 0 || *f as usize > count {
@@ -451,7 +457,19 @@ pub fn extract_bulk(ds: &mut DataSet) -> Vec<BulkBlob> {
             };
             if let Some(bytes) = bytes {
                 let content_type = if tag == tags::ENCAPSULATED_DOCUMENT {
-                    "application/pdf".to_string()
+                    // MIME Type of Encapsulated Document names CDA/XML
+                    // payloads; absent or malformed means legacy PDF.
+                    ds.string(tags::MIME_TYPE_OF_ENCAPSULATED_DOCUMENT)
+                        .map(str::trim)
+                        .filter(|m| {
+                            !m.is_empty()
+                                && m.contains('/')
+                                && !m.chars().any(|c| {
+                                    c.is_whitespace() || c.is_control() || c == ';' || c == ','
+                                })
+                        })
+                        .unwrap_or("application/pdf")
+                        .to_string()
                 } else {
                     "application/octet-stream".to_string()
                 };
@@ -606,16 +624,69 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
     false
 }
 
+/// True when the request's `Accept` header allows one of `kinds`.
+/// Missing header means anything goes; matching is case-insensitive
+/// over bare media types (`;` parameters ignored) with `*/*` and
+/// `type/*` wildcards honored.
+fn accepts(req: &HttpRequest, kinds: &[&str]) -> bool {
+    let Some(accept) = req.headers.get("accept") else {
+        return true;
+    };
+    accept.split(',').any(|item| {
+        let mime = item
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if mime == "*/*" {
+            return true;
+        }
+        kinds.iter().any(|k| {
+            mime == *k
+                || mime
+                    .strip_suffix("/*")
+                    .is_some_and(|t| k.split('/').next() == Some(t))
+        })
+    })
+}
+
 /// Route one request against a store. `public_base` is the externally
-/// visible base URL used for `BulkDataURI`s and RetrieveURLs.
+/// visible base URL used for `BulkDataURI`s and RetrieveURLs; when it
+/// carries a path prefix (e.g. `https://host/dicomweb`), that prefix is
+/// stripped from request paths before routing (bare-root deployments
+/// pass through unchanged).
 ///
-/// QIDO matching is exact/prefix (ranges, wildcards, OR lists
-/// supported): `includefield` and `fuzzymatching` parameters are
-/// accepted but ignored — responses always carry full key sets and
-/// matching never fuzzes.
+/// QIDO matching is exact plus PS3.4 wildcards (`*`/`?` anywhere in
+/// the pattern), ranges, and OR lists: `includefield` and
+/// `fuzzymatching` parameters are accepted but ignored — responses
+/// always carry full key sets and matching never fuzzes.
+///
+/// WADO-RS honors `Accept` media types (`406` when nothing offered is
+/// servable) but ignores `type`/`transfer-syntax` parameters: frames
+/// serve decoded bytes and instances serve stored bytes — no
+/// transcoding is negotiated. QIDO always serves
+/// `application/dicom+json`.
 pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpRequest) -> HttpResponse {
     let base = public_base.trim_end_matches('/');
-    let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
+    let prefix = base
+        .split_once("://")
+        .and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..]))
+        .unwrap_or("");
+    // Strip the deployment prefix on a segment boundary only, so
+    // `/dicomweb2/studies` never collapses onto `/studies`.
+    let path = if prefix.is_empty() {
+        req.path.as_str()
+    } else if req.path == prefix {
+        "/"
+    } else if let Some(rest) = req.path.strip_prefix(prefix)
+        && rest.starts_with('/')
+    {
+        rest
+    } else {
+        req.path.as_str()
+    };
+    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["studies"]) => qido(
             store,
@@ -663,6 +734,9 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
             &req.query,
         ),
         ("GET", ["studies", study, "series", series, "instances", instance]) => {
+            if !accepts(req, &["application/dicom", "multipart/related"]) {
+                return HttpResponse::text(406, "instance needs Accept: application/dicom");
+            }
             match store.instance_file(study, series, instance) {
                 Some(file) => HttpResponse::multipart(
                     &[Part::new("application/dicom", file)],
@@ -682,40 +756,45 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                 instance,
                 "metadata",
             ],
-        ) => match store.instance_metadata(study, series, instance) {
-            Some((ds, blobs)) => {
-                // Snapshot the small JSON keys first so the blob bytes
-                // below can move into the store instead of cloning.
-                let keys: Vec<(String, String)> = blobs
-                    .iter()
-                    .map(|b| {
-                        (
-                            format!("{:04X}{:04X}", b.tag.group(), b.tag.element()),
-                            b.vr.as_str().to_string(),
-                        )
-                    })
-                    .collect();
-                let ids = store.put_bulk(
-                    blobs
-                        .into_iter()
-                        .map(|b| (b.bytes, b.content_type))
-                        .collect(),
-                );
-                let mut obj = dataset_to_json(&ds);
-                let map = obj.as_object_mut().unwrap();
-                for ((key, vr), id) in keys.iter().zip(ids) {
-                    map.insert(
-                        key.clone(),
-                        serde_json::json!({
-                            "vr": vr,
-                            "BulkDataURI": format!("{base}/bulk/{id}")
-                        }),
-                    );
-                }
-                HttpResponse::json(200, &serde_json::Value::Array(vec![obj]))
+        ) => {
+            if !accepts(req, &["application/dicom+json"]) {
+                return HttpResponse::text(406, "metadata needs Accept: application/dicom+json");
             }
-            None => HttpResponse::text(404, "instance not found"),
-        },
+            match store.instance_metadata(study, series, instance) {
+                Some((ds, blobs)) => {
+                    // Snapshot the small JSON keys first so the blob bytes
+                    // below can move into the store instead of cloning.
+                    let keys: Vec<(String, String)> = blobs
+                        .iter()
+                        .map(|b| {
+                            (
+                                format!("{:04X}{:04X}", b.tag.group(), b.tag.element()),
+                                b.vr.as_str().to_string(),
+                            )
+                        })
+                        .collect();
+                    let ids = store.put_bulk(
+                        blobs
+                            .into_iter()
+                            .map(|b| (b.bytes, b.content_type))
+                            .collect(),
+                    );
+                    let mut obj = dataset_to_json(&ds);
+                    let map = obj.as_object_mut().unwrap();
+                    for ((key, vr), id) in keys.iter().zip(ids) {
+                        map.insert(
+                            key.clone(),
+                            serde_json::json!({
+                                "vr": vr,
+                                "BulkDataURI": format!("{base}/bulk/{id}")
+                            }),
+                        );
+                    }
+                    HttpResponse::json(200, &serde_json::Value::Array(vec![obj]))
+                }
+                None => HttpResponse::text(404, "instance not found"),
+            }
+        }
         (
             "GET",
             [
@@ -729,6 +808,9 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                 list,
             ],
         ) => {
+            if !accepts(req, &["application/octet-stream", "multipart/related"]) {
+                return HttpResponse::text(406, "frames need Accept: application/octet-stream");
+            }
             // Every addressed frame must be a positive integer: bad
             // entries are a 400 (not silently dropped, and frame 0 is
             // invalid — frames are 1-based). Duplicates are also a 400:
@@ -794,7 +876,7 @@ fn qido<S: DicomWebStore>(store: &S, scope: QidoScope, query: &str) -> HttpRespo
         match k.to_ascii_lowercase().as_str() {
             "limit" => limit = v.parse().unwrap_or(100).min(1000),
             "offset" => offset = v.parse().unwrap_or(0),
-            "includefield" | "fuzzymatching" => {} // accepted, matching stays exact/prefix
+            "includefield" | "fuzzymatching" => {} // accepted, matching stays exact+wildcard (never fuzzy)
             _ => {
                 if let Some(tag) = qido_key_to_tag(k) {
                     filters.push((tag, v.clone()));
@@ -908,7 +990,7 @@ fn stow<S: DicomWebStore>(
         Err(e) => return HttpResponse::text(400, e.to_string()),
     };
     let mut stored: Vec<StoredIds> = Vec::new();
-    let mut failures: Vec<String> = Vec::new();
+    let mut failures: Vec<(Option<String>, Option<String>, String)> = Vec::new();
     // Media-type match, not string equality: compliant senders add
     // parameters such as `transfer-syntax` (PS3.18 §8.6).
     for part in parts
@@ -917,20 +999,48 @@ fn stow<S: DicomWebStore>(
     {
         match store.store_instance(&part.body, study_hint) {
             Ok(ids) => stored.push(ids),
-            Err(reason) => failures.push(reason),
+            Err(reason) => {
+                let (class, inst) = sop_uids_of(&part.body);
+                failures.push((class, inst, reason));
+            }
         }
     }
     if stored.is_empty() {
-        return HttpResponse::text(400, format!("nothing stored: {}", failures.join("; ")));
+        let reasons: Vec<&str> = failures.iter().map(|(_, _, r)| r.as_str()).collect();
+        return HttpResponse::text(400, format!("nothing stored: {}", reasons.join("; ")));
     }
     if !failures.is_empty() {
-        // Partial failure: 409 with a FailedSOPSequence-shaped body.
+        // Partial failure: 409 with one FailedSOPSequence item per
+        // failed instance (UIDs best-effort: an unparseable part has
+        // none to report).
+        let items: Vec<serde_json::Value> = failures
+            .iter()
+            .map(|(class, inst, _)| {
+                let mut item = serde_json::Map::new();
+                if let Some(uid) = class {
+                    item.insert(
+                        "00081150".to_string(),
+                        serde_json::json!({"vr": "UI", "Value": [uid]}),
+                    );
+                }
+                if let Some(uid) = inst {
+                    item.insert(
+                        "00081155".to_string(),
+                        serde_json::json!({"vr": "UI", "Value": [uid]}),
+                    );
+                }
+                item.insert(
+                    "00081197".to_string(),
+                    serde_json::json!({"vr": "US", "Value": [STOW_FAILURE_PROCESSING]}),
+                );
+                serde_json::Value::Object(item)
+            })
+            .collect();
         return HttpResponse::json(
             409,
             &serde_json::json!({
-                "00081198": {"vr": "SQ", "Value": []},
+                "00081198": {"vr": "SQ", "Value": items},
                 "00081190": {"vr": "UR", "Value": [format!("{base}/studies/{}", stored[0].study)]},
-                "error": failures.join("; "),
             }),
         );
     }
@@ -939,6 +1049,22 @@ fn stow<S: DicomWebStore>(
         &serde_json::json!({
             "00081190": {"vr": "UR", "Value": [format!("{base}/studies/{}", stored[0].study)]}
         }),
+    )
+}
+
+/// STOW-RS Failure Reason for a part that could not be stored
+/// (PS3.18 processing failure).
+const STOW_FAILURE_PROCESSING: u16 = 0x0110;
+
+/// Best-effort SOP Class/Instance UIDs for a failed STOW part
+/// (header-only: the body may be truncated or garbage).
+fn sop_uids_of(body: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok((_, ds)) = read_part10_header(body) else {
+        return (None, None);
+    };
+    (
+        ds.string(tags::SOP_CLASS_UID).map(str::to_string),
+        ds.string(tags::SOP_INSTANCE_UID).map(str::to_string),
     )
 }
 
@@ -960,11 +1086,12 @@ pub fn test_file(study: &str, series: &str, instance: &str, rows: u16, cols: u16
     ds.put_u16_single(tags::BITS_STORED, 12);
     ds.put_u16_single(tags::HIGH_BIT, 11);
     ds.put_u16_single(tags::PIXEL_REPRESENTATION, 0);
-    ds.put_bytes(
-        tags::PIXEL_DATA,
-        Vr::Ow,
-        vec![0u8; rows as usize * cols as usize * 2],
-    );
+    // Checked: the u16 triple can overflow 32-bit usize.
+    let len = (rows as usize)
+        .checked_mul(cols as usize)
+        .and_then(|n| n.checked_mul(2))
+        .expect("test_file dims overflow address space");
+    ds.put_bytes(tags::PIXEL_DATA, Vr::Ow, vec![0u8; len]);
     let meta = FileMeta::new(
         vyna_dcm_core::sop_class::CT_IMAGE,
         instance,
@@ -1426,5 +1553,343 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         let ds = dataset_from_json(&v[0]).unwrap();
         assert_eq!(ds.string(tags::PATIENT_ID), Some("W123"));
+    }
+
+    #[test]
+    fn qido_dedup_claims_only_matched_rows() {
+        // Regression: dedup used to insert before the filter check, so
+        // a study whose FIRST instance missed the filter hid a LATER
+        // matching instance (0 hits instead of 1).
+        let store = stored();
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies?SOPInstanceUID=1.2.3.2.1"),
+        );
+        assert_eq!(r.status, 200);
+        let hits: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(hits[0]["0020000D"]["Value"][0], serde_json::json!("1.2.3"));
+        // Same shape at SERIES scope (global /series endpoint).
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/series?SOPInstanceUID=1.2.3.2.1"),
+        );
+        let hits: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        assert_eq!(
+            hits[0]["0020000E"]["Value"][0],
+            serde_json::json!("1.2.3.2")
+        );
+    }
+
+    #[test]
+    fn frames_garbage_count_is_404() {
+        let store = MemoryStore::new();
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::SOP_CLASS_UID, vyna_dcm_core::sop_class::CT_IMAGE);
+        ds.put_uid(tags::SOP_INSTANCE_UID, "9.9.9.1.1");
+        ds.put_uid(tags::STUDY_INSTANCE_UID, "9.9.9");
+        ds.put_uid(tags::SERIES_INSTANCE_UID, "9.9.9.1");
+        ds.put_u16_single(tags::ROWS, 2);
+        ds.put_u16_single(tags::COLUMNS, 2);
+        ds.put_u16_single(tags::SAMPLES_PER_PIXEL, 1);
+        ds.put_u16_single(tags::BITS_ALLOCATED, 16);
+        ds.put_u16_single(tags::BITS_STORED, 12);
+        ds.put_u16_single(tags::HIGH_BIT, 11);
+        ds.put_u16_single(tags::PIXEL_REPRESENTATION, 0);
+        ds.put_bytes(tags::PIXEL_DATA, Vr::Ow, vec![0u8; 8]);
+        ds.put_text(tags::NUMBER_OF_FRAMES, Vr::Is, "banana");
+        let meta = FileMeta::new(
+            vyna_dcm_core::sop_class::CT_IMAGE,
+            "9.9.9.1.1",
+            TransferSyntax::ExplicitVrLittleEndian,
+        );
+        store
+            .store_instance(&write_part10(&meta, &ds).unwrap(), None)
+            .unwrap();
+        // Present-but-garbage count: 404, not frame-1-of-everything.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/9.9.9/series/9.9.9.1/instances/9.9.9.1.1/frames/1"),
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn encap_bulk_honors_mime_type() {
+        let mut ds = DataSet::new();
+        ds.put_bytes(tags::ENCAPSULATED_DOCUMENT, Vr::Ob, b"<doc/>".to_vec());
+        ds.put_text(tags::MIME_TYPE_OF_ENCAPSULATED_DOCUMENT, Vr::Lo, "text/xml");
+        let blobs = extract_bulk(&mut ds);
+        assert_eq!(blobs.len(), 1);
+        assert_eq!(blobs[0].content_type, "text/xml");
+        // Absent or malformed MIME falls back to legacy PDF.
+        for mime in [None, Some(""), Some("not a mime"), Some("text/html; x=1")] {
+            let mut ds = DataSet::new();
+            ds.put_bytes(tags::ENCAPSULATED_DOCUMENT, Vr::Ob, b"%PDF".to_vec());
+            if let Some(m) = mime {
+                ds.put_text(tags::MIME_TYPE_OF_ENCAPSULATED_DOCUMENT, Vr::Lo, m);
+            }
+            let blobs = extract_bulk(&mut ds);
+            assert_eq!(blobs[0].content_type, "application/pdf", "{mime:?}");
+        }
+    }
+
+    fn get_accept(path: &str, accept: &str) -> HttpRequest {
+        let mut r = get(path);
+        r.headers.insert("accept".to_string(), accept.to_string());
+        r
+    }
+
+    #[test]
+    fn wado_accept_negotiation() {
+        let store = stored();
+        let inst = "/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1";
+        // Instance: dicom or multipart only.
+        assert_eq!(
+            dispatch(&store, "http://x/wado", &get_accept(inst, "image/jpeg")).status,
+            406
+        );
+        assert_eq!(
+            dispatch(
+                &store,
+                "http://x/wado",
+                &get_accept(inst, "application/dicom")
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            dispatch(
+                &store,
+                "http://x/wado",
+                &get_accept(inst, "multipart/related")
+            )
+            .status,
+            200
+        );
+        // Frames: octet-stream (wildcards pass).
+        let frames = format!("{inst}/frames/1");
+        assert_eq!(
+            dispatch(
+                &store,
+                "http://x/wado",
+                &get_accept(&frames, "application/json")
+            )
+            .status,
+            406
+        );
+        assert_eq!(
+            dispatch(&store, "http://x/wado", &get_accept(&frames, "*/*")).status,
+            200
+        );
+        assert_eq!(
+            dispatch(
+                &store,
+                "http://x/wado",
+                &get_accept(&frames, "text/html, application/*")
+            )
+            .status,
+            200
+        );
+        // Metadata: dicom+json (params ignored, mismatch rejected).
+        let meta = format!("{inst}/metadata");
+        assert_eq!(
+            dispatch(
+                &store,
+                "http://x/wado",
+                &get_accept(&meta, "application/dicom+json; charset=utf-8")
+            )
+            .status,
+            200
+        );
+        assert_eq!(
+            dispatch(&store, "http://x/wado", &get_accept(&meta, "text/html")).status,
+            406
+        );
+    }
+
+    #[test]
+    fn dispatch_strips_public_base_prefix() {
+        let store = stored();
+        // Prefixed deployment: BulkDataURI-style paths route.
+        let r = dispatch(
+            &store,
+            "http://x/dicomweb",
+            &get("/dicomweb/studies?PatientID=W123"),
+        );
+        assert_eq!(r.status, 200);
+        let hits: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        // Segment-boundary only: /dicomweb2/* must not collapse.
+        let r = dispatch(
+            &store,
+            "http://x/dicomweb",
+            &get("/dicomweb2/studies?PatientID=W123"),
+        );
+        assert_eq!(r.status, 404);
+        // Bare-root base keeps root routing.
+        let r = dispatch(&store, "http://x", &get("/studies?PatientID=W123"));
+        assert_eq!(r.status, 200);
+    }
+
+    fn stow_req(path: &str, content_type: &str, body: Vec<u8>) -> HttpRequest {
+        HttpRequest {
+            method: "POST".into(),
+            path: path.into(),
+            query: String::new(),
+            headers: [("content-type".into(), content_type.into())].into(),
+            body: Bytes::from(body),
+        }
+    }
+
+    #[test]
+    fn stow_rejects_malformed_uploads() {
+        let store = stored();
+        // Not multipart/related.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &stow_req("/studies", "application/json", b"{}".to_vec()),
+        );
+        assert_eq!(r.status, 400);
+        // Missing boundary.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &stow_req("/studies", "multipart/related", b"x".to_vec()),
+        );
+        assert_eq!(r.status, 400);
+        // Empty boundary.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &stow_req("/studies", "multipart/related; boundary=", b"x".to_vec()),
+        );
+        assert_eq!(r.status, 400);
+    }
+
+    #[test]
+    fn stow_partial_failure_lists_failed_items() {
+        let store = stored();
+        let good = test_file("5.5.5", "5.5.5.1", "5.5.5.1.1", 2, 2);
+        // Unparseable part: no UIDs to report.
+        let garbage = b"not a dicom file at all".to_vec();
+        // Parses but misses Study UID: class UID reported, instance missing.
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::SOP_CLASS_UID, vyna_dcm_core::sop_class::CT_IMAGE);
+        ds.put_uid(tags::SOP_INSTANCE_UID, "5.5.5.1.2");
+        ds.put_uid(tags::SERIES_INSTANCE_UID, "5.5.5.1");
+        let meta = FileMeta::new(
+            vyna_dcm_core::sop_class::CT_IMAGE,
+            "5.5.5.1.2",
+            TransferSyntax::ExplicitVrLittleEndian,
+        );
+        let missing_uid = write_part10(&meta, &ds).unwrap();
+        let (ct, body) = encode_multipart(
+            &[
+                Part::new("application/dicom", good),
+                Part::new("application/dicom", garbage),
+                Part::new("application/dicom", missing_uid),
+            ],
+            "b409",
+            "application/dicom",
+        );
+        let r = dispatch(&store, "http://x/wado", &stow_req("/studies", &ct, body));
+        assert_eq!(r.status, 409, "{}", String::from_utf8_lossy(&r.body));
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert!(v.get("error").is_none(), "non-standard error key present");
+        let failed = v["00081198"]["Value"].as_array().unwrap();
+        assert_eq!(failed.len(), 2);
+        // Garbage part: reason only.
+        assert!(failed[0].get("00081150").is_none());
+        assert!(failed[0].get("00081155").is_none());
+        assert_eq!(failed[0]["00081197"]["Value"][0], serde_json::json!(0x0110));
+        // Missing-UID part: class UID recovered from the header.
+        assert_eq!(
+            failed[1]["00081150"]["Value"][0],
+            serde_json::json!(vyna_dcm_core::sop_class::CT_IMAGE)
+        );
+        assert_eq!(
+            failed[1]["00081155"]["Value"][0],
+            serde_json::json!("5.5.5.1.2")
+        );
+        // The good instance still stored.
+        assert_eq!(store.len(), 3);
+    }
+
+    #[test]
+    fn metadata_and_bulk_404s() {
+        let store = stored();
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/9.9.9/series/9.9.9.1/instances/9.9.9.1.9/metadata"),
+        );
+        assert_eq!(r.status, 404);
+        let r = dispatch(&store, "http://x/wado", &get("/bulk/does-not-exist"));
+        assert_eq!(r.status, 404);
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/9.9.9/series/9.9.9.1/instances/9.9.9.1.9"),
+        );
+        assert_eq!(r.status, 404);
+    }
+
+    #[test]
+    fn qido_limit_offset_clamp_and_garbage() {
+        let store = MemoryStore::new();
+        for i in 0..5 {
+            store
+                .store_instance(
+                    &test_file(
+                        &format!("7.7.{i}"),
+                        &format!("7.7.{i}.1"),
+                        &format!("7.7.{i}.1.1"),
+                        2,
+                        2,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        // Limit honored.
+        let r = dispatch(&store, "http://x/wado", &get("/studies?limit=2"));
+        let hits: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 2);
+        // Garbage limit/offset fall back to defaults (100/0): all rows.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies?limit=banana&offset=nope"),
+        );
+        let hits: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 5);
+        // Offset skips matched rows.
+        let r = dispatch(&store, "http://x/wado", &get("/studies?limit=2&offset=4"));
+        let hits: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1);
+        // Clamp: past 1000 the server caps (1005 rows, limit=99999).
+        for i in 5..1005 {
+            store
+                .store_instance(
+                    &test_file(
+                        &format!("7.7.{i}"),
+                        &format!("7.7.{i}.1"),
+                        &format!("7.7.{i}.1.1"),
+                        2,
+                        2,
+                    ),
+                    None,
+                )
+                .unwrap();
+        }
+        let r = dispatch(&store, "http://x/wado", &get("/studies?limit=99999"));
+        let hits: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 1000);
     }
 }

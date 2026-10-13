@@ -43,6 +43,7 @@ impl ConceptName {
 
 /// Identifying metadata for a complete Encapsulated PDF SOP instance.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct PdfInstanceMeta {
     /// SOP Instance UID (generated when empty).
     pub sop_instance_uid: String,
@@ -199,6 +200,11 @@ impl PdfInstanceMeta {
 /// is added only when needed. The exact byte length is recorded in
 /// Encapsulated Document Length (0042,0015) so [`pdf_from_dataset`]
 /// can strip wire padding exactly.
+///
+/// Validated here: UID syntax for the three UID fields, Patient Sex
+/// (`M`/`F`/`O` when non-empty), and Burned In Annotation (`YES`/`NO`).
+/// Other caller strings (modality, conversion type, dates, titles) are
+/// written verbatim: garbage in, non-conformant out.
 pub fn pdf_to_dataset(pdf: &[u8], meta: &PdfInstanceMeta) -> Result<DataSet> {
     if pdf.is_empty() {
         return Err(Error::EmptyDocument);
@@ -210,6 +216,29 @@ pub fn pdf_to_dataset(pdf: &[u8], meta: &PdfInstanceMeta) -> Result<DataSet> {
         u32::try_from(pdf.len()).map_err(|_| Error::DocumentTooLarge(pdf.len() as u64))?;
     let mut meta = meta.clone();
     meta.fill_uids();
+    for (what, uid) in [
+        ("SOP Instance UID", &meta.sop_instance_uid),
+        ("Study Instance UID", &meta.study_uid),
+        ("Series Instance UID", &meta.series_uid),
+    ] {
+        if !vyna_dcm_core::is_valid_uid(uid) {
+            return Err(Error::InvalidMeta(format!("bad {what} {uid:?}")));
+        }
+    }
+    if let Some(sex) = &meta.sex
+        && !sex.is_empty()
+        && !matches!(sex.as_str(), "M" | "F" | "O")
+    {
+        return Err(Error::InvalidMeta(format!(
+            "Patient Sex {sex:?} (want M, F, or O)"
+        )));
+    }
+    if !matches!(meta.burned_in_annotation.as_str(), "YES" | "NO") {
+        return Err(Error::InvalidMeta(format!(
+            "Burned In Annotation {:?} (want YES or NO)",
+            meta.burned_in_annotation
+        )));
+    }
     let mut ds = DataSet::new();
     if meta.needs_utf8() {
         ds.put_text(tags::SPECIFIC_CHARACTER_SET, Vr::Cs, CHARSET_UTF8);
@@ -301,8 +330,8 @@ pub struct ExtractedPdf {
 /// Extract the encapsulated PDF from a dataset.
 ///
 /// Fragmented storage is joined; Encapsulated Document Length (0042,0015)
-/// truncates wire padding when present and sane, otherwise the stored
-/// bytes are returned unchanged.
+/// truncates wire padding when present and sane. The result must carry
+/// the `%PDF-` magic (the MIME type tag is reported, not enforced).
 pub fn pdf_from_dataset(ds: &DataSet) -> Result<ExtractedPdf> {
     let el = ds
         .get(tags::ENCAPSULATED_DOCUMENT)
@@ -319,6 +348,11 @@ pub fn pdf_from_dataset(ds: &DataSet) -> Result<ExtractedPdf> {
         && (len as usize) <= bytes.len()
     {
         bytes.truncate(len as usize);
+    }
+    // Serving arbitrary stored bytes as `application/pdf` would
+    // mislabel them; refuse instead (mirrors the builder's check).
+    if !bytes.starts_with(b"%PDF-") {
+        return Err(Error::NotPdf);
     }
     Ok(ExtractedPdf {
         bytes,
@@ -625,5 +659,38 @@ mod tests {
             ),
             Err(Error::Missing(_))
         ));
+    }
+
+    #[test]
+    fn extract_rejects_non_pdf_bytes() {
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::SOP_CLASS_UID, sop_class::ENCAPSULATED_PDF);
+        ds.put_bytes(tags::ENCAPSULATED_DOCUMENT, Vr::Ob, b"plain text".to_vec());
+        assert!(matches!(pdf_from_dataset(&ds), Err(Error::NotPdf)));
+    }
+
+    #[test]
+    fn builder_validates_uids_and_enums() {
+        let pdf = sample_pdf();
+        let mut meta = sample_meta();
+        meta.study_uid = "bad uid".into();
+        assert!(matches!(
+            pdf_to_dataset(&pdf, &meta),
+            Err(Error::InvalidMeta(_))
+        ));
+        let mut meta = sample_meta();
+        meta.sex = Some("Q".into());
+        assert!(matches!(
+            pdf_to_dataset(&pdf, &meta),
+            Err(Error::InvalidMeta(_))
+        ));
+        let mut meta = sample_meta();
+        meta.burned_in_annotation = "MAYBE".into();
+        assert!(matches!(
+            pdf_to_dataset(&pdf, &meta),
+            Err(Error::InvalidMeta(_))
+        ));
+        // Valid values still build.
+        assert!(pdf_to_dataset(&pdf, &sample_meta()).is_ok());
     }
 }

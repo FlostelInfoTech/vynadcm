@@ -5,32 +5,22 @@
 
 use std::sync::Arc;
 
-use tokio::net::TcpListener;
 use vyna_dcm::web::client::DicomWebClient;
-use vyna_dcm::web::hyper_server::serve_connection;
+use vyna_dcm::web::hyper_server::serve_forever;
 use vyna_dcm::web::server::{MemoryStore, test_file};
 
 #[tokio::main]
 async fn main() -> Result<(), String> {
     let store = Arc::new(MemoryStore::new());
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .map_err(|e| e.to_string())?;
-    let base = format!(
-        "http://{}",
-        listener.local_addr().map_err(|e| e.to_string())?
-    );
-    let (s2, b2) = (store.clone(), base.clone());
+    // Grab a free loopback port, then let `serve_forever` own the
+    // listener (its accept loop, connection cap, and error backoff).
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| e.to_string())?;
+    let bind = probe.local_addr().map_err(|e| e.to_string())?;
+    drop(probe);
+    let base = format!("http://{bind}");
+    let (s, b) = (store.clone(), base.clone());
     tokio::spawn(async move {
-        loop {
-            let Ok((tcp, _)) = listener.accept().await else {
-                break;
-            };
-            let (s, b) = (s2.clone(), b2.clone());
-            tokio::spawn(async move {
-                serve_connection(s, b, tcp).await.ok();
-            });
-        }
+        serve_forever(s, b, bind).await.ok();
     });
 
     let client = DicomWebClient::new(&base).map_err(|e| e.to_string())?;

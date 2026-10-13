@@ -457,13 +457,22 @@ impl Association {
         match self.recv().await? {
             DimseEvent::Released => Err(Error::Released),
             DimseEvent::Message(m) if m.command.field == CF::N_EVENT_REPORT_RQ => {
+                let report_id = m.command.message_id.unwrap_or(0);
                 if m.command.event_type_id != Some(1) {
+                    // Nack the report before failing: the peer awaits
+                    // this RSP and would otherwise hang to timeout.
+                    let rsp = Command::n_event_report_rsp(
+                        report_id,
+                        m.command.affected_sop_class_uid.clone(),
+                        m.command.affected_sop_instance_uid.clone(),
+                        status::PROCESSING_FAILURE,
+                    );
+                    self.send(m.context_id, &rsp, None).await?;
                     return Err(Error::BadCommand(format!(
                         "unexpected storage commitment event type {:?}, want 1",
                         m.command.event_type_id
                     )));
                 }
-                let report_id = m.command.message_id.unwrap_or(0);
                 let result = m.dataset.as_ref().map(parse_commitment_result).unwrap_or((
                     None,
                     Vec::new(),

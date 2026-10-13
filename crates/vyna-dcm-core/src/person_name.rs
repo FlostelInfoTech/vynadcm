@@ -47,6 +47,15 @@ impl NameComponents {
         }
     }
 
+    /// Encode one component group (`Family^Given^...`, trailing empty
+    /// components dropped).
+    #[must_use]
+    pub fn to_dicom_string(&self) -> String {
+        let mut out = String::new();
+        self.push_to(&mut out);
+        out
+    }
+
     fn push_to(&self, out: &mut String) {
         // `^` separators are significant only up to the last non-empty part.
         let parts = [

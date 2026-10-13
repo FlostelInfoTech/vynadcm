@@ -49,7 +49,7 @@ Items move to the SRS (`docs/requirements.md`) when scheduled.
 ### P0.1 Full PS3.6 dictionary + private creators — DONE
 
 Replaced the 266-entry curated table with the complete public registry
-(5,239 entries, PS3.6 2026d) plus private-creator mechanics (424
+(5,217 entries, PS3.6 2026d) plus private-creator mechanics (424
 creators / 8,898 entries) and the missing `SV` VR (35 variants).
 Accepted: registry/private spot tests, 96/96 green, clippy clean.
 
@@ -140,9 +140,9 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
 ## 5. Priority 2: deployment and robustness
 
 - **De-identification profiles** (PS3.15 E, dcm4che `deidentify`)
-  — DONE: shipped `vyna-dcm-deid` (`Deidentifier` + 197-tag
+  — DONE: shipped `vyna-dcm-deid` (`Deidentifier` + 636-row
   `BASIC_PROFILE` with dummy/zero/remove/UID-remap/date-shift
-  actions, sequence recursion, private/overlay rules, burned-in
+  actions, sequence recursion, private/overlay/curve rules, burned-in
   refusal) plus the batch `deidentify` CLI. Accepted: 14 engine
   unit tests + doc test, 3 CLI tests, ECG stays IOD-valid with
   identical samples post-run, 211/211 tests, clippy clean. Out of

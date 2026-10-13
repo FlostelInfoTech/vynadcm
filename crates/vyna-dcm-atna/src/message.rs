@@ -200,6 +200,9 @@ impl ParticipantObject {
 pub struct AuditMessage {
     /// Event ID triple.
     pub event: Code,
+    /// Event type triple, when the event splits further (e.g. IHE
+    /// Application Start/Stop refines DCM 110100).
+    pub event_type: Option<Code>,
     /// Event action.
     pub action: ActionCode,
     /// Event outcome.
@@ -222,6 +225,7 @@ impl AuditMessage {
     pub fn new(event: Code, action: ActionCode, source_id: impl Into<String>) -> Self {
         Self {
             event,
+            event_type: None,
             action,
             outcome: Outcome::Success,
             timestamp: vyna_dcm_core::utc_now_rfc3339(),
@@ -232,14 +236,14 @@ impl AuditMessage {
         }
     }
 
-    /// Application Activity start/stop (DCM 110100, Execute).
+    /// Application Activity start/stop (DCM 110100, Execute), refined
+    /// by the IHE EventTypeCode (DCM 110120 start / 110121 stop).
     pub fn actor_activity(
         app: &str,
         network_id: Option<&str>,
         source_id: &str,
         started: bool,
     ) -> Self {
-        let _ = started; // start and stop share the event; outcome carries failures
         let mut participant = Participant::application(app, true);
         participant.network_id = network_id.map(str::to_string);
         let mut msg = Self::new(
@@ -247,6 +251,11 @@ impl AuditMessage {
             ActionCode::Execute,
             source_id,
         );
+        msg.event_type = Some(if started {
+            Code::dcm("110120", "Application Start")
+        } else {
+            Code::dcm("110121", "Application Stop")
+        });
         msg.participants.push(participant);
         msg
     }
@@ -399,6 +408,9 @@ impl AuditMessage {
             self.outcome.code()
         ));
         out.push_str(&format!("{}\n", code_xml("EventID", &self.event)));
+        if let Some(event_type) = &self.event_type {
+            out.push_str(&format!("{}\n", code_xml("EventTypeCode", event_type)));
+        }
         out.push_str("</EventIdentification>\n");
         for p in &self.participants {
             out.push_str(&format!(
@@ -422,9 +434,16 @@ impl AuditMessage {
             out.push_str("</ActiveParticipant>\n");
         }
         out.push_str(&format!(
-            "<AuditSourceIdentification AuditSourceID=\"{}\" code=\"{}\"/>\n",
+            "<AuditSourceIdentification AuditSourceID=\"{}\">\n{}\n</AuditSourceIdentification>\n",
             escape(&self.source_id),
-            self.source_code
+            code_xml(
+                "AuditSourceTypeCode",
+                &Code::new(
+                    self.source_code.to_string(),
+                    "RFC-3881",
+                    audit_source_type_display(self.source_code),
+                ),
+            ),
         ));
         for o in &self.objects {
             out.push_str(&format!(
@@ -449,6 +468,22 @@ impl AuditMessage {
         }
         out.push_str("</AuditMessage>");
         out
+    }
+}
+
+/// RFC 3881 audit-source-type display names.
+fn audit_source_type_display(code: u8) -> &'static str {
+    match code {
+        1 => "End-user display device",
+        2 => "Data acquisition device",
+        3 => "Web server process",
+        4 => "Application server process",
+        5 => "Database server process",
+        6 => "Security server",
+        7 => "Network component",
+        8 => "Operating software",
+        9 => "External source",
+        _ => "Unknown audit source type",
     }
 }
 
@@ -526,6 +561,55 @@ mod tests {
             (a.event.code.as_str(), a.action),
             ("110100", ActionCode::Execute)
         );
+    }
+
+    #[test]
+    fn actor_activity_start_stop_are_distinguishable() {
+        let start = AuditMessage::actor_activity("APP", None, "SRC", true);
+        let stop = AuditMessage::actor_activity("APP", None, "SRC", false);
+        let start_type = start.event_type.as_ref().unwrap();
+        let stop_type = stop.event_type.as_ref().unwrap();
+        assert_eq!(
+            (start_type.code.as_str(), start_type.display.as_str()),
+            ("110120", "Application Start")
+        );
+        assert_eq!(
+            (stop_type.code.as_str(), stop_type.display.as_str()),
+            ("110121", "Application Stop")
+        );
+        let xml = start.to_xml();
+        assert!(
+            xml.contains(
+                "<EventTypeCode code=\"110120\" codeSystemName=\"DCM\" \
+                 displayName=\"Application Start\"/>"
+            ),
+            "{xml}"
+        );
+        // Other builders carry no EventTypeCode.
+        let plain = AuditMessage::study_deleted(None, "1.2.3", "APP", "SRC");
+        assert!(plain.event_type.is_none());
+        assert!(!plain.to_xml().contains("EventTypeCode"));
+    }
+
+    #[test]
+    fn audit_source_renders_type_child() {
+        let msg =
+            AuditMessage::instances_transferred(None, "1.2.3", &[], "A", None, "B", None, "SRC");
+        let xml = msg.to_xml();
+        // RFC 3881 shape: AuditSourceID attribute plus an
+        // AuditSourceTypeCode child — never a bare code attribute.
+        assert!(
+            xml.contains("<AuditSourceIdentification AuditSourceID=\"SRC\">"),
+            "{xml}"
+        );
+        assert!(
+            xml.contains(
+                "<AuditSourceTypeCode code=\"4\" codeSystemName=\"RFC-3881\" \
+                 displayName=\"Application server process\"/>"
+            ),
+            "{xml}"
+        );
+        assert!(!xml.contains("AuditSourceID=\"SRC\" code="), "{xml}");
     }
 
     #[test]

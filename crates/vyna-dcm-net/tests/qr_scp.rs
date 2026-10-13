@@ -16,17 +16,15 @@ use vyna_dcm_net::service::{
 use vyna_dcm_net::{AeTitle, Association, AssociationOptions};
 
 fn opts() -> AssociationOptions {
-    AssociationOptions {
-        read_timeout: Duration::from_secs(10),
-        ..Default::default()
-    }
+    let mut o = AssociationOptions::default();
+    o.read_timeout = Duration::from_secs(10);
+    o
 }
 
 fn acceptor() -> AcceptorOptions {
-    AcceptorOptions {
-        association: opts(),
-        ..Default::default()
-    }
+    let mut o = AcceptorOptions::default();
+    o.association = opts();
+    o
 }
 
 fn tmpdir(name: &str) -> PathBuf {
@@ -213,13 +211,12 @@ async fn move_delivers_to_destination() {
         "DEST".to_string(),
         ("127.0.0.1".to_string(), dest_addr.port()),
     );
-    let scp_opts = ScpOptions {
-        move_config: Some(ScpMoveConfig {
-            directory: Arc::new(HashMapDirectory { map }),
-            assoc_options: opts(),
-            calling_ae: AeTitle::new("FINDSCP").unwrap(),
-        }),
-    };
+    let mut scp_opts = ScpOptions::default();
+    scp_opts.move_config = Some(ScpMoveConfig {
+        directory: Arc::new(HashMapDirectory { map }),
+        assoc_options: opts(),
+        calling_ae: AeTitle::new("FINDSCP").unwrap(),
+    });
     let addr = serve_qr(QrIndex::scan(&dir).unwrap(), scp_opts).await;
     let mut assoc = connect(&addr, &[sop_class::STUDY_ROOT_MOVE]).await;
     let result = assoc
@@ -293,5 +290,136 @@ async fn mwl_matches_station() {
     assert_eq!(matches.len(), 1);
     assert_eq!(matches[0].string(tags::PATIENT_ID), Some("W1"));
     assoc.release().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn user_identity_gate_rejects_anonymous() {
+    use vyna_dcm_net::Error;
+    use vyna_dcm_net::pdu::UserIdentity;
+
+    let dir = qr_dir();
+    let index = QrIndex::scan(&dir).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut acc = acceptor();
+        // Reject everything: only the gate firing matters here.
+        acc.user_identity_auth = Some(std::sync::Arc::new(|_: &UserIdentity| None));
+        let _ = accept(stream, &acc, &QrScp::new(index), &ScpOptions::default()).await;
+    });
+    // The SCU sends no user identity, so the gate rejects.
+    let err = vyna_dcm_net::Association::request(
+        &opts(),
+        &AeTitle::new("SCU").unwrap(),
+        &AeTitle::new("SCP").unwrap(),
+        &addr,
+        propose(
+            &[sop_class::STUDY_ROOT_FIND],
+            &[
+                TransferSyntax::ExplicitVrLittleEndian,
+                TransferSyntax::ImplicitVrLittleEndian,
+            ],
+        )
+        .unwrap(),
+    )
+    .await
+    .err()
+    .expect("anonymous association was accepted");
+    assert!(matches!(err, Error::Rejected { .. }), "{err:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+struct NHandlers;
+
+impl Handlers for NHandlers {
+    async fn on_n_get(&self, _ctx: &RequestContext<'_>) -> (u16, Option<DataSet>) {
+        let mut ds = DataSet::new();
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "N123");
+        (0x0000, Some(ds))
+    }
+
+    async fn on_n_delete(&self, _ctx: &RequestContext<'_>) -> u16 {
+        0x0000
+    }
+
+    async fn on_n_event_report(&self, _ctx: &RequestContext<'_>, _dataset: Option<DataSet>) -> u16 {
+        0x0000
+    }
+}
+
+#[tokio::test]
+async fn n_services_dispatch_loopback() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        accept(stream, &acceptor(), &NHandlers, &ScpOptions::default())
+            .await
+            .unwrap();
+    });
+    let sop = sop_class::MODALITY_PERFORMED_PROCEDURE_STEP;
+    let mut assoc = connect(&addr, &[sop]).await;
+    let (s, ds) = assoc.n_get(sop, "1.2.9.9", vec![]).await.unwrap();
+    assert_eq!(s, 0x0000);
+    assert_eq!(ds.unwrap().string(tags::PATIENT_ID), Some("N123"));
+    assert_eq!(assoc.n_delete(sop, "1.2.9.9").await.unwrap(), 0x0000);
+    assert_eq!(
+        assoc.n_event_report(sop, "1.2.9.9", 1, None).await.unwrap(),
+        0x0000
+    );
+    assoc.release().await.unwrap();
+}
+
+#[tokio::test]
+async fn release_during_get_is_clean() {
+    use vyna_dcm_net::dimse::command_field as cf;
+    use vyna_dcm_net::{Command, DimseEvent};
+
+    let dir = qr_dir();
+    let index = QrIndex::scan(&dir).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        stream.set_nodelay(true).unwrap();
+        accept(
+            stream,
+            &acceptor(),
+            &QrScp::new(index),
+            &ScpOptions::default(),
+        )
+        .await
+    });
+    let mut assoc = connect(&addr, &[sop_class::STUDY_ROOT_GET, sop_class::CT_IMAGE]).await;
+    // Manual C-GET: read the first C-STORE-RQ, then release without
+    // acking it, so the SCP sits in its store-wait when RELEASE arrives.
+    let ctx = assoc
+        .context_for(sop_class::STUDY_ROOT_GET)
+        .unwrap()
+        .clone();
+    let id = assoc.next_message_id();
+    let mut q = DataSet::new();
+    q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "IMAGE");
+    q.put_text(tags::SOP_INSTANCE_UID, Vr::Ui, "1.2.2.1.1");
+    assoc
+        .send(
+            ctx.id,
+            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET),
+            Some(&q),
+        )
+        .await
+        .unwrap();
+    let first = assoc.recv().await.unwrap();
+    assert!(
+        matches!(&first, DimseEvent::Message(m) if m.command.field == cf::C_STORE_RQ),
+        "expected C-STORE-RQ, got {first:?}"
+    );
+    assoc.release().await.unwrap();
+    // SCP side: quiet Ok — erroring here used to send A-ABORT after the
+    // release completed.
+    server.await.unwrap().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }

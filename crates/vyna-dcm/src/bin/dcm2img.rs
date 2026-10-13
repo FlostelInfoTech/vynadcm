@@ -3,8 +3,8 @@
 //! Supports MONOCHROME1/2 at 8/16 bits and RGB at 8 bits; YBR,
 //! palette, and sub-byte depths are refused (transcode first).
 
-#[path = "common.rs"]
-mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 use std::path::PathBuf;
 
@@ -40,6 +40,6 @@ fn run(args: &Args) -> Result<(), String> {
     let (meta, ds) = read_part10(&bytes).map_err(|e| e.to_string())?;
     let ts = meta.transfer_syntax().map_err(|e| e.to_string())?;
     let png = frame_to_png(&ds, ts, args.frame).map_err(|e| e.to_string())?;
-    common::write_atomic(&args.output, &png).map_err(|e| e.to_string())?;
+    iocommon::write_atomic(&args.output, &png).map_err(|e| e.to_string())?;
     Ok(())
 }

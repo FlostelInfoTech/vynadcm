@@ -452,6 +452,12 @@ pub fn record_type_for_sop_class(sop_class_uid: &str) -> &'static str {
             "SR DOCUMENT"
         }
         sop_class::KEY_OBJECT_SELECTION => "KEY OBJECT DOC",
+        sop_class::ENCAPSULATED_PDF => "ENCAP DOC",
+        sop_class::ENCAPSULATED_CDA => "HL7 STRUC DOC",
+        // The whole 1.2.840.10008.5.1.4.1.1.9.* family is waveform SOPs
+        // (ECG, hemodynamic/EP, audio, pulse, respiratory, EEG, EMG,
+        // ...), present and future: PS3.11 F.5.24 WAVEFORM records.
+        uid if uid.starts_with("1.2.840.10008.5.1.4.1.1.9.") => "WAVEFORM",
         _ => "IMAGE",
     }
 }
@@ -1017,6 +1023,27 @@ mod tests {
             record_type_for_sop_class("1.2.840.10008.5.1.4.1.1.2"),
             "IMAGE"
         );
+        // Waveform family (PS3.11 F.5.24), present and future members.
+        assert_eq!(
+            record_type_for_sop_class(sop_class::TWELVE_LEAD_ECG_WAVEFORM),
+            "WAVEFORM"
+        );
+        assert_eq!(
+            record_type_for_sop_class(sop_class::HEMODYNAMIC_WAVEFORM),
+            "WAVEFORM"
+        );
+        assert_eq!(
+            record_type_for_sop_class("1.2.840.10008.5.1.4.1.1.9.9.9"),
+            "WAVEFORM"
+        );
+        assert_eq!(
+            record_type_for_sop_class(sop_class::ENCAPSULATED_PDF),
+            "ENCAP DOC"
+        );
+        assert_eq!(
+            record_type_for_sop_class(sop_class::ENCAPSULATED_CDA),
+            "HL7 STRUC DOC"
+        );
         assert_eq!(record_type_for_sop_class("9.9.9.9"), "IMAGE");
         // Explicit override wins, including PRIVATE.
         let dss = ct_sets();
@@ -1032,6 +1059,37 @@ mod tests {
             dir.patients[0].studies[0].series[0].instances[0].record_type,
             "PRIVATE"
         );
+    }
+
+    #[test]
+    fn waveform_and_encap_leaves_build() {
+        let wave = img_ds(
+            sop_class::TWELVE_LEAD_ECG_WAVEFORM,
+            "1.9.1",
+            "P9",
+            "1.9",
+            "1.9.1",
+            "ECG",
+            "1",
+        );
+        let pdf = img_ds(
+            sop_class::ENCAPSULATED_PDF,
+            "1.9.2",
+            "P9",
+            "1.9",
+            "1.9.2",
+            "DOC",
+            "1",
+        );
+        let entries = vec![
+            entry(&wave, &["W1"], "1.2.840.10008.1.2.1", None),
+            entry(&pdf, &["D1"], "1.2.840.10008.1.2.1", None),
+        ];
+        let bytes = build_dicomdir(&entries, None).unwrap();
+        let dir = read_dicomdir(&bytes).unwrap();
+        let series = &dir.patients[0].studies[0].series;
+        assert_eq!(series[0].instances[0].record_type, "WAVEFORM");
+        assert_eq!(series[1].instances[0].record_type, "ENCAP DOC");
     }
 
     #[test]

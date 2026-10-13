@@ -23,4 +23,8 @@ pub enum Error {
     /// Encapsulated Document holds a value that is not bytes or fragments.
     #[error("Encapsulated Document has no extractable bytes")]
     NoDocumentBytes,
+    /// Caller-supplied metadata is not valid DICOM (bad UID syntax or
+    /// an enumerated value outside its set).
+    #[error("invalid metadata: {0}")]
+    InvalidMeta(String),
 }

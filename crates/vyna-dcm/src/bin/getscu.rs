@@ -2,6 +2,8 @@
 
 #[path = "common.rs"]
 mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 use std::path::PathBuf;
 
@@ -129,7 +131,7 @@ async fn main() -> Result<()> {
             let meta = FileMeta::new(&class, &inst, TransferSyntax::ExplicitVrLittleEndian);
             let path = dir.join(format!("{}.dcm", safe_instance_filename(&inst)));
             let status = match vyna_dcm::write_part10(&meta, &ds) {
-                Ok(bytes) => match common::write_atomic(&path, &bytes) {
+                Ok(bytes) => match iocommon::write_atomic(&path, &bytes) {
                     Ok(()) => {
                         count += 1;
                         println!("stored {inst} -> {}", path.display());

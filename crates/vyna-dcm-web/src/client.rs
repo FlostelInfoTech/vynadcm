@@ -106,17 +106,36 @@ impl DicomWebClient {
         // reqwest 0.13 `rustls-no-provider` needs the app to install a
         // provider; ignore failure (another ring install already done).
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
-            // A hung server must not hang us forever; bulk transfers
-            // can legitimately take minutes, hence the budget.
-            .timeout(std::time::Duration::from_secs(300))
-            .build()
-            .map_err(|e| Error::Http(e.to_string()))?;
+        // A hung server must not hang us forever; bulk transfers
+        // can legitimately take minutes, hence the budget.
+        let http = Self::build_http(std::time::Duration::from_secs(300))?;
         Ok(Self {
             http,
             base_url: base,
             auth: None,
         })
+    }
+
+    /// rustls client config verifying against the OS (native) trust
+    /// store via `rustls-platform-verifier` — without this, reqwest's
+    /// `rustls-no-provider` build ships no roots and every HTTPS
+    /// request fails verification.
+    fn platform_tls_config() -> Result<rustls::ClientConfig> {
+        use rustls_platform_verifier::BuilderVerifierExt;
+        rustls::ClientConfig::builder()
+            .with_platform_verifier()
+            .map_err(|e| Error::Http(format!("platform TLS verifier: {e}")))
+            .map(|b| b.with_no_client_auth())
+    }
+
+    /// Shared HTTP engine (also used by [`Self::with_timeout`], which
+    /// rebuilds the immutable reqwest client).
+    fn build_http(timeout: std::time::Duration) -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .use_preconfigured_tls(Self::platform_tls_config()?)
+            .build()
+            .map_err(|e| Error::Http(e.to_string()))
     }
 
     /// Use bearer-token auth.
@@ -141,7 +160,7 @@ impl DicomWebClient {
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         // `reqwest` clients are immutable once built; rebuild with
         // the same settings plus the new timeout.
-        match reqwest::Client::builder().timeout(timeout).build() {
+        match Self::build_http(timeout) {
             Ok(http) => self.http = http,
             Err(e) => tracing::warn!("client rebuild for timeout failed ({e}); keeping old client"),
         }
@@ -512,7 +531,13 @@ impl DicomWebClient {
                     .map(str::to_string)
             })
             .or_else(|| {
-                // XML form: <RetrieveURL>...</RetrieveURL>
+                // XML form: the literal `<RetrieveURL>` element text.
+                // Deliberately not a general XML parser (no namespaces,
+                // entities, or CDATA handling per W3C XML 1.0
+                // <https://www.w3.org/TR/xml/>): the Native DICOM Model
+                // (PS3.19) response carries the URL as plain element
+                // text, and anything fancier falls through to `None`
+                // while `raw_body` keeps the full response.
                 let text = String::from_utf8_lossy(&raw);
                 let start = text.find("<RetrieveURL>")? + "<RetrieveURL>".len();
                 let end = text[start..].find("</RetrieveURL>")? + start;
@@ -679,6 +704,90 @@ pub struct StowResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+
+    /// The platform TLS config must verify against the OS store: a
+    /// loopback server trusted only via `SSL_CERT_FILE` handshakes,
+    /// and the same server without it is refused. (The verifier
+    /// probes the store per config, so the two directions share one
+    /// server thread but build separate configs.)
+    #[test]
+    fn https_verifies_against_platform_store() {
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let ca_path = std::env::temp_dir().join(format!("vyna-web-tls-{}.pem", std::process::id()));
+        std::fs::write(&ca_path, certified.cert.pem().as_bytes()).unwrap();
+
+        let server_config = Arc::new(
+            rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(
+                    vec![certified.cert.der().clone()],
+                    rustls::pki_types::PrivateKeyDer::Pkcs8(
+                        rustls::pki_types::PrivatePkcs8KeyDer::from(
+                            certified.signing_key.serialize_der(),
+                        ),
+                    ),
+                )
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let Ok((tcp, _)) = listener.accept() else {
+                    break;
+                };
+                tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .ok();
+                let mut conn = rustls::ServerConnection::new(server_config.clone()).unwrap();
+                let mut sock = tcp;
+                let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+                let mut buf = [0u8; 5];
+                // The untrusted attempt dies in the handshake; that
+                // error is the expected negative, not a failure.
+                if tls.read_exact(&mut buf).is_ok() {
+                    let _ = tls.write_all(&buf);
+                }
+            }
+        });
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let name: rustls::pki_types::ServerName<'static> = "127.0.0.1".try_into().unwrap();
+        let round_trip = |config: Arc<rustls::ClientConfig>| {
+            let mut conn = rustls::ClientConnection::new(config, name.clone()).unwrap();
+            let sock = std::net::TcpStream::connect(addr).unwrap();
+            sock.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .ok();
+            let mut sock = sock;
+            let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+            tls.write_all(b"hello")?;
+            let mut buf = [0u8; 5];
+            tls.read_exact(&mut buf)?;
+            std::io::Result::Ok(buf)
+        };
+
+        // Trusted via the platform store hook: echo works.
+        unsafe { std::env::set_var("SSL_CERT_FILE", &ca_path) };
+        let trusted = DicomWebClient::platform_tls_config().unwrap();
+        let echo = round_trip(Arc::new(trusted)).expect("trusted handshake failed");
+        assert_eq!(&echo, b"hello");
+        // Same server, no trust anchor: verification must refuse.
+        unsafe { std::env::remove_var("SSL_CERT_FILE") };
+        let untrusted = DicomWebClient::platform_tls_config().unwrap();
+        assert!(
+            round_trip(Arc::new(untrusted)).is_err(),
+            "untrusted server must fail verification"
+        );
+        // The public constructor wires the same config.
+        let client = DicomWebClient::new(format!("https://{addr}/x"))
+            .unwrap()
+            .with_timeout(std::time::Duration::from_secs(5));
+        assert!(client.base_url.starts_with("https://"));
+
+        server.join().unwrap();
+        let _ = std::fs::remove_file(&ca_path);
+    }
 
     fn params(req: &WadoUriRequest) -> Vec<(String, String)> {
         DicomWebClient::wado_uri_params(req)
@@ -851,5 +960,60 @@ mod tests {
         );
         assert!(basic.contains("ann"), "{basic}");
         assert!(!basic.contains("hunter2"), "{basic}");
+    }
+
+    #[tokio::test]
+    async fn stow_xml_fallback_extracts_retrieve_url() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Raw-socket stub (no hyper needed): answers the STOW POST with
+        // the legacy XML store response instead of dicom+json.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = vec![0u8; 65536];
+            let mut have = 0usize;
+            let body_len = loop {
+                let n = tcp.read(&mut head[have..]).await.unwrap();
+                have += n;
+                let text = String::from_utf8_lossy(&head[..have]);
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .split("\r\n")
+                        .find_map(|l| {
+                            l.split_once(':').and_then(|(k, v)| {
+                                (k.trim().eq_ignore_ascii_case("content-length"))
+                                    .then(|| v.trim().parse::<usize>().unwrap_or(0))
+                            })
+                        })
+                        .unwrap_or(0);
+                    let mut left = len + end + 4 - have;
+                    while left > 0 {
+                        let mut sink = vec![0u8; left.min(65536)];
+                        let n = tcp.read(&mut sink).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        left -= n;
+                    }
+                    break len;
+                }
+            };
+            assert!(body_len > 0, "stub got an empty STOW body");
+            let xml = "<NativeDicomModel><RetrieveURL>http://stub/studies/1.2.9</RetrieveURL></NativeDicomModel>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/dicom+xml\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{xml}",
+                xml.len()
+            );
+            tcp.write_all(resp.as_bytes()).await.unwrap();
+        });
+        let client = DicomWebClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let stow = client.stow(None, &[vec![0u8; 8]]).await.unwrap();
+        assert_eq!(stow.status, 200);
+        assert_eq!(
+            stow.retrieve_url.as_deref(),
+            Some("http://stub/studies/1.2.9")
+        );
     }
 }

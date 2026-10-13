@@ -1,8 +1,8 @@
 //! File-backed Query/Retrieve index + C-FIND matching (backs `findscp`).
 //!
 //! - [`QrIndex::scan`] walks a directory of Part-10 files, keeping one
-//!   header dataset (pixel data stripped) per file. Unreadable files
-//!   are skipped with a warning, never fatal.
+//!   header dataset (pixel data never decoded) per file. Unreadable
+//!   files are skipped with a warning, never fatal.
 //! - Matching follows PS3.4 C.2.2.2: universal (empty), single value,
 //!   wildcard (`*`/`?`), UID lists (OR), date/time/numeric ranges, and
 //!   nested sequence items. PN single values match leading `^`
@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use vyna_dcm_codec::read_part10;
+use vyna_dcm_codec::{read_part10, read_part10_header};
 use vyna_dcm_core::{DataElement, DataSet, Tag, Value, Vr, tags};
 
 use crate::dimse::status;
@@ -103,8 +103,9 @@ impl QrIndex {
 
     fn read_header(path: &Path) -> Option<DataSet> {
         let bytes = std::fs::read(path).ok()?;
-        let (_, mut ds) = read_part10(&bytes).ok()?;
-        ds.remove(tags::PIXEL_DATA);
+        // Header-only: pixel data (and anything after it) is never
+        // decoded, so the transient stays headers-sized, not file-sized.
+        let (_, mut ds) = read_part10_header(&bytes).ok()?;
         // Overlay planes can be large; they are never query keys.
         for group in 0x6000..0x6020u16 {
             ds.remove(Tag::new(group, 0x3000));
@@ -132,20 +133,28 @@ const MAX_QR_MATCHES: usize = 10_000;
 /// local nesting must not overflow the stack.
 const MAX_SCAN_DEPTH: usize = 64;
 
+/// Maximum match values one query may carry (across all keys and
+/// nested sequence items): a crafted multi-valued query must fail
+/// `A700`/`A701`, not burn CPU/RAM per record.
+const MAX_QUERY_VALUES: usize = 10_000;
+
 /// Run a C-FIND query (`mwl` selects worklist matching): status plus
 /// one response dataset per match, capped at `MAX_QR_MATCHES` (10,000).
 pub fn find_matches(index: &QrIndex, query: &DataSet, mwl: bool) -> (u16, Vec<DataSet>) {
+    let Some(compiled) = compile_query(query) else {
+        return (status::OUT_OF_RESOURCES, Vec::new());
+    };
     if mwl {
         let mut out = Vec::new();
         for r in index
             .records
             .iter()
-            .filter(|r| dataset_matches(&r.dataset, query))
+            .filter(|r| dataset_matches(&r.dataset, &compiled))
         {
             if out.len() >= MAX_QR_MATCHES {
                 return (status::OUT_OF_RESOURCES, Vec::new());
             }
-            out.push(build_response(&r.dataset, query));
+            out.push(build_response(&r.dataset, query, &compiled));
         }
         return (status::SUCCESS, out);
     }
@@ -156,7 +165,7 @@ pub fn find_matches(index: &QrIndex, query: &DataSet, mwl: bool) -> (u16, Vec<Da
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     for record in &index.records {
-        if !dataset_matches(&record.dataset, query) {
+        if !dataset_matches(&record.dataset, &compiled) {
             continue;
         }
         let Some(key) = level_key(&record.dataset, level) else {
@@ -166,7 +175,7 @@ pub fn find_matches(index: &QrIndex, query: &DataSet, mwl: bool) -> (u16, Vec<Da
             if out.len() >= MAX_QR_MATCHES {
                 return (status::OUT_OF_RESOURCES, Vec::new());
             }
-            out.push(build_response(&record.dataset, query));
+            out.push(build_response(&record.dataset, query, &compiled));
         }
     }
     (status::SUCCESS, out)
@@ -207,43 +216,97 @@ fn level_key(ds: &DataSet, level: QrLevel) -> Option<String> {
     ds.string(tag).map(str::to_string)
 }
 
-/// True when every query key matches the record.
-fn dataset_matches(record: &DataSet, query: &DataSet) -> bool {
-    query.iter().all(|(tag, qel)| {
+/// One compiled match key: the query side rendered once, not per
+/// record, with the total value count capped at compile time.
+#[derive(Clone, Debug)]
+enum CompiledKey {
+    /// Empty query value: matches anything present or absent.
+    Universal,
+    /// Pre-rendered match patterns plus the query VR.
+    Values { vr: Vr, patterns: Vec<String> },
+    /// Nested sequence items, compiled recursively.
+    Sequence(Vec<CompiledQuery>),
+}
+
+/// A query compiled for matching (level key excluded: control, not
+/// match, key).
+#[derive(Clone, Debug, Default)]
+struct CompiledQuery(Vec<(Tag, CompiledKey)>);
+
+/// Render the query side once; `None` when the query carries more
+/// than [`MAX_QUERY_VALUES`] match values (callers fail out-of-resources).
+fn compile_query(query: &DataSet) -> Option<CompiledQuery> {
+    let mut budget = MAX_QUERY_VALUES;
+    compile_level(query, &mut budget)
+}
+
+fn compile_level(query: &DataSet, budget: &mut usize) -> Option<CompiledQuery> {
+    let mut out = Vec::new();
+    for (tag, qel) in query.iter() {
         if tag == tags::QUERY_RETRIEVE_LEVEL {
-            return true; // control key, not a match key
+            continue;
         }
-        match (&qel.value, record.get(tag)) {
-            (Value::Empty, _) => true, // universal match
-            (_, None) => false,        // constrained key, absent tag
-            (Value::Sequence(qitems), Some(rel)) => match &rel.value {
+        match &qel.value {
+            Value::Empty => out.push((tag, CompiledKey::Universal)),
+            Value::Sequence(qitems) => {
+                let mut items = Vec::with_capacity(qitems.len());
+                for qi in qitems {
+                    items.push(compile_level(qi, budget)?);
+                }
+                out.push((tag, CompiledKey::Sequence(items)));
+            }
+            qv => {
+                let patterns = value_strings(qv);
+                *budget = budget.checked_sub(patterns.len())?;
+                out.push((
+                    tag,
+                    CompiledKey::Values {
+                        vr: qel.vr,
+                        patterns,
+                    },
+                ));
+            }
+        }
+    }
+    Some(CompiledQuery(out))
+}
+
+/// True when every query key matches the record.
+fn dataset_matches(record: &DataSet, query: &CompiledQuery) -> bool {
+    query.0.iter().all(|(tag, key)| {
+        match (key, record.get(*tag)) {
+            (CompiledKey::Universal, _) => true, // universal match
+            (_, None) => false,                  // constrained key, absent tag
+            (CompiledKey::Sequence(qitems), Some(rel)) => match &rel.value {
                 Value::Sequence(ritems) => qitems
                     .iter()
                     .all(|qi| ritems.iter().any(|ri| dataset_matches(ri, qi))),
                 _ => false,
             },
-            (qv, Some(rel)) => {
-                let patterns = value_strings(qv);
+            (CompiledKey::Values { vr, patterns }, Some(rel)) => {
                 let values = value_strings(&rel.value);
-                patterns.iter().any(|p| value_matches(p, &values, qel.vr))
+                patterns.iter().any(|p| value_matches(p, &values, *vr))
             }
         }
     })
 }
 
 /// Response: the requested keys with record values (+ echoed level).
-fn build_response(record: &DataSet, query: &DataSet) -> DataSet {
+fn build_response(record: &DataSet, query: &DataSet, compiled: &CompiledQuery) -> DataSet {
     let mut out = DataSet::new();
-    for (tag, qel) in query.iter() {
-        if tag == tags::QUERY_RETRIEVE_LEVEL {
-            out.insert(DataElement::new(tag, qel.vr, qel.value.clone()));
-            continue;
-        }
-        let Some(rel) = record.get(tag) else {
+    if let Some(qel) = query.get(tags::QUERY_RETRIEVE_LEVEL) {
+        out.insert(DataElement::new(
+            tags::QUERY_RETRIEVE_LEVEL,
+            qel.vr,
+            qel.value.clone(),
+        ));
+    }
+    for (tag, key) in &compiled.0 {
+        let Some(rel) = record.get(*tag) else {
             continue;
         };
-        let value = match (&qel.value, &rel.value) {
-            (Value::Sequence(qitems), Value::Sequence(ritems)) => Value::Sequence(
+        let value = match (key, &rel.value) {
+            (CompiledKey::Sequence(qitems), Value::Sequence(ritems)) => Value::Sequence(
                 ritems
                     .iter()
                     .filter(|ri| qitems.iter().any(|qi| dataset_matches(ri, qi)))
@@ -252,7 +315,7 @@ fn build_response(record: &DataSet, query: &DataSet) -> DataSet {
             ),
             _ => rel.value.clone(),
         };
-        out.insert(DataElement::new(tag, rel.vr, value));
+        out.insert(DataElement::new(*tag, rel.vr, value));
     }
     out
 }
@@ -470,13 +533,23 @@ impl StgCommitScp {
                     .collect()
             })
             .unwrap_or_default();
+        // Held-set built once: per-ref linear scans would be
+        // O(refs x records) on peer-controlled N-ACTION input.
+        let held: HashSet<(&str, &str)> = self
+            .index
+            .records
+            .iter()
+            .filter_map(|r| {
+                Some((
+                    r.dataset.string(tags::SOP_CLASS_UID)?,
+                    r.dataset.string(tags::SOP_INSTANCE_UID)?,
+                ))
+            })
+            .collect();
         let (mut ok, mut failed) = (Vec::new(), Vec::new());
         for (class, inst) in refs {
-            let held = self.index.records.iter().any(|r| {
-                r.dataset.string(tags::SOP_CLASS_UID) == Some(class.as_str())
-                    && r.dataset.string(tags::SOP_INSTANCE_UID) == Some(inst.as_str())
-            });
-            if held {
+            let is_held = held.contains(&(class.as_str(), inst.as_str()));
+            if is_held {
                 let mut item = DataSet::new();
                 item.put_uid(tags::REFERENCED_SOP_CLASS_UID, class);
                 item.put_uid(tags::REFERENCED_SOP_INSTANCE_UID, inst);
@@ -579,11 +652,17 @@ fn retrieve_plan(index: &QrIndex, query: &DataSet) -> (u16, RetrievePlan) {
     if query_level(query).is_err() {
         return (status::DATASET_MISMATCH, RetrievePlan::buffered(Vec::new()));
     }
+    let Some(compiled) = compile_query(query) else {
+        return (
+            status::UNABLE_TO_CALCULATE_MATCHES,
+            RetrievePlan::buffered(Vec::new()),
+        );
+    };
     let mut seen = HashSet::new();
     let mut paths = Vec::new();
     let mut classes: Vec<String> = Vec::new();
     for record in &index.records {
-        if !dataset_matches(&record.dataset, query) {
+        if !dataset_matches(&record.dataset, &compiled) {
             continue;
         }
         let Some(key) = level_key(&record.dataset, QrLevel::Image) else {
@@ -742,6 +821,51 @@ mod tests {
         );
     }
 
+    fn uid_list_query(n: usize) -> DataSet {
+        let mut q = DataSet::new();
+        q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "IMAGE");
+        let uids: Vec<String> = (0..n).map(|i| format!("1.9.{i}")).collect();
+        q.insert(DataElement::texts(tags::SOP_INSTANCE_UID, Vr::Ui, uids));
+        q
+    }
+
+    #[test]
+    fn query_value_flood_fails_out_of_resources() {
+        let idx = index();
+        // One value over budget: A700, no responses.
+        let (s, m) = find_matches(&idx, &uid_list_query(MAX_QUERY_VALUES + 1), false);
+        assert_eq!(s, status::OUT_OF_RESOURCES);
+        assert!(m.is_empty());
+        // Exactly at budget: evaluated normally.
+        let (s, _) = find_matches(&idx, &uid_list_query(MAX_QUERY_VALUES), false);
+        assert_eq!(s, status::SUCCESS);
+        // MOVE/GET planning fails A701 on the same flood.
+        let (s, _) = retrieve_plan(&idx, &uid_list_query(MAX_QUERY_VALUES + 1));
+        assert_eq!(s, status::UNABLE_TO_CALCULATE_MATCHES);
+    }
+
+    #[test]
+    fn query_value_budget_spans_nesting() {
+        let idx = index();
+        // 6000 values in a sequence item plus 4001 at top level share
+        // one budget: 10001 total fails.
+        let mut q = DataSet::new();
+        q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "STUDY");
+        let mut item = DataSet::new();
+        item.insert(DataElement::texts(
+            tags::SOP_INSTANCE_UID,
+            Vr::Ui,
+            (0..6000).map(|i| format!("1.8.{i}")).collect(),
+        ));
+        q.put_sequence(tags::REFERENCED_SERIES_SEQUENCE, vec![item]);
+        q.insert(DataElement::texts(
+            tags::SERIES_INSTANCE_UID,
+            Vr::Ui,
+            (0..4001).map(|i| format!("1.7.{i}")).collect(),
+        ));
+        assert_eq!(find_matches(&idx, &q, false).0, status::OUT_OF_RESOURCES);
+    }
+
     #[tokio::test]
     async fn retrieve_flood_fails_at_plan_time() {
         // One shared file keeps the fixture cheap; distinct index keys
@@ -861,6 +985,32 @@ mod tests {
         std::os::unix::fs::symlink("/nonexistent-target", dir.join("dangling")).unwrap();
         let index = QrIndex::scan(&dir).unwrap();
         assert!(index.records.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn scan_reads_headers_only() {
+        let dir = std::env::temp_dir().join(format!("qrdb-header-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut ds = DataSet::new();
+        ds.put_text(tags::SOP_CLASS_UID, Vr::Ui, sop_class::CT_IMAGE);
+        ds.put_text(tags::SOP_INSTANCE_UID, Vr::Ui, "1.2.9.1");
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "PH");
+        ds.put_bytes(tags::PIXEL_DATA, Vr::Ow, vec![0xABu8; 1024]);
+        let meta = vyna_dcm_codec::FileMeta::new(
+            sop_class::CT_IMAGE,
+            "1.2.9.1",
+            vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian,
+        );
+        let bytes = vyna_dcm_codec::write_part10(&meta, &ds).unwrap();
+        std::fs::write(dir.join("px.dcm"), bytes).unwrap();
+        let index = QrIndex::scan(&dir).unwrap();
+        assert_eq!(index.records.len(), 1);
+        let got = &index.records[0].dataset;
+        // Header keys indexed, pixel bytes never decoded.
+        assert_eq!(got.string(tags::PATIENT_ID), Some("PH"));
+        assert!(got.get(tags::PIXEL_DATA).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

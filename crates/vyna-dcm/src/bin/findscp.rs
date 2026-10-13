@@ -134,8 +134,7 @@ async fn main() -> Result<()> {
     let tls = args.listen.tls_acceptor()?;
 
     let mut acceptor = AcceptorOptions::default();
-    acceptor.ae_title =
-        AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?;
+    acceptor.ae_title = AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?;
     acceptor.association = args.listen.assoc_options();
     acceptor.check_called_ae = args.listen.strict_ae;
     let handlers = Arc::new(FindScp {
@@ -152,8 +151,7 @@ async fn main() -> Result<()> {
                 map: parse_routes(&args.routes)?,
             }),
             assoc_options: args.listen.assoc_options(),
-            calling_ae: AeTitle::new(args.listen.ae_title.clone())
-                .map_err(|e| e.to_string())?,
+            calling_ae: AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?,
         })
     };
 

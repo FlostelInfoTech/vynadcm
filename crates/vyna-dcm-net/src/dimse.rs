@@ -725,10 +725,16 @@ impl Command {
 /// Encode a command set: Implicit VR LE with leading group length.
 pub fn encode_command(cmd: &Command) -> Result<Vec<u8>> {
     let mut body = encode_dataset(&cmd.to_dataset(), TransferSyntax::ImplicitVrLittleEndian)?;
+    let group_len = u32::try_from(body.len()).map_err(|_| {
+        Error::BadPdu(format!(
+            "command set ({} bytes) exceeds the u32 group length",
+            body.len()
+        ))
+    })?;
     let mut out = Vec::with_capacity(body.len() + 12);
     out.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // (0000,0000)
     out.extend_from_slice(&[0x04, 0x00, 0x00, 0x00]); // UL, len 4
-    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&group_len.to_le_bytes());
     out.append(&mut body);
     Ok(out)
 }

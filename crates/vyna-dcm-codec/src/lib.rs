@@ -59,7 +59,9 @@ pub use jpeg_lossless::JpegLosslessCodec;
 pub use jpeg_ls::JpegLsCodec;
 pub use json::{dataset_from_json, dataset_to_json};
 pub(crate) use part10::meta_section_len;
-pub use part10::{FileMeta, META_VERSION, PREFIX_LEN, read_part10, write_part10};
+pub use part10::{
+    FileMeta, META_VERSION, PREFIX_LEN, read_part10, read_part10_header, write_part10,
+};
 pub use transcode::{TranscodeOptions, transcode_dataset};
 pub use vyna_dcm_core::TransferSyntax;
 pub use xml::{dataset_from_xml, dataset_to_xml};

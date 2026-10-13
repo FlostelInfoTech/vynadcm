@@ -42,6 +42,7 @@ impl SampleInterpretation {
 
 /// One ECG lead (channel).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EcgLead {
     /// Channel label, e.g. `"II"`, `"V5"`.
     pub label: String,
@@ -118,6 +119,7 @@ impl EcgLead {
 
 /// A multi-lead ECG recording (one multiplex group).
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct EcgRecording {
     /// Leads in channel order.
     pub leads: Vec<EcgLead>,

@@ -27,10 +27,12 @@ struct Args {
     /// Shift dates by DAYS instead of zeroing them (negative shifts back).
     #[arg(long)]
     date_offset: Option<i64>,
-    /// Replacement patient ID (default: ANONYMIZED).
+    /// Dummy text for ID-like `Dummy`-action tags (default:
+    /// ANONYMIZED). Patient ID itself is emptied per E.1 `Z`.
     #[arg(long)]
     patient_id: Option<String>,
-    /// Replacement patient name (default: ANONYMIZED).
+    /// Dummy text for name-like `Dummy`-action tags (default:
+    /// ANONYMIZED). Patient's Name itself is removed per E.1 `X`.
     #[arg(long)]
     patient_name: Option<String>,
     /// Keep private data elements (default: removed).
@@ -268,9 +270,11 @@ mod tests {
         );
         std::fs::write(&input, vyna_dcm::write_part10(&meta, &ds).unwrap()).unwrap();
         let summary = process_file(&mut Deidentifier::new(), &input, &output).unwrap();
-        assert!(summary.contains("1 dummied"), "{summary}");
+        // Patient ID is E.1 `Z`: zeroed (kept but emptied), not dummied.
+        assert!(summary.contains("1 zeroed"), "{summary}");
         let (meta2, ds2) = read_part10(&std::fs::read(&output).unwrap()).unwrap();
-        assert_eq!(ds2.string(tags::PATIENT_ID), Some("ANONYMIZED"));
+        assert_eq!(ds2.string(tags::PATIENT_ID), None);
+        assert!(ds2.contains(tags::PATIENT_ID));
         assert_eq!(
             meta2.media_storage_sop_instance_uid,
             ds2.string(tags::SOP_INSTANCE_UID).unwrap()

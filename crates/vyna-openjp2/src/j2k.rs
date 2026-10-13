@@ -7014,8 +7014,16 @@ fn opj_j2k_is_imf_compliant(
         }
       }
       _ => {
-        panic!("Unknown OPJ_PROFILE");
-        //C: assert(0);
+        // Upstream C asserts here, but aborting the process from a
+        // library over a legal `rsiz` is never right: report
+        // non-compliance and encode a (working) non-IMF codestream.
+        event_msg!(
+          p_manager,
+          EVT_ERROR,
+          "Unknown IMF profile 0x%x.\n-> Non-IMF codestream will be generated\n",
+          profile as core::ffi::c_int
+        );
+        ret = 0i32
       }
     }
     if parameters.roi_compno != -(1i32) {
@@ -12640,10 +12648,14 @@ pub(crate) fn opj_j2k_encode(
           l_max_tile_size = l_current_tile_size
         }
         if l_current_data.is_null() {
-          /* Should not happen in practice, but will avoid Coverity to */
-          /* complain about a null pointer dereference */
-          panic!("");
-          // C: assert(0);
+          /* Upstream C asserts here; failing the encode beats
+          aborting the process. */
+          event_msg!(
+            p_manager,
+            EVT_ERROR,
+            "Not enough memory to encode all tiles\n",
+          );
+          return 0i32;
         }
         /* copy image data (32 bit) to l_current_data as contiguous, all-component, zero offset buffer */
         /* 32 bit components @ 8 bit precision get converted to 8 bit */

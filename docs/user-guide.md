@@ -186,9 +186,14 @@ stgcmtscp --bind 127.0.0.1:11112 ./commit-store
 - `mppsscu` generates the MPPS UID and UTC start/end dates unless
   `--mpps-uid` / `--start-date` / `--end-date` (+ `--start-time` /
   `--end-time`) are given; `--discontinue` ends DISCONTINUED.
+  `--station-ae` / `--station-name` set the performed station, and
+  `--accession` / `--req-proc-id` / `--sps-id` link the scheduled
+  step.
 - `stgcmtscu` takes `--file` (SOP UIDs read from Part-10 meta) and/or
-  `--instance CLASS_UID:INSTANCE_UID`; `--timeout-secs` bounds the
-  report wait, and any failed instance exits nonzero.
+  `--instance CLASS_UID:INSTANCE_UID`; `--request-uid` pins the
+  request SOP Instance UID (generated when omitted),
+  `--timeout-secs` bounds the report wait, and any failed instance
+  exits nonzero.
 - `mppsscp` stores each step as `<MPPSUID>.dcm` (N-SET merges over
   it; duplicates fail 0x0111, updates to final states fail) and
   reloads the directory at startup.
@@ -219,8 +224,13 @@ stowrs --url http://127.0.0.1:8080 a.dcm b.dcm
   `--limit` / `--offset` (paging), and `--json` (DICOM JSON output).
 - `wadorsd` takes `--bearer-token` to require `Authorization:
   Bearer` on every request; without it, keep the loopback bind (PHI
-  travels over plain HTTP otherwise).
-- `--frames` writes one file as given, or `STEM_N.EXT` per frame.
+  travels over plain HTTP otherwise). `--public-base` overrides the
+  `http://{bind}/` prefix stamped into BulkDataURIs.
+- `--frames` writes one file as given, or `STEM_N.EXT` per frame;
+  `--accept` sets the frame media type (default
+  `application/octet-stream`). `--metadata`, `--frames`, and
+  `--bulkdata URI` are exclusive; `-o -` is rejected (metadata goes
+  to stdout, bulk bytes need a file).
 
 ## 6. Files: dcmdump, dcm2json, json2dcm, dcm2xml, xml2dcm, dcm2img, img2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify, dcm2dcm, dcmdir, deidentify
 
@@ -262,9 +272,20 @@ in the dataset's declared set.
 instance: Study/Series/SOP UIDs are generated unless `--study-uid` /
 `--series-uid` / `--sop-uid` are given, `--title` defaults to the
 input file name, and `--transfer-syntax explicit|implicit|deflated`
-(default `explicit`) picks the dataset encoding. The instance is
-validated against its IOD before writing, so a zero exit means the
-file is C-STORE-able; `dcm2pdf` extracts the bytes back exactly.
+(default `explicit`) picks the dataset encoding. Patient/study
+metadata comes from `--patient-name` / `--patient-id` /
+`--birth-date` / `--sex` / `--study-id` / `--accession` /
+`--study-date` / `--study-time` / `--referring-physician`,
+acquisition timing from `--content-date` / `--content-time` /
+`--acquisition-datetime`, the concept-name code from
+`--concept-code` / `--concept-scheme` / `--concept-meaning`,
+equipment from `--institution` / `--manufacturer` / `--model`,
+and series/object numbering from
+`--series-description` / `--series-number` / `--instance-number`,
+with `--modality` / `--conversion-type` / `--burned-in` for the
+remaining Type 1/2 attributes. The instance is validated against
+its IOD before writing, so a zero exit means the file is
+C-STORE-able; `dcm2pdf` extracts the bytes back exactly.
 
 `img2dcm` without `--transfer-syntax` keeps a native template
 syntax; with one (the `dcm2dcm` name set plus UIDs, with `--quality`
@@ -333,8 +354,10 @@ deidentify old.dcm --in-place   # rewrite via a temp file
 
 - `--date-offset DAYS` keeps longitudinal intervals across the whole
   batch (one UID map per run); without it, dates become `19000101`.
-- `--patient-id` / `--patient-name` override the `ANONYMIZED`
-  dummies; `--retain-private-tags` keeps private groups.
+- `--patient-id` / `--patient-name` set the dummy text stamped
+  into `Dummy`-action tags (Patient ID itself is emptied and
+  Patient's Name removed per E.1 `Z`/`X`); `--retain-private-tags`
+  keeps private groups.
 - Files with Burned In Annotation `YES` are refused (pixels are
   never altered); file-meta UIDs follow the remapped dataset.
 
@@ -416,7 +439,10 @@ storescu --connect 127.0.0.1:11112 \
 ```
 
 `auditsend` emits any single event (useful for ARR connectivity
-checks and scripts); `--dry-run` prints the XML instead:
+checks and scripts); `--dry-run` prints the XML instead. Events:
+`start` / `stop` (application activity), `transferred` /
+`begin-transfer` / `export` / `import` (instance movement),
+`query`, `deleted`, and `custom` (free event triple):
 
 ```sh
 auditsend --server udp://127.0.0.1:514 transferred --study 1.2.3 \

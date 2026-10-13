@@ -540,4 +540,114 @@ mod tests {
         assert!(body_over_cap(MAX_BODY_LEN, 1));
         assert!(body_over_cap(usize::MAX, usize::MAX));
     }
+
+    /// Send a raw HTTP request, return the status line's code.
+    async fn raw_status(port: u16, head: &[u8], body: &[u8]) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tcp.write_all(head).await.unwrap();
+        tcp.write_all(body).await.unwrap();
+        let mut buf = vec![0u8; 1024];
+        let n = tcp.read(&mut buf).await.unwrap();
+        let line = String::from_utf8_lossy(&buf[..n]);
+        line.split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn unauthorized_over_wire_is_401() {
+        let store = Arc::new(MemoryStore::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let s = store.clone();
+                tokio::spawn(async move {
+                    serve_connection_with_auth(
+                        s,
+                        format!("http://127.0.0.1:{port}"),
+                        tcp,
+                        ServerAuth {
+                            bearer_token: Some("test-bearer-token".to_string()),
+                        },
+                    )
+                    .await
+                    .ok();
+                });
+            }
+        });
+        let authz = |t: &str| format!("authorization: Bearer {t}\r\n");
+        let req = |auth: &str| {
+            format!("GET /studies HTTP/1.1\r\nhost: x\r\n{auth}connection: close\r\n\r\n")
+                .into_bytes()
+        };
+        assert_eq!(raw_status(port, &req(""), &[]).await, 401);
+        assert_eq!(
+            raw_status(port, &req(&authz("wrong-token")), &[]).await,
+            401
+        );
+        assert_eq!(
+            raw_status(port, &req(&authz("test-bearer-token")), &[]).await,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn oversize_body_over_wire_is_413() {
+        let store = Arc::new(MemoryStore::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            serve_connection(store, format!("http://127.0.0.1:{port}"), tcp)
+                .await
+                .ok();
+        });
+        // One byte past the cap, streamed from a small reusable chunk
+        // (the server must 413 while accumulating, not after).
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tcp.write_all(
+            b"POST /studies HTTP/1.1\r\nhost: x\r\ncontent-type: multipart/related; boundary=b\r\ntransfer-encoding: chunked\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        let chunk = vec![b'x'; 1 << 20];
+        let mut sent = 0usize;
+        // Writes may fail once the server 413s and hangs up; the
+        // status below is the assertion either way.
+        while sent <= MAX_BODY_LEN {
+            let head = format!("{:X}\r\n", chunk.len());
+            if tcp.write_all(head.as_bytes()).await.is_err()
+                || tcp.write_all(&chunk).await.is_err()
+                || tcp.write_all(b"\r\n").await.is_err()
+            {
+                break;
+            }
+            sent += chunk.len();
+        }
+        let _ = tcp.write_all(b"0\r\n\r\n").await;
+        let mut buf = vec![0u8; 1024];
+        let n = tcp.read(&mut buf).await.unwrap();
+        let line = String::from_utf8_lossy(&buf[..n]);
+        let status: u16 = line
+            .split_whitespace()
+            .nth(1)
+            .unwrap_or("0")
+            .parse()
+            .unwrap_or(0);
+        assert_eq!(status, 413, "{line}");
+    }
 }

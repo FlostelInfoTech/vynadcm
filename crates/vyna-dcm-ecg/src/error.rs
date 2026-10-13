@@ -18,6 +18,11 @@ pub enum Error {
     #[error("missing attribute {0}")]
     Missing(String),
 
+    /// Caller-supplied metadata is not valid DICOM (bad UID syntax or
+    /// an enumerated value outside its set).
+    #[error("invalid metadata: {0}")]
+    InvalidMeta(String),
+
     /// Codec failure passthrough.
     #[error(transparent)]
     Codec(#[from] vyna_dcm_codec::Error),

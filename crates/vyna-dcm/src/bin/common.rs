@@ -28,10 +28,12 @@ pub struct ConnArgs {
     /// Per-read timeout in seconds.
     #[arg(long, default_value_t = 30)]
     pub timeout_secs: u64,
-    /// Use DICOM TLS (PS3.15).
+    /// Use DICOM TLS (PS3.15). The server is verified against the
+    /// Mozilla root bundle (plus `--tls-ca`), not the OS store.
     #[arg(long, default_value_t = false)]
     pub tls: bool,
-    /// Extra CA certificate (PEM) for TLS server verification.
+    /// Extra CA certificate (PEM) for TLS server verification, in
+    /// addition to the Mozilla roots.
     #[arg(long)]
     pub tls_ca: Option<PathBuf>,
     /// Client certificate (PEM) for mutual TLS.
@@ -70,7 +72,8 @@ pub struct ListenArgs {
     /// TLS server private key (PEM).
     #[arg(long)]
     pub tls_key: Option<PathBuf>,
-    /// Client CA (PEM) for mutual TLS.
+    /// Client CA (PEM) for mutual TLS. Client certificates verify
+    /// against this CA alone (no Mozilla roots on this path).
     #[arg(long)]
     pub tls_client_ca: Option<PathBuf>,
 }
@@ -141,55 +144,6 @@ impl ConnArgs {
         let stream = connector.connect_to(&self.connect).await?;
         Ok(Association::request_over(&opts, &calling, &called, stream, proposed).await?)
     }
-}
-
-/// Write `bytes` to `dest` atomically: temp file in the same
-/// directory (so the rename stays on one filesystem) plus rename, so
-/// a crash or a concurrent reader never sees a truncated output.
-/// Cleans up the temp file on failure.
-pub fn write_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind, Write};
-    let dir = dest
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    let stem = dest
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "out".to_string());
-    for attempt in 0..10u32 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let tmp = dir.join(format!(".{stem}.tmp-{}-{nanos}-{attempt}", std::process::id()));
-        let mut f = match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(f) => f,
-            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        };
-        // No fsync: rename atomicity (never a truncated output) is
-        // the guarantee; per-file syncs would throttle receivers.
-        let r = f.write_all(bytes).and_then(|()| {
-            drop(f);
-            std::fs::rename(&tmp, dest)
-        });
-        match r {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
-        }
-    }
-    Err(Error::new(
-        ErrorKind::AlreadyExists,
-        format!("cannot pick a temp name in {}", dir.display()),
-    ))
 }
 
 impl ListenArgs {
@@ -324,7 +278,8 @@ pub struct AuditArgs {
     /// Audit Source ID (defaults to our AE title).
     #[arg(long)]
     pub audit_source: Option<String>,
-    /// Extra CA certificate (PEM) for tls:// audit verification.
+    /// Extra CA certificate (PEM) for tls:// audit verification,
+    /// added to the Mozilla roots.
     #[arg(long)]
     pub audit_ca: Option<PathBuf>,
 }

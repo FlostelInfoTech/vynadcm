@@ -6,8 +6,8 @@
 //! target (RLE/JPEG/JPEG-LS/JPEG 2000 included). UIDs are kept except
 //! on lossy targets, which get a fresh SOP Instance UID (reported).
 
-#[path = "common.rs"]
-mod common;
+#[path = "iocommon.rs"]
+mod iocommon;
 
 use std::path::PathBuf;
 
@@ -141,7 +141,7 @@ fn run(args: &Args) -> Result<(), String> {
         .to_string();
     let out = write_part10(&FileMeta::new(class, inst.clone(), out_ts), &out_ds)
         .map_err(|e| e.to_string())?;
-    common::write_atomic(&args.output, &out).map_err(|e| e.to_string())?;
+    iocommon::write_atomic(&args.output, &out).map_err(|e| e.to_string())?;
     if ds.string(tags::SOP_INSTANCE_UID) != out_ds.string(tags::SOP_INSTANCE_UID) {
         println!("img2dcm: lossy target; new SOP Instance UID {inst}");
     }

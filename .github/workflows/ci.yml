@@ -34,7 +34,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99"
-      - run: cargo test --workspace
+      - run: cargo test --workspace --all-targets
 
   # Every feature combination must build (guards feature-gate drift
   # between the bins and the optional net/web/ecg dependencies).
@@ -45,7 +45,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: "1.99"
-      - run: cargo check -p vyna-dcm --no-default-features
-      - run: cargo check -p vyna-dcm --no-default-features --features cli
-      - run: cargo check -p vyna-dcm --no-default-features --features cli,net
-      - run: cargo check -p vyna-dcm --no-default-features --features cli,web
+      - run: cargo check -p vyna-dcm --no-default-features --all-targets
+      - run: cargo check -p vyna-dcm --no-default-features --features cli --all-targets
+      - run: cargo check -p vyna-dcm --no-default-features --features cli,net --all-targets
+      - run: cargo check -p vyna-dcm --no-default-features --features cli,web --all-targets
+      - run: cargo check -p vyna-dcm-net --no-default-features --all-targets
+      - run: cargo check -p vyna-dcm-web --no-default-features --all-targets
+      - run: cargo check -p vyna-dcm-atna --no-default-features --all-targets
