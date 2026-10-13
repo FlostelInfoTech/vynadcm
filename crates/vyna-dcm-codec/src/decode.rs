@@ -70,16 +70,19 @@ pub(crate) fn decode_up_to(
 }
 
 /// Item-tag offsets captured for one sequence tag (DICOMDIR links).
+///
+/// Shared with the encoder (same shape, same helper).
 #[derive(Default)]
-struct ItemCapture {
+pub(crate) struct ItemCapture {
     /// Sequence tag to capture (`None` captures nothing).
-    tag: Option<Tag>,
-    /// Item-tag offsets in decode order (relative to `bytes`).
-    offsets: Vec<usize>,
+    pub(crate) tag: Option<Tag>,
+    /// Item-tag offsets in traversal order (relative to the input
+    /// bytes when decoding, to the output when encoding).
+    pub(crate) offsets: Vec<usize>,
 }
 
 impl ItemCapture {
-    fn record(&mut self, seq_tag: Tag, at: usize) {
+    pub(crate) fn record(&mut self, seq_tag: Tag, at: usize) {
         if self.tag == Some(seq_tag) {
             self.offsets.push(at);
         }

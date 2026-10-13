@@ -279,6 +279,11 @@ impl MppsScp {
         let mut skipped = 0;
         let entries = std::fs::read_dir(directory).map(|r| r.filter_map(|e| e.ok()));
         for entry in entries.into_iter().flatten() {
+            // Never follow symlinks out of the load directory.
+            if entry.file_type().is_ok_and(|ft| ft.is_symlink()) {
+                skipped += 1;
+                continue;
+            }
             let path = entry.path();
             if path.extension().is_none_or(|e| e != "dcm") {
                 continue;

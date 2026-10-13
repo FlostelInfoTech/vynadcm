@@ -5,6 +5,22 @@ the workspace crate version (`Cargo.toml`).
 
 ## [Unreleased]
 
+### Changed (performance)
+
+- JPEG framing joins fragments once instead of twice.
+- DICOMweb request bodies are `Bytes` end to end (hyper streams
+  into a buffer that freezes without copying); metadata responses
+  move blob bytes into the bulk store instead of cloning.
+- The `ItemCapture` helper is defined once and shared by the
+  Part-10 encoder and decoder.
+
+### Fixed
+
+- Worklist loading skips symlinks, matching the other directory
+  walks.
+- New CLI coverage: `--help` smoke test over all 32 binaries plus
+  JSON/XML converter round-trips and a `dcmdump` functional check.
+
 ### Fixed (security)
 
 - DICOMweb client no longer forwards `Authorization` to cross-origin

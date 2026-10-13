@@ -5,6 +5,7 @@
 //! ([`crate::hyper_server`]); embedders can also adapt `dispatch` to their
 //! own HTTP stack (as VynaLink does).
 
+use bytes::Bytes;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use vyna_dcm_codec::{FileMeta, dataset_to_json, decode_pixels, read_part10, write_part10};
@@ -34,8 +35,9 @@ pub struct HttpRequest {
     pub query: String,
     /// Headers with lowercased names.
     pub headers: HashMap<String, String>,
-    /// Body bytes.
-    pub body: Vec<u8>,
+    /// Body bytes (shared buffer: front ends hand over their bytes
+    /// without copying, e.g. multi-hundred-MB STOW uploads).
+    pub body: Bytes,
 }
 
 /// Framework-agnostic HTTP response.
@@ -590,20 +592,30 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
             ],
         ) => match store.instance_metadata(study, series, instance) {
             Some((ds, blobs)) => {
+                // Snapshot the small JSON keys first so the blob bytes
+                // below can move into the store instead of cloning.
+                let keys: Vec<(String, String)> = blobs
+                    .iter()
+                    .map(|b| {
+                        (
+                            format!("{:04X}{:04X}", b.tag.group(), b.tag.element()),
+                            b.vr.as_str().to_string(),
+                        )
+                    })
+                    .collect();
                 let ids = store.put_bulk(
                     blobs
-                        .iter()
-                        .map(|b| (b.bytes.clone(), b.content_type.clone()))
+                        .into_iter()
+                        .map(|b| (b.bytes, b.content_type))
                         .collect(),
                 );
                 let mut obj = dataset_to_json(&ds);
                 let map = obj.as_object_mut().unwrap();
-                for (blob, id) in blobs.iter().zip(ids) {
-                    let key = format!("{:04X}{:04X}", blob.tag.group(), blob.tag.element());
+                for ((key, vr), id) in keys.iter().zip(ids) {
                     map.insert(
-                        key,
+                        key.clone(),
                         serde_json::json!({
-                            "vr": blob.vr.as_str(),
+                            "vr": vr,
                             "BulkDataURI": format!("{base}/bulk/{id}")
                         }),
                     );
@@ -855,7 +867,7 @@ mod tests {
             path,
             query,
             headers: HashMap::new(),
-            body: vec![],
+            body: Bytes::new(),
         }
     }
 
@@ -1072,7 +1084,7 @@ mod tests {
             path: "/studies".into(),
             query: String::new(),
             headers: [("content-type".into(), ct)].into(),
-            body,
+            body: Bytes::from(body),
         };
         let r = dispatch(&store, "http://x/wado", &req);
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
@@ -1091,7 +1103,7 @@ mod tests {
             path: "/studies/7.7.7".into(),
             query: String::new(),
             headers: [("content-type".into(), ct)].into(),
-            body,
+            body: Bytes::from(body),
         };
         assert_eq!(dispatch(&store, "http://x/wado", &req).status, 400);
     }

@@ -5,7 +5,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -137,8 +137,9 @@ async fn handle_one<S: DicomWebStore>(
     }
     // Stream the body with an early cap: collecting first and
     // checking after would let a huge STOW eat memory before the
-    // limit ever applied.
-    let mut raw_body = Vec::new();
+    // limit ever applied. BytesMut freezes into the request body
+    // without a further copy.
+    let mut raw_body = BytesMut::new();
     let mut body = body;
     while let Some(frame) = body.frame().await {
         let frame = frame?;
@@ -152,7 +153,7 @@ async fn handle_one<S: DicomWebStore>(
             raw_body.extend_from_slice(data);
         }
     }
-    let raw_body = Bytes::from(raw_body);
+    let raw_body = raw_body.freeze();
     let path_query = parts
         .uri
         .path_and_query()
@@ -167,7 +168,7 @@ async fn handle_one<S: DicomWebStore>(
         path,
         query,
         headers,
-        body: raw_body.to_vec(),
+        body: raw_body,
     };
     let hresp = dispatch(store, public_base, &hreq);
     let mut builder = Response::builder().status(hresp.status);

@@ -18,6 +18,7 @@ use vyna_dcm_core::{DataSet, FragmentSequence, Tag, TransferSyntax, Value, Vr, d
 use crate::{
     Error, Result, UNDEFINED_LENGTH,
     charset::{Decoding, encode_text, parse_specific_character_set},
+    decode::ItemCapture,
 };
 
 /// Default fragment size for [`fragment_payload`] (64 KiB).
@@ -26,23 +27,6 @@ pub const DEFAULT_FRAGMENT_LEN: usize = 65536;
 /// Encode a whole dataset in `ts`.
 pub fn encode_dataset(ds: &DataSet, ts: TransferSyntax) -> Result<Vec<u8>> {
     encode_dataset_inner(ds, ts, &mut ItemCapture::default())
-}
-
-/// Item-tag offsets captured for one sequence tag (DICOMDIR links).
-#[derive(Default)]
-struct ItemCapture {
-    /// Sequence tag to capture (`None` captures nothing).
-    tag: Option<Tag>,
-    /// Item-tag offsets in encode order (relative to the output).
-    offsets: Vec<usize>,
-}
-
-impl ItemCapture {
-    fn record(&mut self, seq_tag: Tag, at: usize) {
-        if self.tag == Some(seq_tag) {
-            self.offsets.push(at);
-        }
-    }
 }
 
 /// Encode a dataset, capturing item-tag offsets of every sequence

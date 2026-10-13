@@ -433,12 +433,15 @@ pub fn decode_pixels_with(
             // and usable (each entry must point at a codestream start);
             // otherwise one fragment per frame, with a single frame allowed
             // to span several concatenated fragments.
+            // Join once: the usability probe and the slicing below
+            // share one buffer instead of each joining all fragments.
+            let joined;
             let blobs: Vec<Vec<u8>> = if frames == 1 {
                 vec![f.joined()]
-            } else if !f.basic_offset_table.is_empty()
-                && jpeg_bot_usable(&f.joined(), &f.basic_offset_table, frames, ts)
-            {
-                let joined = f.joined();
+            } else if !f.basic_offset_table.is_empty() && {
+                joined = f.joined();
+                jpeg_bot_usable(&joined, &f.basic_offset_table, frames, ts)
+            } {
                 let mut offsets = f.basic_offset_table.clone();
                 offsets.push(joined.len() as u32);
                 let mut blobs = Vec::with_capacity(frames);
