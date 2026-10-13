@@ -3,16 +3,17 @@
 | Field | Value |
 |---|---|
 | Document | SDS (living) |
-| Version | 0.3.0 |
-| Date | 2026-10-12 |
+| Version | 0.4.0 |
+| Date | 2026-10-13 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.3.0 |
+| Applies to | VynaDCM workspace v0.4.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue; full-dictionary
 (P0.1) update applied same day (generated tables, private dict, `SV`);
 0.2.0 (2026-10-12) — version bump, no design change;
 0.3.0 (2026-10-12) — cancel polling + follow-ups +
-TCP_NODELAY design notes.
+TCP_NODELAY design notes;
+0.4.0 (2026-10-13) — security/correctness batch notes folded in.
 
 ## Contents
 

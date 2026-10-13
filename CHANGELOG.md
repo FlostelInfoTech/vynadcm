@@ -5,6 +5,8 @@ the workspace crate version (`Cargo.toml`).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-10-13
+
 ### Changed (performance)
 
 - JPEG framing joins fragments once instead of twice.

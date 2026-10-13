@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | Software bill of materials (living) |
-| Version | 0.3.0 |
-| Date | 2026-10-12 |
+| Version | 0.4.0 |
+| Date | 2026-10-13 |
 | Status | Living — regenerated on every dependency change |
-| Applies to | VynaDCM workspace v0.3.0 |
+| Applies to | VynaDCM workspace v0.4.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue (201
 components); Unreleased — bundled JPEG codecs + IOD validator + PDF
@@ -20,13 +20,15 @@ third-party); Unreleased — PNG export/import (`image` + PNG stack):
 0.2.0 (2026-10-12) — version bump, dependency set unchanged;
 Unreleased — `storescp --exec` (tokio `process` feature):
 229 components (10 workspace, 219 third-party);
-0.3.0 (2026-10-12) — version bump, dependency set as above.
+0.3.0 (2026-10-12) — version bump, dependency set as above;
+0.4.0 (2026-10-13) — version bump, workspace members MIT,
+dependency set unchanged.
 
 ## 1. Artifact
 
 `docs/sbom.cyclonedx.json` is the authoritative bill of materials in
 [CycloneDX](https://cyclonedx.org/) 1.5 JSON format. It currently lists
-**10 workspace members** (proprietary) and **219 third-party crates**,
+**10 workspace members** (MIT) and **219 third-party crates**,
 each with name, version, Package URL, SPDX license, and (for registry
 crates) the SHA-256 checksum from `Cargo.lock`. One third-party
 component, `openjp2` 0.6.1, is vendored under `vendor/` with a VynaDCM
@@ -53,8 +55,8 @@ dependencies change and commit the refreshed JSON alongside the
 
 - The SBOM reflects the **locked** graph (`Cargo.lock`), i.e. exactly
   what CI and releases build.
-- Workspace members are marked `Proprietary` with
-  `"description": "VynaDCM workspace member (proprietary)"`.
+- Workspace members are marked `MIT` with
+  `"description": "VynaDCM workspace member (MIT)"`.
 - Build-time-only and test-only crates (e.g. `rcgen`, used solely by
   the TLS loopback test) are included with `scope: required`, since
   CycloneDX scope here means “required to reproduce the build”.

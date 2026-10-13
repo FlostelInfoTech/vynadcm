@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | SRS (living) |
-| Version | 0.3.0 |
-| Date | 2026-10-12 |
+| Version | 0.4.0 |
+| Date | 2026-10-13 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.3.0 (crates `vyna-dcm-*`) |
+| Applies to | VynaDCM workspace v0.4.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
 implemented baseline (176 tests green, IOD validator + PDF helpers
@@ -14,7 +14,8 @@ implemented baseline (176 tests green, IOD validator + PDF helpers
 0.2.0 (2026-10-12) — version bump; FR-WEB-04 + QR/MWL SCP +
 charset/XML/img requirements folded in since 0.1.0;
 0.3.0 (2026-10-12) — FR-NET-11 (MPPS/commitment SCP) + cancel
-+ ATNA completion + CLI deltas folded in.
++ ATNA completion + CLI deltas folded in;
+0.4.0 (2026-10-13) — MIT license (NFR-03), quality-gate wording.
 
 ## Contents
 
@@ -73,7 +74,7 @@ functionality may come from outside this workspace (NFR-02).
 
 ### 2.3 Constraints
 
-Rust 1.98+, edition 2024, async via tokio, proprietary license
+Rust 1.98+, edition 2024, async via tokio, MIT license
 (see NFR-01…NFR-03).
 
 ## 3. Functional requirements
@@ -368,7 +369,7 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
 - **NFR-02 (M)** From-scratch DICOM: no DICOM crates outside this
   workspace; third-party crates only for generic infrastructure
   (async, HTTP, TLS, crypto, CLI, serialization).
-- **NFR-03 (M)** License: proprietary, all rights reserved.
+- **NFR-03 (M)** License: MIT (see `LICENSE`).
 - **NFR-04 (M)** Robustness: malformed input (files, PDUs, DIMSE,
   JSON, HTTP) returns typed errors; the library never panics on
   input. Incoming PDU sizes are capped (default 64 MiB).
@@ -384,7 +385,7 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   (`missing_docs` enforced); this SRS, the design spec, integration
   and user guides, and the SBOM are maintained as living documents.
 
-## 5. Out of scope (v0.3)
+## 5. Out of scope (v0.4)
 
 JPEG Extended 12-bit (`.51`), JPEG 2000 Part 2, and HTJ2K pixel
 codecs; private-vendor dictionaries; media interchange (PS3.11/12); print

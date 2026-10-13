@@ -1712,7 +1712,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "serde_json",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-atna"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "rcgen",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-codec"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64",
  "bytes",
@@ -1766,7 +1766,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
  "uuid",
@@ -1774,7 +1774,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-deid"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
  "vyna-dcm-core",
@@ -1782,7 +1782,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-ecg"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
  "vyna-dcm-codec",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-iod"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "vyna-dcm-codec",
  "vyna-dcm-core",
@@ -1799,7 +1799,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-net"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "rcgen",
@@ -1816,7 +1816,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-pdf"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "thiserror",
  "vyna-dcm-codec",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "vyna-dcm-web"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bytes",
  "http-body-util",

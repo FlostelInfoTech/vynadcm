@@ -3,15 +3,16 @@
 | Field | Value |
 |---|---|
 | Document | User guide (living) |
-| Version | 0.3.0 |
-| Date | 2026-10-12 |
+| Version | 0.4.0 |
+| Date | 2026-10-13 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.3.0, `vyna-dcm` CLI tools |
+| Applies to | VynaDCM workspace v0.4.0, `vyna-dcm` CLI tools |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue. Flag
 reference below is transcribed from `--help` output;
 0.2.0 (2026-10-12) — version bump, 30 CLI tools covered;
-0.3.0 (2026-10-12) — 32 CLI tools + cancel/exec/paths/syntax flags.
+0.3.0 (2026-10-12) — 32 CLI tools + cancel/exec/paths/syntax flags;
+0.4.0 (2026-10-13) — `--bearer-token`/`--verbose` flags, GitHub links.
 
 Audience: operators and support engineers running connectivity checks,
 storage, queries, and file conversions. Developers embedding the
@@ -66,7 +67,8 @@ SCP tools (`echoscp`, `storescp`, `findscp`, `mwlscp`, `mppsscp`,
 (reject mismatched Called-AE), and `--tls-cert` / `--tls-key` /
 `--tls-client-ca` (TLS is enabled when cert+key are present; client
 CA switches on mutual TLS). `storescp` adds `--directory` (default
-`.`) for received files; the other directory SCPs take the
+`.`) for received files and `--verbose` to also log patient names
+(PHI: off by default); the other directory SCPs take the
 directory as a positional argument.
 
 Exit codes: `0` on success; nonzero with an error message on
@@ -213,6 +215,9 @@ stowrs --url http://127.0.0.1:8080 a.dcm b.dcm
 ```
 
 - Client tools take `--bearer TOKEN` or `--basic user:pass`.
+- `wadorsd` takes `--bearer-token` to require `Authorization:
+  Bearer` on every request; without it, keep the loopback bind (PHI
+  travels over plain HTTP otherwise).
 - `--frames` writes one file as given, or `STEM_N.EXT` per frame.
 
 ## 6. Files: dcmdump, dcm2json, json2dcm, dcm2xml, xml2dcm, dcm2img, img2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify

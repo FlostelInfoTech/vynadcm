@@ -1,6 +1,6 @@
 [package]
 name = "vyna-dcm-web"
-version = "0.3.0"
+version = "0.4.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -13,8 +13,8 @@ default = ["server"]
 server = ["hyper", "hyper-util", "http-body-util"]
 
 [dependencies]
-vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.3" }
-vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.3" }
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.4" }
+vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.4" }
 thiserror.workspace = true
 bytes.workspace = true
 serde.workspace = true
