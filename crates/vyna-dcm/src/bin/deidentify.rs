@@ -133,6 +133,9 @@ fn process_file(deid: &mut Deidentifier, input: &Path, dest: &Path) -> Result<St
         .ok_or_else(|| format!("{}: missing SOP Instance UID", input.display()))?;
     meta.media_storage_sop_class_uid = class.to_string();
     meta.media_storage_sop_instance_uid = inst.to_string();
+    // The source writer's version must not leak into de-identified output.
+    meta.implementation_version_name =
+        Some(vyna_dcm_core::VYNA_IMPLEMENTATION_VERSION_NAME.to_string());
     let out = write_part10(&meta, &ds).map_err(|e| format!("{}: {e}", input.display()))?;
     write_output(dest, &out)?;
     Ok(format!(

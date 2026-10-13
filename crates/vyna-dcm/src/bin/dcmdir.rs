@@ -2,7 +2,10 @@
 //!
 //! Exit status: 0 on success, 1 on failure.
 
-use std::path::{Path, PathBuf};
+#[path = "common.rs"]
+mod common;
+
+use std::path::{Component, Path, PathBuf};
 
 use clap::Parser;
 use vyna_dcm::{
@@ -155,7 +158,22 @@ fn scan_dir(dir: &Path, out: &mut Vec<(PathBuf, bool)>) -> std::io::Result<()> {
 }
 
 fn run_create(output: &Path, file_set_id: Option<&str>, inputs: &[PathBuf]) -> i32 {
-    let root = output.parent().filter(|p| !p.as_os_str().is_empty());
+    // Containment root: the output directory, resolved. A bare
+    // `--output DICOMDIR` resolves against the current directory —
+    // stripping an empty prefix (always `Ok`) would skip containment
+    // and bake absolute File IDs.
+    let root_dir = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let root = match root_dir.canonicalize() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("dcmdir: output directory {}: {e}", root_dir.display());
+            return 1;
+        }
+    };
     let files = match collect_files(inputs, output) {
         Ok(f) => f,
         Err(e) => {
@@ -205,11 +223,20 @@ fn run_create(output: &Path, file_set_id: Option<&str>, inputs: &[PathBuf]) -> i
                 continue;
             }
         };
-        let rel = match root {
-            Some(root) => path.strip_prefix(root),
-            None => path.strip_prefix(""),
+        // Canonicalize both sides so `..` segments, absolute inputs,
+        // and symlinks that escape the root all fail the strip below
+        // (a contained absolute input still yields a relative ID).
+        let canon = match path.canonicalize() {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("dcmdir: {}: {e}", path.display());
+                if *explicit {
+                    return 1;
+                }
+                continue;
+            }
         };
-        let rel = match rel {
+        let rel = match canon.strip_prefix(&root) {
             Ok(r) => r,
             Err(_) => {
                 eprintln!("dcmdir: {}: outside the DICOMDIR directory", path.display());
@@ -217,10 +244,16 @@ fn run_create(output: &Path, file_set_id: Option<&str>, inputs: &[PathBuf]) -> i
             }
         };
         held.push((ds, ts.uid().to_string()));
-        let file_id: Vec<String> = rel
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect();
+        let mut file_id = Vec::new();
+        for c in rel.components() {
+            match c {
+                Component::Normal(s) => file_id.push(s.to_string_lossy().into_owned()),
+                _ => {
+                    eprintln!("dcmdir: {}: unrepresentable File ID", path.display());
+                    return 1;
+                }
+            }
+        }
         entries.push((file_id, held.len() - 1));
     }
     let refs: Vec<DirEntry> = entries
@@ -239,7 +272,7 @@ fn run_create(output: &Path, file_set_id: Option<&str>, inputs: &[PathBuf]) -> i
             return 1;
         }
     };
-    if let Err(e) = std::fs::write(output, &bytes) {
+    if let Err(e) = common::write_atomic(output, &bytes) {
         eprintln!("dcmdir: {}: {e}", output.display());
         return 1;
     }

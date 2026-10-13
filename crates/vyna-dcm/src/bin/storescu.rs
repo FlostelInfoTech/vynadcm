@@ -21,10 +21,23 @@ struct Args {
     #[arg(required = true)]
     files: Vec<PathBuf>,
     /// DIMSE priority (0 medium, 1 high, 2 low).
-    #[arg(long, default_value_t = 0)]
+    #[arg(long, default_value_t = 0, value_parser = parse_priority)]
     priority: u16,
     #[command(flatten)]
     audit: AuditArgs,
+}
+
+/// Clap parser: DIMSE priority must be 0, 1, or 2.
+fn parse_priority(s: &str) -> std::result::Result<u16, String> {
+    s.parse::<u16>()
+        .map_err(|_| format!("priority must be 0, 1, or 2, got {s:?}"))
+        .and_then(|p| {
+            if p <= 2 {
+                Ok(p)
+            } else {
+                Err(format!("priority must be 0, 1, or 2, got {p}"))
+            }
+        })
 }
 
 #[tokio::main]

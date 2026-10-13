@@ -79,11 +79,10 @@ impl ConnArgs {
     /// Build association options from CLI flags.
     #[must_use]
     pub fn assoc_options(&self) -> AssociationOptions {
-        AssociationOptions {
-            max_pdu_len: self.max_pdu,
-            read_timeout: Duration::from_secs(self.timeout_secs),
-            ..AssociationOptions::default()
-        }
+        let mut o = AssociationOptions::default();
+        o.max_pdu_len = self.max_pdu;
+        o.read_timeout = Duration::from_secs(self.timeout_secs);
+        o
     }
 
     /// Default uncompressed transfer syntaxes for proposals.
@@ -106,6 +105,16 @@ impl ConnArgs {
         let called = AeTitle::new(self.called.clone())?;
         let proposed = propose(sop_classes, syntaxes)?;
         if !self.tls {
+            // TLS material without --tls would silently run plaintext.
+            if self.tls_ca.is_some()
+                || self.tls_cert.is_some()
+                || self.tls_key.is_some()
+                || self.tls_server_name.is_some()
+            {
+                return Err(anyhowish::Error::msg(
+                    "--tls-ca/--tls-cert/--tls-key/--tls-server-name need --tls",
+                ));
+            }
             return Ok(
                 Association::request(&opts, &calling, &called, &self.connect, proposed).await?,
             );
@@ -131,6 +140,101 @@ impl ConnArgs {
         )?;
         let stream = connector.connect_to(&self.connect).await?;
         Ok(Association::request_over(&opts, &calling, &called, stream, proposed).await?)
+    }
+}
+
+/// Write `bytes` to `dest` atomically: temp file in the same
+/// directory (so the rename stays on one filesystem) plus rename, so
+/// a crash or a concurrent reader never sees a truncated output.
+/// Cleans up the temp file on failure.
+pub fn write_atomic(dest: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Write};
+    let dir = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let stem = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "out".to_string());
+    for attempt in 0..10u32 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let tmp = dir.join(format!(".{stem}.tmp-{}-{nanos}-{attempt}", std::process::id()));
+        let mut f = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => f,
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        // No fsync: rename atomicity (never a truncated output) is
+        // the guarantee; per-file syncs would throttle receivers.
+        let r = f.write_all(bytes).and_then(|()| {
+            drop(f);
+            std::fs::rename(&tmp, dest)
+        });
+        match r {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+    }
+    Err(Error::new(
+        ErrorKind::AlreadyExists,
+        format!("cannot pick a temp name in {}", dir.display()),
+    ))
+}
+
+impl ListenArgs {
+    /// Build association options from listener flags.
+    #[must_use]
+    pub fn assoc_options(&self) -> AssociationOptions {
+        let mut o = AssociationOptions::default();
+        o.max_pdu_len = self.max_pdu;
+        o.read_timeout = Duration::from_secs(self.timeout_secs);
+        o
+    }
+
+    /// TLS acceptor from `--tls-cert/--tls-key/--tls-client-ca` (or
+    /// `None` for plaintext). Errors when the flags disagree: half a
+    /// server identity, or a client CA with no server identity (which
+    /// would otherwise be silently ignored).
+    pub fn tls_acceptor(
+        &self,
+    ) -> anyhowish::Result<Option<std::sync::Arc<vyna_dcm::net::tls::TlsAcceptor>>> {
+        match (&self.tls_cert, &self.tls_key) {
+            (Some(c), Some(k)) => {
+                let cert = std::fs::read(c).map_err(|e| e.to_string())?;
+                let key = std::fs::read(k).map_err(|e| e.to_string())?;
+                let ca = self
+                    .tls_client_ca
+                    .as_ref()
+                    .map(std::fs::read)
+                    .transpose()
+                    .map_err(|e| e.to_string())?;
+                let acc = vyna_dcm::net::tls::TlsAcceptor::new(&cert, &key, ca.as_deref())
+                    .map_err(|e| e.to_string())?;
+                Ok(Some(std::sync::Arc::new(acc)))
+            }
+            (None, None) => {
+                if self.tls_client_ca.is_some() {
+                    return Err(anyhowish::Error::msg(
+                        "--tls-client-ca needs --tls-cert and --tls-key",
+                    ));
+                }
+                Ok(None)
+            }
+            _ => Err(anyhowish::Error::msg(
+                "--tls-cert and --tls-key go together",
+            )),
+        }
     }
 }
 

@@ -11,6 +11,11 @@ fn conformance_statement_is_current() {
     }
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest.parent().unwrap().parent().unwrap();
+    // Packaged crates ship tests/ without docs/: skip instead of failing.
+    if !workspace.join("docs/generate-conformance.py").exists() {
+        eprintln!("skipping: docs/generate-conformance.py not packaged");
+        return;
+    }
     let out = Command::new("python3")
         .arg("docs/generate-conformance.py")
         .arg("--check")

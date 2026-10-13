@@ -1,5 +1,7 @@
 //! A de-identified 12-lead ECG instance stays IOD-valid with identical samples.
 
+#![cfg(feature = "ecg")]
+
 use vyna_dcm::core::{PersonName, tags};
 use vyna_dcm::ecg::{
     EcgInstanceMeta, EcgLead, EcgRecording, STANDARD_12_LEAD, recording_from_waveform_item,

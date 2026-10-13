@@ -7,6 +7,9 @@
 //! File-meta SOP UIDs are synced from the edited dataset; erasing or
 //! blanking them refuses to write.
 
+#[path = "common.rs"]
+mod common;
+
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
@@ -449,7 +452,7 @@ fn run(args: &Args) -> i32 {
 /// must not redirect the write elsewhere).
 fn write_output(dest: &Path, input: &Path, bytes: &[u8]) -> Result<(), String> {
     if dest != input {
-        return std::fs::write(dest, bytes).map_err(|e| format!("{}: {e}", dest.display()));
+        return common::write_atomic(dest, bytes).map_err(|e| format!("{}: {e}", dest.display()));
     }
     for attempt in 0..100u32 {
         let tmp = input.with_extension(format!("vyna-tmp-{}-{attempt}", std::process::id()));

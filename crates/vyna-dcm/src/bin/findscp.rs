@@ -131,65 +131,38 @@ async fn main() -> Result<()> {
         emit_best_effort(Some(&audit.sender), &msg, "findscp");
     }
 
-    let tls = match (&args.listen.tls_cert, &args.listen.tls_key) {
-        (Some(c), Some(k)) => Some(Arc::new(
-            vyna_dcm::net::tls::TlsAcceptor::new(
-                &std::fs::read(c).map_err(|e| e.to_string())?,
-                &std::fs::read(k).map_err(|e| e.to_string())?,
-                args.listen
-                    .tls_client_ca
-                    .as_ref()
-                    .map(std::fs::read)
-                    .transpose()
-                    .map_err(|e| e.to_string())?
-                    .as_deref(),
-            )
-            .map_err(|e| e.to_string())?,
-        )),
-        (None, None) => None,
-        _ => {
-            return Err(common::anyhowish::Error::msg(
-                "--tls-cert and --tls-key go together",
-            ));
-        }
-    };
+    let tls = args.listen.tls_acceptor()?;
 
-    let acceptor = AcceptorOptions {
-        ae_title: AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?,
-        association: vyna_dcm::net::AssociationOptions {
-            max_pdu_len: args.listen.max_pdu,
-            read_timeout: Duration::from_secs(args.listen.timeout_secs),
-            ..Default::default()
-        },
-        check_called_ae: args.listen.strict_ae,
-        ..Default::default()
-    };
+    let mut acceptor = AcceptorOptions::default();
+    acceptor.ae_title =
+        AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?;
+    acceptor.association = args.listen.assoc_options();
+    acceptor.check_called_ae = args.listen.strict_ae;
     let handlers = Arc::new(FindScp {
         inner: QrScp::new(index),
         audit,
         our_ip,
     });
-    let scp_opts = ScpOptions {
-        move_config: if args.routes.is_empty() {
-            None
-        } else {
-            Some(ScpMoveConfig {
-                directory: Arc::new(HashMapDirectory {
-                    map: parse_routes(&args.routes)?,
-                }),
-                assoc_options: vyna_dcm::net::AssociationOptions {
-                    max_pdu_len: args.listen.max_pdu,
-                    read_timeout: Duration::from_secs(args.listen.timeout_secs),
-                    ..Default::default()
-                },
-                calling_ae: AeTitle::new(args.listen.ae_title.clone())
-                    .map_err(|e| e.to_string())?,
-            })
-        },
+    let mut scp_opts = ScpOptions::default();
+    scp_opts.move_config = if args.routes.is_empty() {
+        None
+    } else {
+        Some(ScpMoveConfig {
+            directory: Arc::new(HashMapDirectory {
+                map: parse_routes(&args.routes)?,
+            }),
+            assoc_options: args.listen.assoc_options(),
+            calling_ae: AeTitle::new(args.listen.ae_title.clone())
+                .map_err(|e| e.to_string())?,
+        })
     };
 
     loop {
         let Ok((tcp, peer)) = listener.accept().await else {
+            // Back off: a persistent accept failure (e.g. EMFILE)
+            // must not spin the loop at full speed.
+            eprintln!("findscp: accept failed (retrying in 100ms)");
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
         // DIMSE is small-write chatty; Nagle would stall each PDU on the

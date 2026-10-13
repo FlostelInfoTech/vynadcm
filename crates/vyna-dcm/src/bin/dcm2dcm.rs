@@ -3,6 +3,9 @@
 //! Exit status: 0 on success, 1 on failure. Lossy targets get a fresh
 //! SOP Instance UID; lossless targets keep it.
 
+#[path = "common.rs"]
+mod common;
+
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -141,7 +144,7 @@ fn run(args: &Args) -> i32 {
             return 1;
         }
     };
-    if let Err(e) = std::fs::write(&args.output, &file) {
+    if let Err(e) = common::write_atomic(&args.output, &file) {
         eprintln!("dcm2dcm: {}: {e}", args.output.display());
         return 1;
     }

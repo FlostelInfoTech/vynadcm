@@ -1,5 +1,8 @@
 //! `wadors`: WADO-RS retrieve (instance, metadata, frames, bulk data).
 
+#[path = "common.rs"]
+mod common;
+
 #[path = "webcommon.rs"]
 mod webcommon;
 
@@ -24,10 +27,10 @@ struct Args {
     #[arg(long)]
     instance: Option<String>,
     /// Fetch metadata (`.../metadata`) as JSON to stdout.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, conflicts_with_all = ["frames", "bulkdata"])]
     metadata: bool,
     /// Fetch frames (comma list, e.g. `1,2,3`).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "bulkdata")]
     frames: Option<String>,
     /// Accept type for frames (e.g. `image/jpeg`).
     #[arg(long, default_value = "application/octet-stream")]
@@ -35,7 +38,7 @@ struct Args {
     /// Fetch one BulkData URI to the output file.
     #[arg(long)]
     bulkdata: Option<String>,
-    /// Output file (`-` is unsupported; metadata goes to stdout).
+    /// Output file (`-` is rejected; metadata goes to stdout).
     #[arg(short, long)]
     output: Option<PathBuf>,
 }
@@ -78,6 +81,11 @@ fn run(args: &Args) -> Result<(), String> {
 }
 
 async fn run_async(args: &Args) -> Result<(), String> {
+    // `-` is not stdout here: without this guard it becomes a file
+    // literally named `-`.
+    if args.output.as_ref().is_some_and(|p| p.as_os_str() == "-") {
+        return Err("`-o -` is not supported; give a file path".to_string());
+    }
     let client = args.web.client()?;
     if let Some(uri) = &args.bulkdata {
         let output = args
@@ -85,7 +93,7 @@ async fn run_async(args: &Args) -> Result<(), String> {
             .as_ref()
             .ok_or("--output is required with --bulkdata")?;
         let (content_type, body) = client.wado_bulkdata(uri).await.map_err(|e| e.to_string())?;
-        std::fs::write(output, body).map_err(|e| e.to_string())?;
+        common::write_atomic(output, &body).map_err(|e| e.to_string())?;
         println!("{} ({} bytes)", output.display(), content_type);
         return Ok(());
     }
@@ -128,7 +136,7 @@ async fn run_async(args: &Args) -> Result<(), String> {
         .wado_file(study, series, instance)
         .await
         .map_err(|e| e.to_string())?;
-    std::fs::write(output, &bytes).map_err(|e| e.to_string())?;
+    common::write_atomic(output, &bytes).map_err(|e| e.to_string())?;
     println!("{} ({} bytes)", output.display(), bytes.len());
     Ok(())
 }
@@ -137,7 +145,7 @@ async fn run_async(args: &Args) -> Result<(), String> {
 /// `STEM_N.EXT`.
 fn write_parts(output: &PathBuf, parts: &[Vec<u8>]) -> Result<(), String> {
     if parts.len() == 1 {
-        std::fs::write(output, &parts[0]).map_err(|e| e.to_string())?;
+        common::write_atomic(output, &parts[0]).map_err(|e| e.to_string())?;
         println!("{} ({} bytes)", output.display(), parts[0].len());
         return Ok(());
     }

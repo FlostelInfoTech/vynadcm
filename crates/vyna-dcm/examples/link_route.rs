@@ -80,14 +80,13 @@ async fn main() -> Result<(), String> {
     if args.len() != 4 {
         return Err("usage: link_route <bind> <dest-host:port> <dest-ae>".into());
     }
+    let mut fwd_opts = AssociationOptions::default();
+    fwd_opts.read_timeout = Duration::from_secs(60);
     let handlers = Arc::new(Forwarder {
         dest_addr: args[2].clone(),
         dest_ae: AeTitle::new(args[3].clone()).map_err(|e| e.to_string())?,
         calling_ae: AeTitle::new("VYNALINK").map_err(|e| e.to_string())?,
-        opts: AssociationOptions {
-            read_timeout: Duration::from_secs(60),
-            ..Default::default()
-        },
+        opts: fwd_opts,
     });
     let _ = tags::SOP_INSTANCE_UID; // (kept for reader orientation)
     let acceptor = AcceptorOptions::default();
@@ -97,6 +96,8 @@ async fn main() -> Result<(), String> {
     println!("link_route: {} -> {} ({})", args[1], args[2], args[3]);
     loop {
         let Ok((tcp, peer)) = listener.accept().await else {
+            eprintln!("link_route: accept failed (retrying in 100ms)");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             continue;
         };
         let (acceptor, handlers) = (acceptor.clone(), handlers.clone());

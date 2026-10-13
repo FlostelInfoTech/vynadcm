@@ -129,7 +129,7 @@ async fn main() -> Result<()> {
             let meta = FileMeta::new(&class, &inst, TransferSyntax::ExplicitVrLittleEndian);
             let path = dir.join(format!("{}.dcm", safe_instance_filename(&inst)));
             let status = match vyna_dcm::write_part10(&meta, &ds) {
-                Ok(bytes) => match std::fs::write(&path, bytes) {
+                Ok(bytes) => match common::write_atomic(&path, &bytes) {
                     Ok(()) => {
                         count += 1;
                         println!("stored {inst} -> {}", path.display());

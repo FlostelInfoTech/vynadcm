@@ -139,7 +139,7 @@ impl Handlers for StoreScp {
             Ok(bytes) => {
                 let safe = safe_instance_filename(&inst);
                 let path = self.directory.join(format!("{safe}.dcm"));
-                match std::fs::write(&path, bytes) {
+                match common::write_atomic(&path, &bytes) {
                     Ok(()) => {
                         // Patient names are PHI: only log them with --verbose.
                         if self.verbose {
@@ -228,39 +228,13 @@ async fn main() -> Result<()> {
         emit_best_effort(Some(&audit.sender), &msg, "storescp");
     }
 
-    let tls = match (&args.listen.tls_cert, &args.listen.tls_key) {
-        (Some(c), Some(k)) => Some(Arc::new(
-            vyna_dcm::net::tls::TlsAcceptor::new(
-                &std::fs::read(c).map_err(|e| e.to_string())?,
-                &std::fs::read(k).map_err(|e| e.to_string())?,
-                args.listen
-                    .tls_client_ca
-                    .as_ref()
-                    .map(std::fs::read)
-                    .transpose()
-                    .map_err(|e| e.to_string())?
-                    .as_deref(),
-            )
-            .map_err(|e| e.to_string())?,
-        )),
-        (None, None) => None,
-        _ => {
-            return Err(common::anyhowish::Error::msg(
-                "--tls-cert and --tls-key go together",
-            ));
-        }
-    };
+    let tls = args.listen.tls_acceptor()?;
 
-    let acceptor = AcceptorOptions {
-        ae_title: AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?,
-        association: vyna_dcm::net::AssociationOptions {
-            max_pdu_len: args.listen.max_pdu,
-            read_timeout: Duration::from_secs(args.listen.timeout_secs),
-            ..Default::default()
-        },
-        check_called_ae: args.listen.strict_ae,
-        ..Default::default()
-    };
+    let mut acceptor = AcceptorOptions::default();
+    acceptor.ae_title =
+        AeTitle::new(args.listen.ae_title.clone()).map_err(|e| e.to_string())?;
+    acceptor.association = args.listen.assoc_options();
+    acceptor.check_called_ae = args.listen.strict_ae;
     let exec = args
         .exec
         .as_deref()
@@ -277,6 +251,10 @@ async fn main() -> Result<()> {
 
     loop {
         let Ok((tcp, peer)) = listener.accept().await else {
+            // Back off: a persistent accept failure (e.g. EMFILE)
+            // must not spin the loop at full speed.
+            eprintln!("storescp: accept failed (retrying in 100ms)");
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
         // DIMSE is small-write chatty; Nagle would stall each PDU on the
