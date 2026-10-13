@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "VynaDCM ECG waveform helpers for VynaECG"
+keywords = ["dicom", "ecg", "waveform"]
+categories = ["science", "multimedia"]
 
 [dependencies]
 vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.4" }

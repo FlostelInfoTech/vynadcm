@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "VynaDCM ATNA audit-trail emission: DICOM audit messages over syslog"
+keywords = ["dicom", "atna", "audit", "syslog"]
+categories = ["network-programming"]
 
 [features]
 default = ["tls"]

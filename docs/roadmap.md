@@ -194,8 +194,8 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   the `GB2312` Specific Character Set term (via its GBK superset,
   with a CPython oracle vector), single-frame PNG export/import
   (`codec::img` over the `image` crate plus `dcm2img`/`img2dcm`
-  CLIs; MONO 8/16-bit and RGB 8-bit, no windowing), and a vendored
-  real-file regression corpus (`vendor/dicom-corpus`, 5 MIT
+  CLIs; MONO 8/16-bit and RGB 8-bit, no windowing), and a
+  real-file regression corpus (crate `tests/data/` dirs, 5 MIT
   pydicom-data files + README) with `codec::corpus` tests. The
   corpus immediately paid off: RLE MSB-first component-major
   segment order (was little-endian), even-length segment padding

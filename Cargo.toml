@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/vyna-openjp2",
     "crates/vyna-dcm-core",
     "crates/vyna-dcm-codec",
     "crates/vyna-dcm-net",
@@ -48,15 +49,12 @@ jpeg-decoder = { version = "0.3", default-features = false }
 jpeg-encoder = "0.7"
 pure_jpegls = "2"
 pure_jpegli = "2"
-openjp2 = { version = "0.6", default-features = false, features = ["std"] }
+vyna-openjp2 = { version = "0.6", path = "crates/vyna-openjp2", default-features = false, features = ["std"] }
 
 [profile.release]
 lto = "thin"
 codegen-units = 16
 
-# Patched openjp2: guards two null `dealloc` calls in tcd.rs that abort the
-# process (UB) when a codestream skips code blocks — valid input, e.g. flat
-# regions. See vendor/openjp2/README.VYNA.md. Re-check upstream before
-# widening the version requirement past 0.6.
-[patch.crates-io]
-openjp2 = { path = "vendor/openjp2" }
+# `vyna-openjp2` is our fork of `openjp2` 0.6.1 (null-`dealloc` soundness
+# fix, see crates/vyna-openjp2/README.md). It is published to crates.io
+# separately (publish it before vyna-dcm-codec).

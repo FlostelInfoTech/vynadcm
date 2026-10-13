@@ -5,6 +5,16 @@ the workspace crate version (`Cargo.toml`).
 
 ## [Unreleased]
 
+### Changed
+
+- The vendored `openjp2` patch is now a `vyna-openjp2` 0.6.1 fork
+  crate (workspace member, BSD-2-Clause, published separately) so
+  crates.io builds get the null-`dealloc` soundness fix; the
+  `[patch.crates-io]` section is gone.
+- Test fixtures moved from `vendor/dicom-corpus/` into crate
+  `tests/data/` dirs so published crates verify standalone;
+  `vendor/` is removed.
+
 ## [0.4.0] — 2026-10-13
 
 ### Changed (performance)

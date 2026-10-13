@@ -3,7 +3,7 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-10-13T06:11:52Z",
+    "timestamp": "2026-10-13T07:06:07Z",
     "tools": {
       "components": [
         {
@@ -1937,22 +1937,6 @@
       ]
     },
     {
-      "bom-ref": "pkg:cargo/openjp2@0.6.1",
-      "type": "library",
-      "name": "openjp2",
-      "version": "0.6.1",
-      "scope": "required",
-      "purl": "pkg:cargo/openjp2@0.6.1",
-      "licenses": [
-        {
-          "license": {
-            "id": "BSD-2-Clause"
-          }
-        }
-      ],
-      "description": "Vendored path dependency (see vendor/openjp2/README.VYNA.md)"
-    },
-    {
       "bom-ref": "pkg:cargo/openssl-probe@0.2.1",
       "type": "library",
       "name": "openssl-probe",
@@ -3702,6 +3686,22 @@
         }
       ],
       "description": "VynaDCM workspace member (MIT)"
+    },
+    {
+      "bom-ref": "pkg:cargo/vyna-openjp2@0.6.1",
+      "type": "library",
+      "name": "vyna-openjp2",
+      "version": "0.6.1",
+      "scope": "required",
+      "purl": "pkg:cargo/vyna-openjp2@0.6.1",
+      "licenses": [
+        {
+          "license": {
+            "id": "BSD-2-Clause"
+          }
+        }
+      ],
+      "description": "VynaDCM workspace member (BSD-2-Clause)"
     },
     {
       "bom-ref": "pkg:cargo/walkdir@2.5.0",

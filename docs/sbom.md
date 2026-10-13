@@ -28,14 +28,15 @@ dependency set unchanged.
 
 `docs/sbom.cyclonedx.json` is the authoritative bill of materials in
 [CycloneDX](https://cyclonedx.org/) 1.5 JSON format. It currently lists
-**10 workspace members** (MIT) and **219 third-party crates**,
+**11 workspace members** (10 MIT plus BSD-2-Clause `vyna-openjp2`)
+and **218 third-party crates**,
 each with name, version, Package URL, SPDX license, and (for registry
-crates) the SHA-256 checksum from `Cargo.lock`. One third-party
-component, `openjp2` 0.6.1, is vendored under `vendor/` with a VynaDCM
-patch (see `vendor/openjp2/README.VYNA.md`) instead of a lock checksum.
+crates) the SHA-256 checksum from `Cargo.lock`. All workspace members
+are first-party except `vyna-openjp2` 0.6.1, our BSD-2-Clause fork of
+`openjp2` (see `crates/vyna-openjp2/README.md`), published separately.
 
 License mix is permissive throughout: predominantly
-`MIT OR Apache-2.0` / `MIT`, plus `BSD-2-Clause` (openjp2),
+`MIT OR Apache-2.0` / `MIT`, plus `BSD-2-Clause` (vyna-openjp2),
 `Unicode-3.0` (unicode tables), `0BSD`, `ISC`, and `Unlicense`
 duals. No copyleft licenses are present. Per-component detail lives
 in the JSON, not here, so this page cannot rot.

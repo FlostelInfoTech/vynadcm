@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "VynaDCM networking: DIMSE, associations, SCU/SCP services"
+keywords = ["dicom", "dimse", "pacs", "networking"]
+categories = ["network-programming", "multimedia"]
 
 [features]
 default = ["tls"]

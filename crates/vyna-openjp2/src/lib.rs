@@ -5,6 +5,10 @@
 #![allow(non_upper_case_globals)]
 #![allow(unused_assignments)]
 #![allow(unused_mut)]
+// VYNA-PATCH: mechanical C port trips hundreds of default clippy lints;
+// silenced at the crate root (as upstream already does for rustc lints)
+// to keep the fork diff minimal instead of churning foreign sources.
+#![allow(clippy::all)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
 #[cfg(not(feature = "std"))]

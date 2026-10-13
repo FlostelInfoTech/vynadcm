@@ -1,5 +1,5 @@
 //! Loopback tests: real HTTP between `hyper_server` and `DicomWebClient`
-//! over a store seeded from the vendored corpus.
+//! over a store seeded from `tests/data`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,7 +10,7 @@ use vyna_dcm_web::server::{DicomWebStore, MemoryStore};
 
 fn corpus(name: &str) -> Vec<u8> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/dicom-corpus")
+        .join("tests/data")
         .join(name);
     std::fs::read(path).unwrap()
 }

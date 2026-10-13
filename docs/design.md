@@ -92,9 +92,10 @@ spec adds component contracts, algorithms, sequences, and invariants.
 - `encode_pixels(ds, ts, raw, codec)`: the encode mirror — RLE
   built in, JPEG families via the codec, one fragment per frame.
   Bundled backends are pure Rust: `jpeg-decoder`/`jpeg-encoder`
-  (`.50`), `jpegli` (`.70`), `jpegls` (`.80`/`.81`), and a vendored
-  `openjp2` (`.90`/`.91`, see `vendor/openjp2/README.VYNA.md` for the
-  null-`dealloc` patch). `.51`, J2K Part 2, and HTJ2K stay unsupported.
+  (`.50`), `jpegli` (`.70`), `jpegls` (`.80`/`.81`), and our
+  `vyna-openjp2` fork (`.90`/`.91`, see
+  `crates/vyna-openjp2/README.md` for the null-`dealloc` patch).
+  `.51`, J2K Part 2, and HTJ2K stay unsupported.
 - `transcode_dataset(ds, src, dst, opts)`: decode → normalize
   (big-endian swap, planar de-interleave, BT.601 YBR→RGB) →
   re-encode; native/RLE length math is `YBR_FULL_422`-aware (2

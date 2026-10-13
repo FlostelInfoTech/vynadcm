@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "VynaDCM IOD validation: Type 1/2/3 presence, VR and VM checking"
+keywords = ["dicom", "validation", "iod"]
+categories = ["data-structures", "multimedia"]
 
 [dependencies]
 vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.4" }

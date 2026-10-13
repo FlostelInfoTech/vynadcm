@@ -1,5 +1,5 @@
-//! Regression tests over the vendored real-file corpus
-//! (`vendor/dicom-corpus`, third-party DCMTK/GDCM writers).
+//! Regression tests over real third-party-encoded files
+//! (`tests/data`, DCMTK/GDCM writers).
 
 use std::path::PathBuf;
 use vyna_dcm_codec::{
@@ -10,7 +10,7 @@ use vyna_dcm_core::{DataSet, tags};
 
 fn corpus(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../vendor/dicom-corpus")
+        .join("tests/data")
         .join(name)
 }
 

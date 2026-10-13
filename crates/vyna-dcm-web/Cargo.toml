@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "VynaDCM DICOMweb: WADO-RS, STOW-RS, QIDO-RS, WADO-URI"
+keywords = ["dicom", "dicomweb", "wado", "qido", "stow"]
+categories = ["web-programming", "multimedia"]
 
 [features]
 default = ["server"]

@@ -1,27 +1,28 @@
 //! JPEG 2000 pixel codec (Transfer Syntaxes `.90` lossless, `.91` lossy).
 //!
-//! Backed by `openjp2`, a pure-Rust port of OpenJPEG: raw codestreams with
+//! Backed by `vyna-openjp2` (our `openjp2` fork, a pure-Rust OpenJPEG
+//! port): raw codestreams with
 //! mono or 3-component frames, precision 1–16 bits. Encoding always writes
 //! unsigned components; decoding honours each component's own signedness, so
 //! signed lossless data (e.g. CT) round-trips as bit patterns.
 //!
-//! Memory I/O goes through openjp2's stream callbacks ([`MemStream`]); the
+//! Memory I/O goes through the fork's stream callbacks ([`MemStream`]); the
 //! `unsafe` there is confined to that wrapper (see its safety notes).
 
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::rc::Rc;
 
-use openjp2::openjpeg::{
+use vyna_dcm_core::{FragmentSequence, TransferSyntax};
+use vyna_openjp2::openjpeg::{
     OPJ_BOOL, OPJ_OFF_T, OPJ_SIZE_T, opj_stream_default_create, opj_stream_destroy,
     opj_stream_set_read_function, opj_stream_set_seek_function, opj_stream_set_skip_function,
     opj_stream_set_user_data, opj_stream_set_user_data_length, opj_stream_set_write_function,
 };
-use openjp2::{
+use vyna_openjp2::{
     CODEC_FORMAT, COLOR_SPACE, Codec, Stream, opj_cparameters_t, opj_dparameters_t, opj_image,
     opj_image_comptparm, opj_stream_t,
 };
-use vyna_dcm_core::{FragmentSequence, TransferSyntax};
 
 use crate::{PixelCodec, PixelCodecError};
 
@@ -174,7 +175,7 @@ fn encoder_params(
     let cblock = if min_dim >= 64 { 64 } else { 4 };
     // Single tile spanning the frame, stated explicitly: the port's
     // non-tiling path leaves the tile grid empty and fails validation.
-    let mut params = openjp2::opj_cparameters {
+    let mut params = vyna_openjp2::opj_cparameters {
         tcp_numlayers: 1,
         tile_size_on: 1,
         cp_tdx: columns as i32,
@@ -407,9 +408,9 @@ struct MemState {
     pos: usize,
 }
 
-/// RAII handle over a raw openjp2 memory stream.
+/// RAII handle over a raw fork memory stream.
 ///
-/// openjp2 exposes memory I/O only through its C-style stream callbacks, so
+/// The port exposes memory I/O only through its C-style stream callbacks, so
 /// this wrapper owns both the `Box<Stream>` (created by
 /// `opj_stream_default_create`, freed by `opj_stream_destroy` on drop) and
 /// the `Box<MemState>` the callbacks dereference (freed by `mem_free` when

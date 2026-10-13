@@ -82,10 +82,11 @@ def main() -> int:
         if not is_member and digest:
             comp["hashes"] = [{"alg": "SHA-256", "content": digest}]
         if is_member:
-            comp["description"] = "VynaDCM workspace member (MIT)"
+            lic_id = pkg.get("license", "MIT")
+            comp["description"] = f"VynaDCM workspace member ({lic_id})"
         elif not digest and pkg.get("source") is None:
             comp["description"] = (
-                f"Vendored path dependency (see vendor/{pkg['name']}/README.VYNA.md)"
+                f"Local path crate ({pkg['name']}, published to crates.io separately)"
             )
         components.append(comp)
 

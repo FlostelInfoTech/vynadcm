@@ -7,6 +7,8 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 description = "VynaDCM codecs: dataset encoding, Part-10 files, RLE, DICOM JSON"
+keywords = ["dicom", "codec", "part10", "rle", "json"]
+categories = ["multimedia", "parser-implementations"]
 
 [dependencies]
 vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.4" }
@@ -22,7 +24,7 @@ jpeg-decoder.workspace = true
 jpeg-encoder.workspace = true
 pure_jpegls.workspace = true
 pure_jpegli.workspace = true
-openjp2.workspace = true
+vyna-openjp2.workspace = true
 encoding_rs.workspace = true
 
 [dev-dependencies]
