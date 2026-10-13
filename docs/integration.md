@@ -35,7 +35,7 @@ Operators should start with `docs/user-guide.md`.
 
 ```toml
 [dependencies]
-vyna-dcm = { git = "https://gitlab.flostel.com/alexshao/VynaDCM", version = "0.1" }
+vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.3" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 ```
 

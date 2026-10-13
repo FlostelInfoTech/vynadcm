@@ -33,7 +33,7 @@ library should read `docs/integration.md`.
 ## 1. Installation
 
 ```sh
-git clone https://gitlab.flostel.com/alexshao/VynaDCM
+git clone https://github.com/FlostelInfoTech/vynadcm
 cd VynaDCM
 cargo build --release -p vyna-dcm --bins
 # binaries land in target/release/
