@@ -669,6 +669,7 @@ fn build_value(
         }
         Vr::Ob | Vr::Ow | Vr::Un => Err(bad("byte VRs need InlineBinary")),
         Vr::Si => Err(bad("retired SI unsupported in XML")),
+        _ => Err(Error::Xml(format!("{tag}: unsupported VR {vr:?} in XML"))),
     }
 }
 
@@ -732,6 +733,14 @@ mod tests {
                 ],
             ))
             .with(DataElement::new(tags::MODALITY, Vr::Cs, Value::Empty))
+    }
+
+    #[test]
+    fn retired_si_bytes_round_trip() {
+        let mut ds = DataSet::new();
+        ds.put_bytes(Tag::new(0x0019, 0x1001), Vr::Si, vec![7, 7, 7, 7]);
+        let back = dataset_from_xml(&dataset_to_xml(&ds)).unwrap();
+        assert_eq!(back, ds);
     }
 
     #[test]

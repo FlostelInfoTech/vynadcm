@@ -36,6 +36,7 @@ const MAX_FRAGMENT: usize = 65536;
 
 /// Knobs for lossy target encoders.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct TranscodeOptions {
     /// Bundled JPEG backends (tune `jpeg.quality`, `jpeg_ls.near`,
     /// `jpeg_2000.lossy_ratio` for `.50` / `.81` / `.91` targets).
@@ -479,7 +480,8 @@ fn encode_target(
     let frames: Vec<Vec<u8>> = if geo.frames == 1 {
         vec![seq.fragments.concat()]
     } else {
-        // encode_pixels emits one fragment per frame.
+        // encode_pixels joins to one fragment per frame (see its
+        // contract), so each fragment is exactly one frame here.
         seq.fragments
     };
     let compressed_len: usize = frames.iter().map(Vec::len).sum();

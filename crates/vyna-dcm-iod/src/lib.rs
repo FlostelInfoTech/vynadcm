@@ -519,10 +519,10 @@ mod tests {
             Vr::Sv => Value::I64(vec![1; n]),
             Vr::Fl => Value::F32(vec![1.0; n]),
             Vr::Fd => Value::F64(vec![1.0; n]),
-            Vr::Ob | Vr::Ow | Vr::Od | Vr::Of | Vr::Ol | Vr::Ov | Vr::Un | Vr::Si => {
+            Vr::Sq => Value::Sequence(vec![DataSet::new(); n]),
+            Vr::Ob | Vr::Ow | Vr::Od | Vr::Of | Vr::Ol | Vr::Ov | Vr::Un | Vr::Si | _ => {
                 Value::Bytes(vec![0; n])
             }
-            Vr::Sq => Value::Sequence(vec![DataSet::new(); n]),
         }
     }
 

@@ -102,16 +102,11 @@ impl EcgInstanceMeta {
 
     /// True when any stored text needs non-ASCII (UTF-8) encoding.
     fn needs_utf8(&self) -> bool {
-        fn pn_non_ascii(pn: &PersonName) -> bool {
-            [&pn.alphabetic]
-                .into_iter()
-                .chain(pn.ideographic.as_ref())
-                .chain(pn.phonetic.as_ref())
-                .flat_map(|g| [&g.family, &g.given, &g.middle, &g.prefix, &g.suffix])
-                .any(|s| !s.is_ascii())
-        }
-        pn_non_ascii(&self.patient_name)
-            || self.referring_physician.as_ref().is_some_and(pn_non_ascii)
+        person_name_needs_utf8(&self.patient_name)
+            || self
+                .referring_physician
+                .as_ref()
+                .is_some_and(person_name_needs_utf8)
             || !self.patient_id.is_ascii()
             || [
                 &self.birth_date,
@@ -132,6 +127,13 @@ impl EcgInstanceMeta {
             || !self.manufacturer.is_ascii()
             || !self.model.is_ascii()
             || !self.instance_number.is_ascii()
+            // Caller-supplied acquisition-context items are written
+            // verbatim: their text counts toward the charset decision
+            // or a reader decodes it as Latin-1 mojibake.
+            || self
+                .acquisition_context
+                .iter()
+                .any(dataset_needs_utf8)
     }
 
     fn fill_uids(&mut self) {
@@ -161,6 +163,45 @@ fn recording_needs_utf8(rec: &EcgRecording) -> bool {
         })
 }
 
+/// True when any person-name component needs non-ASCII encoding.
+fn person_name_needs_utf8(pn: &PersonName) -> bool {
+    [&pn.alphabetic]
+        .into_iter()
+        .chain(pn.ideographic.as_ref())
+        .chain(pn.phonetic.as_ref())
+        .flat_map(|g| [&g.family, &g.given, &g.middle, &g.prefix, &g.suffix])
+        .any(|s| !s.is_ascii())
+}
+
+/// True when any text in a caller-supplied dataset needs non-ASCII
+/// encoding. Numbers, tags, and raw bytes cannot carry text; nested
+/// sequences recurse so coded concept names are covered too.
+fn dataset_needs_utf8(ds: &DataSet) -> bool {
+    ds.iter().any(|(_, el)| value_needs_utf8(&el.value))
+}
+
+/// True when a value holds non-ASCII text.
+fn value_needs_utf8(v: &Value) -> bool {
+    match v {
+        Value::Text(texts) => texts.iter().any(|s| !s.is_ascii()),
+        Value::PersonName(names) => names.iter().any(person_name_needs_utf8),
+        Value::Sequence(items) => items.iter().any(dataset_needs_utf8),
+        _ => false,
+    }
+}
+
+/// Waveform Originality is a closed enumerated pair (C.10.9.1.4).
+/// Shared by encoder and decoder so anything that decodes re-encodes.
+fn check_originality(s: &str) -> Result<()> {
+    if matches!(s, "ORIGINAL" | "DERIVED") {
+        Ok(())
+    } else {
+        Err(Error::InvalidMeta(format!(
+            "Waveform Originality {s:?} (want ORIGINAL or DERIVED)"
+        )))
+    }
+}
+
 /// Convert a recording into one Waveform Sequence item.
 pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
     if !matches!(rec.bits_allocated, 8 | 16) {
@@ -188,14 +229,9 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
             rec.sampling_frequency_hz
         )));
     }
-    // Waveform Originality is a closed enumerated pair (C.10.9.1.4):
-    // anything else would emit a non-conformant item.
-    if !matches!(rec.originality.as_str(), "ORIGINAL" | "DERIVED") {
-        return Err(Error::InvalidMeta(format!(
-            "Waveform Originality {:?} (want ORIGINAL or DERIVED)",
-            rec.originality
-        )));
-    }
+    // Closed pair (C.10.9.1.4): anything else would emit a
+    // non-conformant item.
+    check_originality(&rec.originality)?;
     // Format a DS field, refusing non-finite floats (NaN/inf are not
     // valid DS values).
     let ds_field = |what: &str, v: f64| {
@@ -400,18 +436,25 @@ fn interleave(rec: &EcgRecording) -> Result<Vec<u8>> {
 
 /// Parse one Waveform Sequence item back into a recording.
 pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
+    // Absent reads Missing; present-but-unusable reads a Waveform
+    // shape error (never Missing: the tag IS there).
+    let shape = |tag, what: &str| {
+        if item.get(tag).is_none() {
+            Error::Missing(tag.to_string())
+        } else {
+            Error::Waveform(format!("{tag} present but not {what}"))
+        }
+    };
     let req = |tag| {
         item.require_string(tag)
-            .map_err(|_| Error::Missing(tag.to_string()))
+            .map_err(|_| shape(tag, "usable text"))
     };
-    let channels = item
-        .uint16(tags::NUMBER_OF_WAVEFORM_CHANNELS)
-        .ok_or_else(|| Error::Missing(tags::NUMBER_OF_WAVEFORM_CHANNELS.to_string()))?
-        as usize;
+    let channels =
+        item.uint16(tags::NUMBER_OF_WAVEFORM_CHANNELS)
+            .ok_or_else(|| shape(tags::NUMBER_OF_WAVEFORM_CHANNELS, "U16"))? as usize;
     let samples = item
         .uint32(tags::NUMBER_OF_WAVEFORM_SAMPLES)
-        .ok_or_else(|| Error::Missing(tags::NUMBER_OF_WAVEFORM_SAMPLES.to_string()))?
-        as usize;
+        .ok_or_else(|| shape(tags::NUMBER_OF_WAVEFORM_SAMPLES, "U32"))? as usize;
     let freq: f64 = req(tags::SAMPLING_FREQUENCY)?
         .trim()
         .parse()
@@ -421,18 +464,35 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
     if channels == 0 || samples == 0 || !freq.is_finite() || freq <= 0.0 {
         return Err(Error::Waveform("empty waveform dimensions".into()));
     }
-    let bits = item.uint16(tags::WAVEFORM_BITS_ALLOCATED).unwrap_or(16);
+    // Type 1 like its siblings: guessed widths mis-slice every sample.
+    let bits = item
+        .uint16(tags::WAVEFORM_BITS_ALLOCATED)
+        .ok_or_else(|| shape(tags::WAVEFORM_BITS_ALLOCATED, "U16"))?;
     if !matches!(bits, 8 | 16) {
         return Err(Error::Samples(format!("bits_allocated {bits}")));
     }
+    // C.10.9.1.7: SB/UB are 8-bit, SS/US are 16-bit. Crossed pairs
+    // (e.g. SS with 8 bits) are rejected, not silently kept.
     let interp = match req(tags::WAVEFORM_SAMPLE_INTERPRETATION)?.trim() {
-        "SS" | "SB" => SampleInterpretation::Signed,
-        "US" | "UB" => SampleInterpretation::Unsigned,
-        other => return Err(Error::Samples(format!("interpretation {other:?}"))),
+        "SS" if bits == 16 => SampleInterpretation::Signed,
+        "SB" if bits == 8 => SampleInterpretation::Signed,
+        "US" if bits == 16 => SampleInterpretation::Unsigned,
+        "UB" if bits == 8 => SampleInterpretation::Unsigned,
+        other => {
+            return Err(Error::Samples(format!(
+                "interpretation {other:?} disagrees with bits_allocated {bits}"
+            )));
+        }
     };
+    // Absent stays ORIGINAL (the model default); present garbage is
+    // rejected like the encoder rejects it, so decode→encode round-trips.
+    let originality = item
+        .string(tags::WAVEFORM_ORIGINALITY)
+        .unwrap_or("ORIGINAL");
+    check_originality(originality)?;
     let defs = item
         .sequence(tags::CHANNEL_DEFINITION_SEQUENCE)
-        .ok_or_else(|| Error::Missing(tags::CHANNEL_DEFINITION_SEQUENCE.to_string()))?;
+        .ok_or_else(|| shape(tags::CHANNEL_DEFINITION_SEQUENCE, "a sequence"))?;
     if defs.len() != channels {
         return Err(Error::Waveform(format!(
             "channel definitions {} != channels {channels}",
@@ -487,7 +547,17 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
             });
         let mut lead_samples = Vec::with_capacity(samples);
         for t in 0..samples {
-            let off = (t * channels + c) * bytes_per_sample;
+            // u64 with an explicit bound: the product can exceed
+            // 32-bit usize for hostile dimensions. The `want` check
+            // above already constrains it, but fail closed here
+            // rather than relying on that non-local invariant.
+            let off = (t as u64 * channels as u64 + c as u64) * bytes_per_sample as u64;
+            if off + bytes_per_sample as u64 > raw.len() as u64 {
+                return Err(Error::Waveform(
+                    "waveform sample offset out of range".into(),
+                ));
+            }
+            let off = off as usize;
             let v = match (interp, bits) {
                 (SampleInterpretation::Signed, 16) => {
                     i16::from_le_bytes([raw[off], raw[off + 1]]) as i32
@@ -516,10 +586,7 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
     }
 
     let mut rec = EcgRecording::new(leads, freq)?;
-    rec.originality = item
-        .string(tags::WAVEFORM_ORIGINALITY)
-        .unwrap_or("ORIGINAL")
-        .to_string();
+    rec.originality = originality.to_string();
     rec.multiplex_label = item.string(tags::MULTIPLEX_GROUP_LABEL).map(str::to_string);
     rec.powerline_hz = item
         .string(tags::POWERLINE_FREQUENCY)
@@ -553,10 +620,11 @@ fn waveform_bytes(item: &DataSet) -> Result<Vec<u8>> {
 ///
 /// Validated here: UID syntax for all four UID fields, Patient Sex
 /// (`M`/`F`/`O` when non-empty), Waveform Originality (in the item
-/// builder), and the per-SOP-class channel caps (12-lead ≤ 13,
-/// General ECG ≤ 12). Other free-text fields (dates, names, labels,
-/// descriptions) are the caller's responsibility and are written
-/// verbatim: garbage in, non-conformant out.
+/// builder), the non-empty Type 1 Instance Number, and the
+/// per-SOP-class channel caps (12-lead ≤ 13, General ECG ≤ 12). Other
+/// free-text fields (dates, names, labels, descriptions) are the
+/// caller's responsibility and are written verbatim: garbage in,
+/// non-conformant out.
 pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Result<DataSet> {
     let mut meta = meta.clone();
     meta.fill_uids();
@@ -603,6 +671,11 @@ pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Resul
         if v.as_ref().is_none_or(|s| s.is_empty()) {
             return Err(Error::Missing(tag.to_string()));
         }
+    }
+    // Type 1 Instance Number: the default is "1" but a caller can
+    // empty it, and an empty Type 1 breaks the IOD.
+    if meta.instance_number.is_empty() {
+        return Err(Error::Missing(tags::INSTANCE_NUMBER.to_string()));
     }
     let mut ds = DataSet::new();
     if meta.needs_utf8() || recording_needs_utf8(rec) {
@@ -674,12 +747,17 @@ pub fn file_meta_for_dataset(
     ds: &DataSet,
     ts: vyna_dcm_core::TransferSyntax,
 ) -> Result<vyna_dcm_codec::FileMeta> {
-    let sop_class = ds
-        .require_string(tags::SOP_CLASS_UID)
-        .map_err(|_| Error::Missing(tags::SOP_CLASS_UID.to_string()))?;
-    let sop_inst = ds
-        .require_string(tags::SOP_INSTANCE_UID)
-        .map_err(|_| Error::Missing(tags::SOP_INSTANCE_UID.to_string()))?;
+    let req = |tag| {
+        ds.require_string(tag).map_err(|_| {
+            if ds.get(tag).is_none() {
+                Error::Missing(tag.to_string())
+            } else {
+                Error::Waveform(format!("{tag} present but not usable text"))
+            }
+        })
+    };
+    let sop_class = req(tags::SOP_CLASS_UID)?;
+    let sop_inst = req(tags::SOP_INSTANCE_UID)?;
     Ok(vyna_dcm_codec::FileMeta::new(sop_class, sop_inst, ts))
 }
 
@@ -687,6 +765,7 @@ pub fn file_meta_for_dataset(
 mod tests {
     use super::*;
     use crate::model::{EcgLead, STANDARD_12_LEAD};
+    use vyna_dcm_core::DataElement;
 
     fn twelve_lead() -> EcgRecording {
         let leads = STANDARD_12_LEAD
@@ -753,6 +832,78 @@ mod tests {
             assert_eq!(back.bits_allocated, bits);
             assert_eq!(back.leads[0].samples, vec![0, max, max / 2, 1]);
         }
+    }
+
+    #[test]
+    fn present_but_unusable_reads_waveform_not_missing() {
+        // Wrong-typed channels (U32, not U16).
+        let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        let mut mistyped = item.clone();
+        mistyped.insert(DataElement::new(
+            tags::NUMBER_OF_WAVEFORM_CHANNELS,
+            Vr::Ul,
+            Value::U32(vec![12]),
+        ));
+        let err = recording_from_waveform_item(&mistyped).unwrap_err();
+        assert!(matches!(err, Error::Waveform(_)), "{err:?}");
+        // Present-but-empty sampling frequency.
+        let mut empty = item.clone();
+        empty.put_text(tags::SAMPLING_FREQUENCY, Vr::Ds, "");
+        let err = recording_from_waveform_item(&empty).unwrap_err();
+        assert!(matches!(err, Error::Waveform(_)), "{err:?}");
+        // Genuinely absent still reads Missing.
+        let mut gone = item.clone();
+        gone.remove(tags::NUMBER_OF_WAVEFORM_CHANNELS);
+        let err = recording_from_waveform_item(&gone).unwrap_err();
+        assert!(matches!(err, Error::Missing(_)), "{err:?}");
+    }
+
+    #[test]
+    fn missing_bits_allocated_is_missing_not_default() {
+        let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        let mut no_bits = item.clone();
+        no_bits.remove(tags::WAVEFORM_BITS_ALLOCATED);
+        let err = recording_from_waveform_item(&no_bits).unwrap_err();
+        assert!(matches!(err, Error::Missing(_)), "{err:?}");
+    }
+
+    #[test]
+    fn bogus_originality_rejected_like_encoder() {
+        let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        let mut bogus = item.clone();
+        bogus.put_text(tags::WAVEFORM_ORIGINALITY, Vr::Cs, "MAYBE");
+        let err = recording_from_waveform_item(&bogus).unwrap_err();
+        assert!(matches!(err, Error::InvalidMeta(_)), "{err:?}");
+        // Absent keeps the ORIGINAL default and round-trips.
+        let mut absent = item.clone();
+        absent.remove(tags::WAVEFORM_ORIGINALITY);
+        let back = recording_from_waveform_item(&absent).unwrap();
+        assert_eq!(back.originality, "ORIGINAL");
+        recording_to_waveform_item(&back).unwrap();
+    }
+
+    #[test]
+    fn crossed_interpretation_width_pairs_rejected() {
+        for (interp, bits) in [("SS", 8), ("SB", 16), ("US", 8), ("UB", 16)] {
+            let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+            let mut crossed = item.clone();
+            crossed.put_u16_single(tags::WAVEFORM_BITS_ALLOCATED, bits);
+            crossed.put_text(tags::WAVEFORM_SAMPLE_INTERPRETATION, Vr::Cs, interp);
+            let err = recording_from_waveform_item(&crossed).unwrap_err();
+            assert!(matches!(err, Error::Samples(_)), "{interp}/{bits}: {err:?}");
+        }
+    }
+
+    #[test]
+    fn empty_instance_number_rejected() {
+        let rec = twelve_lead();
+        let mut meta = EcgInstanceMeta::new(PersonName::parse("Doe^Jane"), "E123");
+        meta.content_date = Some("20261011".into());
+        meta.content_time = Some("120000".into());
+        meta.acquisition_datetime = Some("20261011120000".into());
+        meta.instance_number.clear();
+        let err = recording_to_dataset(&rec, &meta).unwrap_err();
+        assert!(matches!(err, Error::Missing(_)), "{err:?}");
     }
 
     #[test]
@@ -989,6 +1140,37 @@ mod tests {
         // ASCII-only recording: no charset stamped.
         let ds = recording_to_dataset(&twelve_lead(), &meta).unwrap();
         assert!(ds.get(tags::SPECIFIC_CHARACTER_SET).is_none());
+    }
+
+    #[test]
+    fn non_ascii_acquisition_context_declares_utf8() {
+        // Write direction: caller-supplied context text counts toward
+        // the charset decision even when header and recording are
+        // fully ASCII.
+        let mut meta = dated_meta();
+        let mut name_item = DataSet::new();
+        name_item.put_text(tags::CODE_VALUE, Vr::Sh, "STRESS-ü");
+        name_item.put_text(tags::CODE_MEANING, Vr::Lo, "Belastungs-EKG ✓");
+        let mut ctx = DataSet::new();
+        ctx.put_sequence(tags::CONCEPT_NAME_CODE_SEQUENCE, vec![name_item]);
+        ctx.put_text(tags::TEXT_VALUE, Vr::Ut, "Ruhe-Messung ✓");
+        meta.acquisition_context = vec![ctx];
+        let ds = recording_to_dataset(&twelve_lead(), &meta).unwrap();
+        assert_eq!(ds.string(tags::SPECIFIC_CHARACTER_SET), Some("ISO_IR 192"));
+        // Read direction: a Part-10 round-trip decodes the context
+        // text exactly (without the declaration the reader falls back
+        // to Latin-1 and the text mojibakes).
+        let ts = vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian;
+        let bytes =
+            vyna_dcm_codec::write_part10(&file_meta_for_dataset(&ds, ts).unwrap(), &ds).unwrap();
+        let (_, back) = vyna_dcm_codec::read_part10(&bytes).unwrap();
+        let back_ctx = &back.sequence(tags::ACQUISITION_CONTEXT_SEQUENCE).unwrap()[0];
+        assert_eq!(back_ctx.string(tags::TEXT_VALUE), Some("Ruhe-Messung ✓"));
+        let back_name = &back_ctx.sequence(tags::CONCEPT_NAME_CODE_SEQUENCE).unwrap()[0];
+        assert_eq!(
+            back_name.string(tags::CODE_MEANING),
+            Some("Belastungs-EKG ✓")
+        );
     }
 
     #[test]

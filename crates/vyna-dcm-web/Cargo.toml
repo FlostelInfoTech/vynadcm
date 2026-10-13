@@ -19,6 +19,7 @@ vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.5" }
 vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.5" }
 thiserror.workspace = true
 bytes.workspace = true
+memchr = "2"
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true

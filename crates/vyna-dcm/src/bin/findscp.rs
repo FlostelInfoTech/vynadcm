@@ -13,7 +13,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use common::{AuditArgs, ListenArgs, SenderWithId, anyhowish::Result, emit_best_effort, host_of};
+use common::{
+    AuditArgs, ListenArgs, MAX_SCP_ASSOCIATIONS, SenderWithId, anyhowish::Result, emit_best_effort,
+    host_of,
+};
 use tokio::net::TcpListener;
 use vyna_dcm::net::AeTitle;
 use vyna_dcm::net::qrdb::{QrIndex, QrScp};
@@ -155,12 +158,19 @@ async fn main() -> Result<()> {
         })
     };
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_SCP_ASSOCIATIONS));
     loop {
         let Ok((tcp, peer)) = listener.accept().await else {
             // Back off: a persistent accept failure (e.g. EMFILE)
             // must not spin the loop at full speed.
             eprintln!("findscp: accept failed (retrying in 100ms)");
             tokio::time::sleep(Duration::from_millis(100)).await;
+            continue;
+        };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            eprintln!(
+                "findscp: association from {peer} dropped: over {MAX_SCP_ASSOCIATIONS} concurrent"
+            );
             continue;
         };
         // DIMSE is small-write chatty; Nagle would stall each PDU on the
@@ -173,6 +183,7 @@ async fn main() -> Result<()> {
             scp_opts.clone(),
         );
         tokio::spawn(async move {
+            let _permit = permit;
             println!("association from {peer}");
             let out = match tls {
                 Some(tls) => match tls.accept(tcp).await {

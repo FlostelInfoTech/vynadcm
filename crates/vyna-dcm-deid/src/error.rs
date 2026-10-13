@@ -8,6 +8,10 @@ pub enum Error {
     /// crate never alters pixels, so de-identification is refused.
     #[error("refusing to de-identify: Burned In Annotation is YES")]
     BurnedInAnnotation,
+    /// Replacement name is not a valid single `PN` value (overlong
+    /// group, too many components/groups, or backslash).
+    #[error("invalid replacement name: {0}")]
+    InvalidReplacementName(String),
 }
 
 /// De-identification result.

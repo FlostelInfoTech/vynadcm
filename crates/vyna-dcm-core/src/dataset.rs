@@ -76,6 +76,15 @@ impl DataSet {
         self.elements.keys().copied()
     }
 
+    /// Approximate in-RAM payload bytes of every element's
+    /// [`Value`](crate::Value) (see
+    /// [`approx_bytes`](crate::Value::approx_bytes) for what is and is
+    /// not counted). For DoS accounting, not billing.
+    #[must_use]
+    pub fn approx_bytes(&self) -> u64 {
+        self.elements.values().map(|e| e.value.approx_bytes()).sum()
+    }
+
     // -- typed readers ----------------------------------------------------
 
     /// First text value of `tag`, or `None` when absent/not text.
@@ -93,11 +102,23 @@ impl DataSet {
         }
     }
 
-    /// Required string; error when missing or empty.
+    /// Required string; [`Error::MissingAttribute`] when absent,
+    /// [`Error::Value`] when present but empty or not text.
     pub fn require_string(&self, tag: Tag) -> Result<&str> {
-        self.string(tag)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| Error::MissingAttribute(tag.to_string()))
+        let Some(e) = self.get(tag) else {
+            return Err(Error::MissingAttribute(tag.to_string()));
+        };
+        match e.value.first_text() {
+            Some(s) if !s.is_empty() => Ok(s),
+            Some(_) => Err(Error::Value {
+                tag: tag.to_string(),
+                message: "empty value".into(),
+            }),
+            None => Err(Error::Value {
+                tag: tag.to_string(),
+                message: format!("expected text, found {:?}", e.vr),
+            }),
+        }
     }
 
     /// Person names of `tag`.
@@ -139,12 +160,15 @@ impl DataSet {
     /// Parse the first `DS`/`IS`/numeric value as `f64`.
     ///
     /// 64-bit integers lose precision past 2⁵³ (documented, not
-    /// hidden: the `as f64` conversion rounds).
+    /// hidden: the `as f64` conversion rounds). Text uses DS grammar:
+    /// Rust-only spellings (`inf`, `NaN`, ...) are not numbers and
+    /// yield `None` (binary `FL`/`FD` infinities stay faithful — the
+    /// bits really say that).
     #[must_use]
     pub fn float(&self, tag: Tag) -> Option<f64> {
         let e = self.get(tag)?;
         match &e.value {
-            Value::Text(v) => v.first()?.trim().parse::<f64>().ok(),
+            Value::Text(v) => v.first().and_then(|s| parse_finite(s)),
             Value::F32(v) => v.first().map(|f| *f as f64),
             Value::F64(v) => v.first().copied(),
             Value::U16(v) => v.first().map(|f| *f as f64),
@@ -162,11 +186,7 @@ impl DataSet {
     #[must_use]
     pub fn float_list(&self, tag: Tag) -> Option<Vec<f64>> {
         match self.get(tag).map(|e| &e.value) {
-            Some(Value::Text(v)) => Some(
-                v.iter()
-                    .filter_map(|s| s.trim().parse::<f64>().ok())
-                    .collect(),
-            ),
+            Some(Value::Text(v)) => Some(v.iter().filter_map(|s| parse_finite(s)).collect()),
             Some(Value::F32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
             Some(Value::F64(v)) => Some(v.clone()),
             Some(Value::U16(v)) => Some(v.iter().map(|f| *f as f64).collect()),
@@ -256,10 +276,66 @@ impl DataSet {
     }
 }
 
+/// Parse `DS`/`IS` text as `f64`, rejecting Rust-only non-finite
+/// spellings (`inf`, `-Infinity`, `NaN`, ...) that the DS grammar
+/// (PS3.5 §6.2) forbids. They are the only gap: everything else
+/// `f64::from_str` accepts is valid DS.
+fn parse_finite(s: &str) -> Option<f64> {
+    let f: f64 = s.trim().parse().ok()?;
+    f.is_finite().then_some(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::tags;
+
+    #[test]
+    fn require_string_distinguishes_absence_from_bad_value() {
+        let mut ds = DataSet::new();
+        assert!(matches!(
+            ds.require_string(tags::MODALITY),
+            Err(crate::Error::MissingAttribute(_))
+        ));
+        ds.put_text(tags::MODALITY, Vr::Cs, "");
+        assert!(matches!(
+            ds.require_string(tags::MODALITY),
+            Err(crate::Error::Value { .. })
+        ));
+        ds.insert(DataElement::new(
+            tags::MODALITY,
+            Vr::Us,
+            Value::U16(vec![1]),
+        ));
+        let err = ds.require_string(tags::MODALITY).unwrap_err();
+        assert!(matches!(err, crate::Error::Value { .. }), "{err:?}");
+        assert!(err.to_string().contains("Us"), "{err}");
+        ds.put_text(tags::MODALITY, Vr::Cs, "ECG");
+        assert_eq!(ds.require_string(tags::MODALITY).unwrap(), "ECG");
+    }
+
+    #[test]
+    fn float_rejects_nonfinite_text_keeps_binary() {
+        let mut ds = DataSet::new();
+        for bad in ["inf", "-inf", "Infinity", "NaN", "nan", "INF"] {
+            ds.put_text(tags::RESCALE_SLOPE, Vr::Ds, bad);
+            assert_eq!(ds.float(tags::RESCALE_SLOPE), None, "{bad}");
+            assert_eq!(
+                ds.float_list(tags::RESCALE_SLOPE).unwrap(),
+                Vec::<f64>::new(),
+                "{bad}"
+            );
+        }
+        ds.put_text(tags::RESCALE_SLOPE, Vr::Ds, "1.25");
+        assert_eq!(ds.float(tags::RESCALE_SLOPE), Some(1.25));
+        // Binary infinities are faithful (the bits really say that).
+        ds.insert(DataElement::new(
+            tags::RESCALE_SLOPE,
+            Vr::Fl,
+            Value::F32(vec![f32::INFINITY]),
+        ));
+        assert_eq!(ds.float(tags::RESCALE_SLOPE), Some(f64::INFINITY));
+    }
 
     #[test]
     fn typed_accessors() {

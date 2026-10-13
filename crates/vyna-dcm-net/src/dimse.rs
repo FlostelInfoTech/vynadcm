@@ -71,6 +71,10 @@ pub mod status {
     pub const PENDING_WARNING: u16 = 0xFF01;
     /// Warning: coercion of data elements.
     pub const COERCION: u16 = 0xB000;
+    /// Warning (C-MOVE/C-GET final): sub-operations complete, one or
+    /// more failures. Same value as [`COERCION`]; the meaning is
+    /// per-service.
+    pub const SUBOPERATIONS_COMPLETE_WITH_FAILURES: u16 = 0xB000;
     /// Warning: elements discarded.
     pub const ELEMENTS_DISCARDED: u16 = 0xB006;
     /// Warning: dataset does not match SOP class.

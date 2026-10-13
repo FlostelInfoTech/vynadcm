@@ -124,7 +124,9 @@ pub fn syslog_frame(
 ) -> String {
     format!(
         "<{}>1 {timestamp} {hostname} {app_name} - {msgid} - {message}",
-        pri_value(severity),
+        // Mask defensively: only the low 3 bits are severity, and a
+        // hostile direct caller could otherwise smuggle facility bits.
+        pri_value(severity & 0x07),
         timestamp = sanitize_field(timestamp),
         hostname = sanitize_field(hostname),
         app_name = sanitize_field(app_name),
@@ -133,8 +135,9 @@ pub fn syslog_frame(
 }
 
 /// Replace header-hostile characters (whitespace, controls, DEL)
-/// with `_` (RFC 5424 fields admit no spaces); empty fields become
-/// the NILVALUE `-` so the frame stays well-formed.
+/// with `_` (RFC 5424 fields admit no spaces) and fold any other
+/// non-ASCII to `?` (header fields are PRINTUSASCII); empty fields
+/// become the NILVALUE `-` so the frame stays well-formed.
 fn sanitize_field(s: &str) -> String {
     if s.is_empty() {
         return "-".to_string();
@@ -143,8 +146,10 @@ fn sanitize_field(s: &str) -> String {
         .map(|c| {
             if c.is_whitespace() || c.is_control() {
                 '_'
-            } else {
+            } else if c.is_ascii() {
                 c
+            } else {
+                '?'
             }
         })
         .collect()
@@ -164,7 +169,7 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_UDP_FRAME: usize = 65507;
 
 /// Syslog sender for audit messages (blocking; safe to share).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SyslogSender {
     target: SyslogTarget,
     app_name: String,
@@ -174,6 +179,26 @@ pub struct SyslogSender {
     client_cert: Option<(Vec<u8>, Vec<u8>)>,
     webpki_roots: bool,
     timeout: Duration,
+}
+
+// Manual `Debug`: the mTLS private key (and CA bundle) must never
+// reach logs; presence is shown, bytes are not.
+impl std::fmt::Debug for SyslogSender {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyslogSender")
+            .field("target", &self.target)
+            .field("app_name", &self.app_name)
+            .field("hostname", &self.hostname)
+            .field("ca_pem", &self.ca_pem.as_ref().map(|_| "<redacted>"))
+            .field("server_name", &self.server_name)
+            .field(
+                "client_cert",
+                &self.client_cert.as_ref().map(|_| "<redacted>"),
+            )
+            .field("webpki_roots", &self.webpki_roots)
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl SyslogSender {
@@ -240,6 +265,15 @@ impl SyslogSender {
 
     /// Send one audit message (severity follows its outcome).
     ///
+    /// Delivery is at-most-once: each call opens a fresh connection,
+    /// tries every resolved address once, and returns its failure —
+    /// there is no retry, no queue, and no persistence. A refused or
+    /// timed-out server means that message is lost unless the caller
+    /// retries or records the error (the CLI tools log it via
+    /// `emit_best_effort` and continue the clinical path). Match on
+    /// [`Error::Io`](crate::Error::Io) for the
+    /// [`Kind`](std::io::ErrorKind) when deciding whether to retry.
+    ///
     /// Connect/read/write run under the 10 s timeout, but DNS
     /// resolution does not (`std` offers no resolution timeout): a
     /// broken resolver can stall past it. Prefer IP literals for the
@@ -274,10 +308,7 @@ impl SyslogSender {
         // Resolve first and bind a matching family: an IPv4 socket
         // cannot send to an IPv6 server.
         let mut last_err = None;
-        for addr in (self.target.host.as_str(), self.target.port)
-            .to_socket_addrs()
-            .map_err(|e| Error::Transport(e.to_string()))?
-        {
+        for addr in (self.target.host.as_str(), self.target.port).to_socket_addrs()? {
             let bind = if addr.is_ipv6() {
                 "[::]:0"
             } else {
@@ -293,19 +324,14 @@ impl SyslogSender {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(Error::Transport(
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| format!("{}: no addresses", self.target.host)),
-        ))
+        Err(last_err
+            .map(Error::Io)
+            .unwrap_or_else(|| Error::Transport(format!("{}: no addresses", self.target.host))))
     }
 
     fn send_tcp(&self, frame: &str) -> Result<()> {
         let mut last_err = None;
-        for addr in (self.target.host.as_str(), self.target.port)
-            .to_socket_addrs()
-            .map_err(|e| Error::Transport(e.to_string()))?
-        {
+        for addr in (self.target.host.as_str(), self.target.port).to_socket_addrs()? {
             match TcpStream::connect_timeout(&addr, self.timeout) {
                 Ok(stream) => {
                     return Self::write_tcp(stream, &octet_frame(frame), self.timeout);
@@ -313,21 +339,15 @@ impl SyslogSender {
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(Error::Transport(
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| format!("{}: no addresses", self.target.host)),
-        ))
+        Err(last_err
+            .map(Error::Io)
+            .unwrap_or_else(|| Error::Transport(format!("{}: no addresses", self.target.host))))
     }
 
     fn write_tcp(mut stream: TcpStream, frame: &str, timeout: Duration) -> Result<()> {
-        stream
-            .set_write_timeout(Some(timeout))
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        stream
-            .write_all(frame.as_bytes())
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        stream.flush().map_err(|e| Error::Transport(e.to_string()))
+        stream.set_write_timeout(Some(timeout))?;
+        stream.write_all(frame.as_bytes())?;
+        Ok(stream.flush()?)
     }
 
     #[cfg(feature = "tls")]
@@ -374,36 +394,28 @@ impl SyslogSender {
         let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)
             .map_err(|e| Error::Tls(e.to_string()))?;
         let mut last_err = None;
-        for addr in (self.target.host.as_str(), self.target.port)
-            .to_socket_addrs()
-            .map_err(|e| Error::Transport(e.to_string()))?
-        {
+        for addr in (self.target.host.as_str(), self.target.port).to_socket_addrs()? {
             match TcpStream::connect_timeout(&addr, self.timeout) {
                 Ok(mut sock) => {
-                    sock.set_write_timeout(Some(self.timeout))
-                        .map_err(|e| Error::Transport(e.to_string()))?;
+                    sock.set_write_timeout(Some(self.timeout))?;
                     // The TLS handshake reads: without a read timeout a
                     // silent peer hangs emit() forever.
-                    sock.set_read_timeout(Some(self.timeout))
-                        .map_err(|e| Error::Transport(e.to_string()))?;
+                    sock.set_read_timeout(Some(self.timeout))?;
                     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
-                    tls.write_all(octet_frame(frame).as_bytes())
-                        .map_err(|e| Error::Tls(e.to_string()))?;
-                    tls.flush().map_err(|e| Error::Tls(e.to_string()))?;
+                    tls.write_all(octet_frame(frame).as_bytes())?;
+                    tls.flush()?;
                     // Clean shutdown so the repository sees EOF, not a
                     // truncated stream (then drop; no reply is read).
                     tls.conn.send_close_notify();
-                    tls.flush().map_err(|e| Error::Tls(e.to_string()))?;
+                    tls.flush()?;
                     return Ok(());
                 }
                 Err(e) => last_err = Some(e),
             }
         }
-        Err(Error::Transport(
-            last_err
-                .map(|e| e.to_string())
-                .unwrap_or_else(|| format!("{}: no addresses", self.target.host)),
-        ))
+        Err(last_err
+            .map(Error::Io)
+            .unwrap_or_else(|| Error::Transport(format!("{}: no addresses", self.target.host))))
     }
 
     #[cfg(not(feature = "tls"))]
@@ -415,6 +427,21 @@ impl SyslogSender {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn debug_redacts_key_material() {
+        let target: SyslogTarget = "tls://arr.example".parse().unwrap();
+        let sender = SyslogSender::new(target, "host")
+            .with_ca_pem(b"CA-BYTES".to_vec())
+            .with_client_cert(b"CERT-BYTES".to_vec(), b"KEY-BYTES".to_vec());
+        let shown = format!("{sender:?}");
+        assert!(!shown.contains("CA-BYTES"), "{shown}");
+        assert!(!shown.contains("CERT-BYTES"), "{shown}");
+        assert!(!shown.contains("KEY-BYTES"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        // Non-secret fields still show.
+        assert!(shown.contains("arr.example"), "{shown}");
+    }
 
     #[test]
     fn urls_parse_with_scheme_defaults() {
@@ -527,7 +554,13 @@ mod tests {
         let target: SyslogTarget = "tcp://127.0.0.1:1".parse().unwrap();
         let sender = SyslogSender::new(target, "h").with_timeout(Duration::from_millis(500));
         let msg = AuditMessage::actor_activity("APP", None, "SRC", true);
-        assert!(matches!(sender.emit(&msg), Err(Error::Transport(_))));
+        // The io::Error kind survives (callers can tell refused
+        // from timeout when deciding whether to retry).
+        let err = sender.emit(&msg).unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::ConnectionRefused),
+            "{err:?}"
+        );
     }
 
     #[cfg(feature = "tls")]
@@ -622,7 +655,10 @@ mod tests {
         let sender = SyslogSender::new(target, "h").with_timeout(Duration::from_secs(5));
         let msg = AuditMessage::actor_activity("APP", None, "SRC", true);
         // No private CA: WebPKI roots cannot validate the loopback cert.
-        assert!(matches!(sender.emit(&msg), Err(Error::Tls(_))));
+        // I/O on the TLS stream is Error::Io, with rustls's reason kept.
+        let err = sender.emit(&msg).unwrap_err();
+        assert!(matches!(&err, Error::Io(_)), "{err:?}");
+        assert!(err.to_string().to_lowercase().contains("cert"), "{err}");
         drop(server);
     }
 
@@ -632,6 +668,20 @@ mod tests {
         assert!(f.contains("evil_host_x"), "{f}");
         assert!(f.contains("a_b"), "{f}");
         assert!(!f.contains('\n'), "{f}");
+    }
+
+    #[test]
+    fn frame_masks_severity_and_folds_non_ascii() {
+        // Severity 99 would smuggle facility bits without the mask
+        // (99 & 7 == 3 -> PRI 107).
+        let f = syslog_frame(99, "t", "h", "a", "ATNA", "<m/>");
+        assert!(f.starts_with("<107>1 "), "{f}");
+        // Non-ASCII header bytes fold to '?'; the UTF-8 message body
+        // (RFC 5424 MSG) passes through untouched.
+        let f = syslog_frame(5, "t", "héllo wörld✓", "a", "ATNA", "<m>日本語</m>");
+        assert!(f.contains("h?llo_w?rld?"), "{f}");
+        assert!(f.contains("<m>日本語</m>"), "{f}");
+        assert!(f.split(' ').nth(2).unwrap().is_ascii(), "{f}");
     }
 
     #[test]

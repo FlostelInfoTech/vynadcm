@@ -56,31 +56,59 @@ impl TlsConnector {
         })
     }
 
-    /// TLS handshake over an open TCP stream.
+    /// TLS handshake over an open TCP stream (10 s budget, matching
+    /// [`AssociationOptions::default`](crate::AssociationOptions): a
+    /// peer that accepts TCP but never handshakes must not hold the
+    /// task forever — the read timeout only applies later).
     pub async fn connect(
         &self,
         stream: TcpStream,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        self.connect_timeout(stream, crate::AssociationOptions::default().connect_timeout)
+            .await
+    }
+
+    /// TLS handshake over an open TCP stream with an explicit budget.
+    pub async fn connect_timeout(
+        &self,
+        stream: TcpStream,
+        timeout: std::time::Duration,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let name = self
             .server_name
             .clone()
             .try_into()
             .map_err(|_| Error::Tls(format!("bad server name {:?}", self.server_name)))?;
-        self.inner
-            .connect(name, stream)
+        tokio::time::timeout(timeout, self.inner.connect(name, stream))
             .await
+            .map_err(|_| Error::Timeout("TLS handshake"))?
             .map_err(|e| Error::Tls(e.to_string()))
     }
 
-    /// Connect + handshake to `addr` in one step.
+    /// Connect + handshake to `addr` in one step (10 s budget per
+    /// phase, matching [`AssociationOptions::default`](crate::AssociationOptions)).
     pub async fn connect_to(
         &self,
         addr: &str,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
-        let stream = TcpStream::connect(addr).await?;
+        self.connect_to_timeout(addr, crate::AssociationOptions::default().connect_timeout)
+            .await
+    }
+
+    /// Connect + handshake to `addr` with an explicit budget,
+    /// applied to the TCP connect and the TLS handshake each (a
+    /// hanging SYN or a silent peer must not stall the caller forever).
+    pub async fn connect_to_timeout(
+        &self,
+        addr: &str,
+        connect_timeout: std::time::Duration,
+    ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| Error::Timeout("TCP connect"))??;
         // As in Association::request: Nagle stalls small PDU writes.
         stream.set_nodelay(true)?;
-        self.connect(stream).await
+        self.connect_timeout(stream, connect_timeout).await
     }
 }
 
@@ -127,14 +155,28 @@ impl TlsAcceptor {
         })
     }
 
-    /// TLS handshake over an inbound TCP stream.
+    /// TLS handshake over an inbound TCP stream (10 s budget,
+    /// matching [`AssociationOptions::default`](crate::AssociationOptions):
+    /// a slow-loris peer that connects but never handshakes must not
+    /// hold the accept task forever — the read timeout only applies
+    /// later).
     pub async fn accept(
         &self,
         stream: TcpStream,
     ) -> Result<tokio_rustls::server::TlsStream<TcpStream>> {
-        self.inner
-            .accept(stream)
+        self.accept_timeout(stream, crate::AssociationOptions::default().connect_timeout)
             .await
+    }
+
+    /// TLS handshake over an inbound TCP stream with an explicit budget.
+    pub async fn accept_timeout(
+        &self,
+        stream: TcpStream,
+        timeout: std::time::Duration,
+    ) -> Result<tokio_rustls::server::TlsStream<TcpStream>> {
+        tokio::time::timeout(timeout, self.inner.accept(stream))
+            .await
+            .map_err(|_| Error::Timeout("TLS handshake"))?
             .map_err(|e| Error::Tls(e.to_string()))
     }
 }
@@ -166,6 +208,50 @@ mod tests {
 
     struct EchoOnly;
     impl Handlers for EchoOnly {}
+
+    #[tokio::test]
+    async fn accept_timeout_bounds_slow_loris() {
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let acceptor = TlsAcceptor::new(
+            &certified.cert.pem().into_bytes(),
+            &certified.signing_key.serialize_pem().into_bytes(),
+            None,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Client connects and goes silent: the handshake must time
+        // out instead of holding the accept task forever.
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        let t0 = std::time::Instant::now();
+        let err = acceptor
+            .accept_timeout(tcp, std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_bounds_silent_server() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Server accepts TCP but never handshakes.
+        tokio::spawn(async move {
+            let (_sock, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+        let connector = TlsConnector::new("localhost", None, None).unwrap();
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let t0 = std::time::Instant::now();
+        let err = connector
+            .connect_timeout(stream, std::time::Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        assert!(t0.elapsed() < std::time::Duration::from_secs(30));
+    }
 
     #[tokio::test]
     async fn tls_loopback_echo() {

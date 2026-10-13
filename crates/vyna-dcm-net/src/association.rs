@@ -24,6 +24,24 @@ use crate::{
 pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 
+/// Maximum events the pushback queue holds: a conformant peer sends at
+/// most one stray message mid-operation (a C-CANCEL or release), so 16
+/// is generous headroom and anything past it is a flood. Past the cap
+/// [`Association::stash`] fails with
+/// [`Error::TooManyStashed`](crate::Error::TooManyStashed) and the
+/// operation aborts the association instead of buffering peer-driven
+/// datasets without bound.
+pub const MAX_STASHED_EVENTS: usize = 16;
+
+/// Maximum aggregate dataset bytes the pushback queue holds (see
+/// [`MAX_STASHED_EVENTS`]: the count cap alone still allows 16 x 1 GiB
+/// stashed datasets). Past it [`Association::stash`] fails with
+/// [`Error::StashedTooLarge`](crate::Error::StashedTooLarge). Legit
+/// strays are a C-CANCEL or release (bytes, not megabytes), so 64 MiB
+/// is generous headroom. (The C-GET hold-aside carries its own twin
+/// budget, so the combined worst case is twice this.)
+pub const MAX_STASHED_BYTES: u64 = 64 * 1024 * 1024;
+
 /// Options for requesting (SCU) or accepting (SCP) associations.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -44,6 +62,9 @@ pub struct AssociationOptions {
     /// all its PDVs (DoS guard; the per-PDU cap alone does not bound
     /// a many-PDU message).
     pub max_message_bytes: u64,
+    /// TCP connect timeout (a hanging SYN must not stall the caller —
+    /// for C-MOVE that caller is an inbound association).
+    pub connect_timeout: Duration,
 }
 
 impl Default for AssociationOptions {
@@ -51,6 +72,7 @@ impl Default for AssociationOptions {
         Self {
             max_pdu_len: 256 * 1024,
             read_timeout: Duration::from_secs(300),
+            connect_timeout: Duration::from_secs(10),
             implementation_class_uid: vyna_dcm_core::VYNA_IMPLEMENTATION_CLASS_UID.to_string(),
             implementation_version: Some(
                 vyna_dcm_core::VYNA_IMPLEMENTATION_VERSION_NAME.to_string(),
@@ -107,9 +129,10 @@ pub struct Association {
     read_timeout: Duration,
     next_id: u16,
     /// Pushback queue: events seen by a cancel poll that belong to the
-    /// dispatch loop (e.g. RELEASE-RQ mid-FIND). [`Association::recv`]
+    /// dispatch loop (e.g. RELEASE-RQ mid-FIND), each with its dataset
+    /// bytes for the [`MAX_STASHED_BYTES`] budget. [`Association::recv`]
     /// drains this before touching the wire.
-    pending: VecDeque<DimseEvent>,
+    pending: VecDeque<(DimseEvent, u64)>,
     /// PDVs read past a message boundary: one P-DATA-TF may carry
     /// several messages, and [`Association::recv`] keeps the trailing
     /// PDVs here for the next call instead of dropping them.
@@ -125,7 +148,11 @@ impl Association {
         addr: &str,
         proposed: Vec<ProposedContext>,
     ) -> Result<Self> {
-        let stream = TcpStream::connect(addr).await?;
+        // A hanging SYN must time out: without this, a C-MOVE to a
+        // blackholed destination stalls the inbound association forever.
+        let stream = timeout(opts.connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| Error::Timeout("TCP connect"))??;
         // DIMSE is small-write chatty; Nagle would stall each PDU on the
         // peer's delayed ACK (~40ms), as DCMTK/dcm4che also avoid.
         stream.set_nodelay(true)?;
@@ -315,11 +342,13 @@ impl Association {
         command: &Command,
         dataset: Option<&vyna_dcm_core::DataSet>,
     ) -> Result<()> {
-        debug_assert_eq!(
-            command.has_dataset(),
-            dataset.is_some(),
-            "command data_set_type disagrees with dataset presence"
-        );
+        // Hard error, not debug-only: a mismatch would emit corrupt
+        // DIMSE (flag says dataset, none follows, or vice versa).
+        if command.has_dataset() != dataset.is_some() {
+            return Err(Error::BadCommand(
+                "command data_set_type disagrees with dataset presence".into(),
+            ));
+        }
         let ctx = self
             .context_by_id(context_id)
             .ok_or(Error::UnknownContext(context_id))?
@@ -364,7 +393,7 @@ impl Association {
 
     /// Receive one complete DIMSE message (reassembling PDVs), or a release.
     pub async fn recv(&mut self) -> Result<DimseEvent> {
-        if let Some(ev) = self.pending.pop_front() {
+        if let Some((ev, _)) = self.pending.pop_front() {
             return Ok(ev);
         }
         let mut cmd_buf: Vec<u8> = Vec::new();
@@ -464,7 +493,7 @@ impl Association {
     /// messages (C-CANCEL is ~30 bytes); anything larger in flight
     /// risks association desync, which then fails loudly.
     pub async fn poll_event(&mut self, wait: Duration) -> Result<Option<DimseEvent>> {
-        if let Some(ev) = self.pending.pop_front() {
+        if let Some((ev, _)) = self.pending.pop_front() {
             return Ok(Some(ev));
         }
         match timeout(wait, self.recv()).await {
@@ -474,8 +503,25 @@ impl Association {
     }
 
     /// Return an event to the pushback queue (see [`Association::recv`]).
-    pub fn stash(&mut self, ev: DimseEvent) {
-        self.pending.push_back(ev);
+    /// Fails with [`Error::TooManyStashed`](crate::Error::TooManyStashed)
+    /// past [`MAX_STASHED_EVENTS`] (or
+    /// [`Error::StashedTooLarge`](crate::Error::StashedTooLarge) past
+    /// [`MAX_STASHED_BYTES`]) instead of buffering without bound.
+    pub fn stash(&mut self, ev: DimseEvent) -> Result<()> {
+        if self.pending.len() >= MAX_STASHED_EVENTS {
+            return Err(Error::TooManyStashed {
+                limit: MAX_STASHED_EVENTS,
+            });
+        }
+        let size = event_bytes(&ev);
+        let held: u64 = self.pending.iter().map(|(_, b)| b).sum();
+        if held.saturating_add(size) > MAX_STASHED_BYTES {
+            return Err(Error::StashedTooLarge {
+                limit: MAX_STASHED_BYTES,
+            });
+        }
+        self.pending.push_back((ev, size));
+        Ok(())
     }
 
     /// Clean release: RELEASE-RQ then await RELEASE-RSP.
@@ -506,6 +552,15 @@ impl Association {
         )
         .await
         .map_err(|_| Error::Timeout("PDU read"))?
+    }
+}
+
+/// Dataset bytes an event holds for the stash budget (commands are
+/// ~10^2 bytes and ignored; releases hold nothing).
+fn event_bytes(ev: &DimseEvent) -> u64 {
+    match ev {
+        DimseEvent::Released => 0,
+        DimseEvent::Message(m) => m.dataset.as_ref().map(|ds| ds.approx_bytes()).unwrap_or(0),
     }
 }
 
@@ -543,6 +598,118 @@ mod tests {
         };
         assert_eq!(assoc.next_message_id(), u16::MAX);
         assert_eq!(assoc.next_message_id(), 1);
+    }
+
+    #[test]
+    fn stash_fails_past_cap() {
+        let opts = AssociationOptions::default();
+        let (a, _b) = tokio::io::duplex(64);
+        let info = AssociationInfo {
+            local_ae: AeTitle::new("A").unwrap(),
+            peer_ae: AeTitle::new("B").unwrap(),
+            peer_max_pdu: 0,
+        };
+        let mut assoc = Association::from_accepted(Box::new(a), info, vec![], &opts);
+        for _ in 0..MAX_STASHED_EVENTS {
+            assoc.stash(DimseEvent::Released).unwrap();
+        }
+        let err = assoc.stash(DimseEvent::Released).unwrap_err();
+        assert!(
+            matches!(err, Error::TooManyStashed { .. }),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[test]
+    fn stash_fails_past_byte_budget() {
+        use vyna_dcm_core::{DataElement, DataSet, Value, Vr, tags};
+        let opts = AssociationOptions::default();
+        let (a, _b) = tokio::io::duplex(64);
+        let info = AssociationInfo {
+            local_ae: AeTitle::new("A").unwrap(),
+            peer_ae: AeTitle::new("B").unwrap(),
+            peer_max_pdu: 0,
+        };
+        let mut assoc = Association::from_accepted(Box::new(a), info, vec![], &opts);
+        let message = |bytes: usize| {
+            let mut ds = DataSet::new();
+            ds.insert(DataElement::new(
+                tags::PIXEL_DATA,
+                Vr::Ow,
+                Value::Bytes(vec![0u8; bytes]),
+            ));
+            DimseEvent::Message(Box::new(crate::dimse::DimseMessage {
+                context_id: 1,
+                command: Command::echo_rq(1),
+                dataset: Some(ds),
+            }))
+        };
+        // Small stashes fit.
+        assoc.stash(message(1024)).unwrap();
+        // One 64 MiB + 1 byte stash trips the byte budget on its own.
+        let err = assoc
+            .stash(message(MAX_STASHED_BYTES as usize + 1))
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::StashedTooLarge { .. }),
+            "unexpected: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn connect_timeout_bounds_blackhole() {
+        // Probe first: TEST-NET-1 must hang here for the strict
+        // assertion to mean anything (some sandboxes refuse it fast
+        // instead, in which case there is nothing to bound).
+        let probe = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::TcpStream::connect("192.0.2.1:42"),
+        )
+        .await;
+        if probe.is_ok() {
+            eprintln!("blackhole probe did not hang; skipping strict connect-timeout check");
+            return;
+        }
+        let opts = AssociationOptions {
+            connect_timeout: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let Err(err) = Association::request(
+            &opts,
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            "192.0.2.1:42",
+            Vec::new(),
+        )
+        .await
+        else {
+            panic!("blackhole connect unexpectedly succeeded");
+        };
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+        assert!(t0.elapsed() < Duration::from_secs(30), "connect hung");
+    }
+
+    #[tokio::test]
+    async fn refused_connect_still_fails_fast() {
+        // The timeout must not break normal failures: port 1 refuses
+        // immediately with an I/O error, not a timeout.
+        let opts = AssociationOptions {
+            connect_timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let Err(err) = Association::request(
+            &opts,
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            "127.0.0.1:1",
+            Vec::new(),
+        )
+        .await
+        else {
+            panic!("refused connect unexpectedly succeeded");
+        };
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
     }
 
     #[test]

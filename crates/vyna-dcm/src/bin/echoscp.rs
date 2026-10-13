@@ -3,10 +3,11 @@
 #[path = "common.rs"]
 mod common;
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use common::{ListenArgs, anyhowish::Result};
+use common::{ListenArgs, MAX_SCP_ASSOCIATIONS, anyhowish::Result};
 use tokio::net::TcpListener;
 use vyna_dcm::net::AeTitle;
 use vyna_dcm::net::service::{AcceptorOptions, Handlers, ScpOptions, accept};
@@ -37,6 +38,7 @@ async fn main() -> Result<()> {
     acceptor.association = args.listen.assoc_options();
     acceptor.check_called_ae = args.listen.strict_ae;
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_SCP_ASSOCIATIONS));
     loop {
         let Ok((tcp, peer)) = listener.accept().await else {
             // Back off: a persistent accept failure (e.g. EMFILE)
@@ -45,11 +47,18 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            eprintln!(
+                "echoscp: association from {peer} dropped: over {MAX_SCP_ASSOCIATIONS} concurrent"
+            );
+            continue;
+        };
         // DIMSE is small-write chatty; Nagle would stall each PDU on the
         // peer's delayed ACK (~40ms).
         tcp.set_nodelay(true).ok();
         let (acceptor, tls) = (acceptor.clone(), tls.clone());
         tokio::spawn(async move {
+            let _permit = permit;
             println!("association from {peer}");
             let out = match tls {
                 Some(tls) => match tls.accept(tcp).await {

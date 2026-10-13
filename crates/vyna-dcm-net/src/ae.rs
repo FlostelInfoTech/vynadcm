@@ -19,8 +19,11 @@ impl AeTitle {
         if trimmed.len() > 16 {
             return Err(Error::BadAeTitle(t, "longer than 16 characters"));
         }
-        if trimmed.bytes().any(|b| b < 0x20 || b == 0x7F) {
-            return Err(Error::BadAeTitle(t, "control characters not allowed"));
+        if !trimmed.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+            return Err(Error::BadAeTitle(
+                t,
+                "only ASCII graphic characters and spaces allowed",
+            ));
         }
         Ok(Self(trimmed.to_string()))
     }
@@ -72,5 +75,13 @@ mod tests {
         assert!(AeTitle::new("").is_err());
         assert!(AeTitle::new("0123456789ABCDEFG").is_err());
         assert!(AeTitle::new("BAD\nAE").is_err());
+        // Interior controls, DEL, and non-ASCII are all rejected ...
+        assert!(AeTitle::new("BAD\x01AE").is_err());
+        assert!(AeTitle::new("BAD\x7FAE").is_err());
+        assert!(AeTitle::new("CAFÉ").is_err());
+        assert!(AeTitle::new("É").is_err());
+        // ... while interior spaces and surrounding trims still pass.
+        assert_eq!(AeTitle::new("MY AE").unwrap().as_str(), "MY AE");
+        assert_eq!(AeTitle::new("  PADDED  ").unwrap().as_str(), "PADDED");
     }
 }

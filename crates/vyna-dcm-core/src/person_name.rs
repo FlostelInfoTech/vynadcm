@@ -36,6 +36,8 @@ impl NameComponents {
     }
 
     fn parse(group: &str) -> Self {
+        // Lossy fallback for the decode path: keep the first five,
+        // drop the rest (dirty files must still read).
         let mut parts = group.split('^');
         let take = |it: &mut std::str::Split<'_, char>| it.next().unwrap_or("").trim().to_string();
         Self {
@@ -45,6 +47,22 @@ impl NameComponents {
             prefix: take(&mut parts),
             suffix: take(&mut parts),
         }
+    }
+
+    fn try_parse(group: &str) -> Result<Self, Error> {
+        let mut parts = group.split('^');
+        let take = |it: &mut std::str::Split<'_, char>| it.next().unwrap_or("").trim().to_string();
+        let out = Self {
+            family: take(&mut parts),
+            given: take(&mut parts),
+            middle: take(&mut parts),
+            prefix: take(&mut parts),
+            suffix: take(&mut parts),
+        };
+        if parts.next().is_some() {
+            return Err(Error::Parse("PN group has more than 5 components".into()));
+        }
+        Ok(out)
     }
 
     /// Encode one component group (`Family^Given^...`, trailing empty
@@ -93,8 +111,16 @@ pub struct PersonName {
 
 impl PersonName {
     /// Parse one `PN` component value (no backslash splitting).
+    ///
+    /// Lossy by design (decoder liberality for dirty files): components
+    /// past the 5th and groups past the 3rd are silently dropped, and a
+    /// backslash keeps only the first value (embedding it would corrupt
+    /// value arity on re-encode). Use [`try_parse`](Self::try_parse)
+    /// for user input, where truncation must fail instead.
     #[must_use]
     pub fn parse(s: &str) -> Self {
+        // Lossy fallback for the decode path (see above).
+        let s = s.split('\\').next().unwrap_or("");
         let mut groups = s.split('=');
         let alpha = NameComponents::parse(groups.next().unwrap_or(""));
         let opt = |g: Option<&str>| match g {
@@ -109,6 +135,34 @@ impl PersonName {
             ideographic: opt(groups.next()),
             phonetic: opt(groups.next()),
         }
+    }
+
+    /// Strict parse: rejects backslashes (split multi-valued names
+    /// first), groups past the 3rd, and components past the 5th.
+    pub fn try_parse(s: &str) -> Result<Self, Error> {
+        if s.contains('\\') {
+            return Err(Error::Parse(
+                "multi-valued PN must be split on backslash first".into(),
+            ));
+        }
+        let mut groups = s.split('=');
+        let alpha = NameComponents::try_parse(groups.next().unwrap_or(""))?;
+        let opt = |g: Option<&str>| match g {
+            Some(t) => {
+                let c = NameComponents::try_parse(t)?;
+                Ok::<_, Error>((!c.is_empty()).then_some(c))
+            }
+            None => Ok(None),
+        };
+        let out = Self {
+            alphabetic: alpha,
+            ideographic: opt(groups.next())?,
+            phonetic: opt(groups.next())?,
+        };
+        if groups.next().is_some() {
+            return Err(Error::Parse("PN has more than 3 groups".into()));
+        }
+        Ok(out)
     }
 
     /// Encode back to a DICOM `PN` string.
@@ -167,12 +221,7 @@ impl FromStr for PersonName {
     type Err = Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if s.contains('\\') {
-            return Err(Error::Parse(
-                "multi-valued PN must be split on backslash first".into(),
-            ));
-        }
-        Ok(Self::parse(s))
+        Self::try_parse(s)
     }
 }
 
@@ -187,6 +236,21 @@ mod tests {
         assert_eq!(pn.alphabetic.suffix, "Jr");
         assert_eq!(pn.to_dicom_string(), "Adams^John^Robert^Dr^Jr");
         assert_eq!(pn.family_given(), "Adams, John");
+    }
+
+    #[test]
+    fn try_parse_rejects_overlong_and_backslash() {
+        assert!(PersonName::try_parse("A^B^C^D^E^F").is_err());
+        assert!(PersonName::try_parse("a=b=c=d").is_err());
+        assert!(PersonName::try_parse("A\\B").is_err());
+        assert!(PersonName::try_parse("A^B^C^D^E=a=b").is_ok());
+        // Lossy parse keeps its documented truncation (decode path).
+        let pn = PersonName::parse("A^B^C^D^E^F=a=b=c=d");
+        assert_eq!(pn.to_dicom_string(), "A^B^C^D^E=a=b");
+        // ... including backslash: first value wins, arity preserved.
+        let pn = PersonName::parse("Doe^Jane\\Smith^John");
+        assert_eq!(pn.to_dicom_string(), "Doe^Jane");
+        assert!(!pn.to_dicom_string().contains('\\'));
     }
 
     #[test]

@@ -10,7 +10,8 @@ use crate::{Error, Result};
 /// One body part.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Part {
-    /// Part `Content-Type` (default `application/octet-stream`).
+    /// Part `Content-Type` (default `application/octet-stream`; the
+    /// full header value — parameters are preserved, not stripped).
     pub content_type: String,
     /// Optional `Content-Location`.
     pub content_location: Option<String>,
@@ -84,23 +85,7 @@ const MAX_PARTS: usize = 100_000;
 /// Decode a multipart body framed by `boundary` (without quotes/dashes).
 pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
     let needle = format!("--{boundary}").into_bytes();
-    // Delimiter positions accepted only at a line start.
-    let mut marks: Vec<usize> = Vec::new();
-    let mut i = 0;
-    while i + needle.len() <= body.len() {
-        if body[i..].starts_with(&needle)
-            && (i == 0 || body[..i].ends_with(b"\r\n") || body[..i].ends_with(b"\n"))
-        {
-            marks.push(i);
-            // +1: the closing delimiter is a mark but not a part.
-            if marks.len() > MAX_PARTS + 1 {
-                return Err(Error::Multipart(format!("too many parts (>{MAX_PARTS})")));
-            }
-            i += needle.len();
-        } else {
-            i += 1;
-        }
-    }
+    let marks = find_marks(body, &needle)?;
     if marks.is_empty() {
         return Err(Error::Multipart("no boundary delimiters found".into()));
     }
@@ -140,6 +125,32 @@ pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
         parts.push(part_from_headers(headers, payload.to_vec()));
     }
     Ok(parts)
+}
+
+/// Delimiter offsets accepted only at a line start. memmem jumps
+/// between candidates instead of a byte-at-a-time `starts_with`
+/// scan: adversarial bodies of repeated `-` bytes would otherwise
+/// turn the scan quadratic and stall a worker for seconds per
+/// gigabyte. Advancement matches the old scan exactly (skip past
+/// line-start hits, step one byte past others) so overlapping
+/// needles behave identically.
+fn find_marks(body: &[u8], needle: &[u8]) -> Result<Vec<usize>> {
+    let finder = memchr::memmem::Finder::new(needle);
+    let mut marks: Vec<usize> = Vec::new();
+    let mut pos = 0;
+    while let Some(found) = finder.find(&body[pos..]).map(|k| k + pos) {
+        if found == 0 || body[..found].ends_with(b"\r\n") || body[..found].ends_with(b"\n") {
+            marks.push(found);
+            // +1: the closing delimiter is a mark but not a part.
+            if marks.len() > MAX_PARTS + 1 {
+                return Err(Error::Multipart(format!("too many parts (>{MAX_PARTS})")));
+            }
+            pos = found + needle.len();
+        } else {
+            pos = found + 1;
+        }
+    }
+    Ok(marks)
 }
 
 fn trim_crlf(mut b: &[u8]) -> &[u8] {
@@ -245,6 +256,49 @@ pub fn is_dicom_media_type(header: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memmem_marks_match_naive_byte_scan() {
+        // The pre-memmem scan, verbatim: the optimized finder must
+        // agree with it on every input, including overlapping and
+        // self-overlapping needles.
+        fn naive_marks(body: &[u8], needle: &[u8]) -> Vec<usize> {
+            let mut marks = Vec::new();
+            let mut i = 0;
+            while i + needle.len() <= body.len() {
+                if body[i..].starts_with(needle)
+                    && (i == 0 || body[..i].ends_with(b"\r\n") || body[..i].ends_with(b"\n"))
+                {
+                    marks.push(i);
+                    i += needle.len();
+                } else {
+                    i += 1;
+                }
+            }
+            marks
+        }
+        let dashes = vec![b'-'; 1000];
+        let cases: Vec<(&[u8], &[u8])> = vec![
+            (b"", b"--B"),
+            (b"--B", b"--B"),
+            (b"----", b"---"), // self-overlapping needle, no line start
+            (b"a----\r\nb---\r\nc--\r\n---\r\n", b"---"),
+            (b"\n-----\n---\n--\n", b"---"),
+            (b"--B\r\n--B--\r\n--B", b"--B"),
+            (b"x--B\r\n--B\r\n", b"--B"),     // non-start then start
+            (&dashes, b"----------"),         // adversarial dashes
+            (b"\r\n--B\n--B\r\n--B", b"--B"), // mixed endings
+            (b"--", b"--"),
+            (b"---", b"---"),
+        ];
+        for (body, needle) in cases {
+            assert_eq!(
+                find_marks(body, needle).unwrap(),
+                naive_marks(body, needle),
+                "{body:?}"
+            );
+        }
+    }
 
     #[test]
     fn round_trips_binary_parts() {

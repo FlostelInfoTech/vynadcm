@@ -8,12 +8,13 @@ use std::time::Duration;
 use vyna_dcm_codec::{FileMeta, write_part10};
 use vyna_dcm_core::sop_class;
 use vyna_dcm_core::{DataElement, DataSet, TransferSyntax, Value, Vr, tags};
+use vyna_dcm_net::dimse::DATA_SET_NULL;
 use vyna_dcm_net::qrdb::{MwlScp, QrIndex, QrScp};
 use vyna_dcm_net::service::{
     AcceptorOptions, Handlers, HashMapDirectory, RequestContext, ScpMoveConfig, ScpOptions, accept,
     propose,
 };
-use vyna_dcm_net::{AeTitle, Association, AssociationOptions};
+use vyna_dcm_net::{AeTitle, Association, AssociationOptions, Command, DimseEvent};
 
 fn opts() -> AssociationOptions {
     let mut o = AssociationOptions::default();
@@ -178,6 +179,58 @@ async fn find_missing_level_fails() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Raw C-FIND-RQ with Data Set Type NULL (no Identifier): the SCP
+/// must fail it, never treat it as an empty (MATCH-ALL) query.
+async fn find_without_dataset(assoc: &mut Association, sop: &str) -> (u16, bool) {
+    let ctx = assoc.context_for(sop).unwrap().clone();
+    let id = assoc.next_message_id();
+    let mut rq = Command::find_rq(id, 0, sop);
+    rq.data_set_type = DATA_SET_NULL;
+    assoc.send(ctx.id, &rq, None).await.unwrap();
+    let mut saw_pending = false;
+    loop {
+        let DimseEvent::Message(msg) = assoc.recv().await.unwrap() else {
+            panic!("association released mid-FIND");
+        };
+        let s = msg.command.status.unwrap();
+        if s == 0xFF00 {
+            saw_pending = true;
+            continue;
+        }
+        return (s, saw_pending);
+    }
+}
+
+#[tokio::test]
+async fn find_without_dataset_fails() {
+    let dir = qr_dir();
+    let addr = serve_qr(QrIndex::scan(&dir).unwrap(), ScpOptions::default()).await;
+    let mut assoc = connect(&addr, &[sop_class::STUDY_ROOT_FIND]).await;
+    let (status, saw_pending) = find_without_dataset(&mut assoc, sop_class::STUDY_ROOT_FIND).await;
+    assert_eq!(status, 0xA900);
+    assert!(!saw_pending);
+    assoc.release().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn mwl_find_without_dataset_fails_instead_of_match_all() {
+    let dir = tmpdir("mwl-nods");
+    let mut ds = DataSet::new();
+    ds.put_text(tags::SOP_CLASS_UID, Vr::Ui, sop_class::CT_IMAGE);
+    ds.put_text(tags::SOP_INSTANCE_UID, Vr::Ui, "1.2.9.7");
+    ds.put_text(tags::PATIENT_ID, Vr::Lo, "W7");
+    write_instance(&dir, "w7.dcm", &ds);
+    let addr = serve_mwl(QrIndex::scan(&dir).unwrap()).await;
+    let mut assoc = connect(&addr, &[sop_class::MODALITY_WORKLIST_FIND]).await;
+    let (status, saw_pending) =
+        find_without_dataset(&mut assoc, sop_class::MODALITY_WORKLIST_FIND).await;
+    assert_eq!(status, 0xA900);
+    assert!(!saw_pending, "dataset-less MWL FIND must not emit matches");
+    assoc.release().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[derive(Default)]
 struct Collector {
     stored: Mutex<Vec<DataSet>>,
@@ -233,6 +286,184 @@ async fn move_delivers_to_destination() {
             .iter()
             .all(|ds| ds.string(tags::PATIENT_ID) == Some("P1"))
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn send_flag_mismatch_is_rejected() {
+    use vyna_dcm_net::Error;
+    let dir = qr_dir();
+    let addr = serve_qr(QrIndex::scan(&dir).unwrap(), ScpOptions::default()).await;
+    let mut assoc = connect(&addr, &[sop_class::STUDY_ROOT_FIND]).await;
+    let ctx = assoc
+        .context_for(sop_class::STUDY_ROOT_FIND)
+        .unwrap()
+        .clone();
+    let id = assoc.next_message_id();
+    // Flag says dataset, none given.
+    let rq = Command::find_rq(id, 0, sop_class::STUDY_ROOT_FIND);
+    let err = assoc.send(ctx.id, &rq, None).await.unwrap_err();
+    assert!(matches!(err, Error::BadCommand(_)), "{err:?}");
+    // Dataset given, flag says none.
+    let mut rq = Command::find_rq(id, 0, sop_class::STUDY_ROOT_FIND);
+    rq.data_set_type = DATA_SET_NULL;
+    let err = assoc
+        .send(ctx.id, &rq, Some(&DataSet::new()))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::BadCommand(_)), "{err:?}");
+    assoc.release().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn ps_only_move_rejects_series_level() {
+    let dir = qr_dir();
+    // No move_config: STUDY passes the guard (then fails unknown
+    // destination), SERIES must fail identifier-mismatch first.
+    let addr = serve_qr(QrIndex::scan(&dir).unwrap(), ScpOptions::default()).await;
+    let mut assoc = connect(&addr, &[sop_class::PATIENT_STUDY_ONLY_MOVE]).await;
+    let mut q = DataSet::new();
+    q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "SERIES");
+    q.put_text(tags::SERIES_INSTANCE_UID, Vr::Ui, "1.2.1.1");
+    let result = assoc
+        .move_to(sop_class::PATIENT_STUDY_ONLY_MOVE, &q, "DEST", 0)
+        .await
+        .unwrap();
+    assert_eq!(result.status, 0xA900);
+    let mut q = DataSet::new();
+    q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "STUDY");
+    q.put_text(tags::STUDY_INSTANCE_UID, Vr::Ui, "1.2.1");
+    let result = assoc
+        .move_to(sop_class::PATIENT_STUDY_ONLY_MOVE, &q, "DEST", 0)
+        .await
+        .unwrap();
+    assert_eq!(result.status, 0xA801);
+    assoc.release().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn get_survives_stray_cancel_for_other_op() {
+    use vyna_dcm_net::command_field as CF;
+    let dir = qr_dir();
+    let addr = serve_qr(QrIndex::scan(&dir).unwrap(), ScpOptions::default()).await;
+    let mut assoc = connect(&addr, &[sop_class::STUDY_ROOT_GET, sop_class::CT_IMAGE]).await;
+    let ctx = assoc
+        .context_for(sop_class::STUDY_ROOT_GET)
+        .unwrap()
+        .clone();
+    let id = assoc.next_message_id();
+    let mut q = DataSet::new();
+    q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "IMAGE");
+    q.put_text(tags::SOP_INSTANCE_UID, Vr::Ui, "1.2.2.1.1");
+    assoc
+        .send(
+            ctx.id,
+            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET),
+            Some(&q),
+        )
+        .await
+        .unwrap();
+    // First: the C-STORE-RQ for the single match.
+    let store = match assoc.recv().await.unwrap() {
+        DimseEvent::Message(m) => *m,
+        DimseEvent::Released => panic!("released mid-GET"),
+    };
+    assert_eq!(store.command.field, CF::C_STORE_RQ);
+    let store_id = store.command.message_id.unwrap();
+    // Stray: C-CANCEL for an unknown operation. This used to abort
+    // the whole association; now it is stashed and ignored.
+    assoc
+        .send(ctx.id, &Command::cancel_rq(id.wrapping_add(100)), None)
+        .await
+        .unwrap();
+    // Answer the store; the GET must continue to SUCCESS.
+    let rsp = Command::store_rsp(
+        store_id,
+        store.command.affected_sop_class_uid.clone(),
+        store.command.affected_sop_instance_uid.clone(),
+        0x0000,
+    );
+    assoc.send(store.context_id, &rsp, None).await.unwrap();
+    loop {
+        match assoc.recv().await.unwrap() {
+            DimseEvent::Released => panic!("released mid-GET"),
+            DimseEvent::Message(m) => {
+                assert_eq!(m.command.field, CF::C_GET_RSP);
+                let s = m.command.status.unwrap();
+                if s == 0xFF00 {
+                    continue;
+                }
+                assert_eq!(s, 0x0000);
+                break;
+            }
+        }
+    }
+    assoc.release().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Raw C-GET for the single `1.2.2.1.1` match, stopped after the
+/// C-STORE-RQ arrives: returns `(dir, assoc, get_ctx, store_ctx,
+/// get_id, store_id)` for stray-injection tests.
+async fn stray_get_setup() -> (PathBuf, Association, u8, u8, u16, u16) {
+    let dir = qr_dir();
+    let addr = serve_qr(QrIndex::scan(&dir).unwrap(), ScpOptions::default()).await;
+    let mut assoc = connect(&addr, &[sop_class::STUDY_ROOT_GET, sop_class::CT_IMAGE]).await;
+    let ctx = assoc.context_for(sop_class::STUDY_ROOT_GET).unwrap().id;
+    let st_ctx = assoc.context_for(sop_class::CT_IMAGE).unwrap().id;
+    let id = assoc.next_message_id();
+    let mut q = DataSet::new();
+    q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "IMAGE");
+    q.put_text(tags::SOP_INSTANCE_UID, Vr::Ui, "1.2.2.1.1");
+    assoc
+        .send(
+            ctx,
+            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET),
+            Some(&q),
+        )
+        .await
+        .unwrap();
+    let store = match assoc.recv().await.unwrap() {
+        DimseEvent::Message(m) => *m,
+        DimseEvent::Released => panic!("released mid-GET"),
+    };
+    assert_eq!(store.command.field, vyna_dcm_net::command_field::C_STORE_RQ);
+    let store_id = store.command.message_id.unwrap();
+    (dir, assoc, ctx, st_ctx, id, store_id)
+}
+
+#[tokio::test]
+async fn get_stray_count_flood_aborts() {
+    let (dir, mut assoc, ctx, _st_ctx, id, _) = stray_get_setup().await;
+    // 17 dataset-less strays: the 17th exceeds the 16-event hold
+    // budget and the GET fails (association aborts).
+    for i in 0..17u16 {
+        assoc
+            .send(ctx, &Command::cancel_rq(id.wrapping_add(100 + i)), None)
+            .await
+            .unwrap();
+    }
+    assert!(assoc.recv().await.is_err(), "flooded GET must abort");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn get_stray_byte_flood_aborts() {
+    let (dir, mut assoc, _ctx, st_ctx, _, _) = stray_get_setup().await;
+    // 13 x 5 MiB stray datasets = 65 MiB past the 64 MiB hold budget.
+    let mut ds = DataSet::new();
+    ds.insert(DataElement::new(
+        tags::PIXEL_DATA,
+        Vr::Ob,
+        Value::Bytes(vec![7u8; 5 * 1024 * 1024]),
+    ));
+    for i in 0..13u16 {
+        let rq = Command::store_rq(500 + i, 0, sop_class::CT_IMAGE, "1.2.9.99");
+        assoc.send(st_ctx, &rq, Some(&ds)).await.unwrap();
+    }
+    assert!(assoc.recv().await.is_err(), "flooded GET must abort");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

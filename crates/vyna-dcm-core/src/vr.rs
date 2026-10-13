@@ -12,6 +12,7 @@ use crate::Error;
 /// A DICOM Value Representation.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 #[allow(missing_docs)]
+#[non_exhaustive]
 pub enum Vr {
     Ae,
     As,
@@ -60,8 +61,8 @@ impl Vr {
         Vr::Da,
         Vr::Ds,
         Vr::Dt,
-        Vr::Fl,
         Vr::Fd,
+        Vr::Fl,
         Vr::Is,
         Vr::Lo,
         Vr::Lt,
@@ -221,16 +222,21 @@ impl Vr {
         }
     }
 
-    /// Size in bytes of one numeric unit; `1` for text/byte VRs, `0` for `SQ`.
+    /// Size in bytes of one value unit; `Some(1)` for text/byte VRs.
+    ///
+    /// `None` means "no fixed unit": `SQ` holds nested items rather
+    /// than units, and retired `SI` has no standard-defined width
+    /// (DCMTK defines none either; the codec treats `SI` as opaque
+    /// bytes). Callers must handle `None` instead of dividing.
     #[must_use]
-    pub const fn unit_size(self) -> usize {
+    pub const fn unit_size(self) -> Option<usize> {
         match self {
-            Vr::At | Vr::Fl | Vr::Of | Vr::Sl | Vr::Ul => 4,
-            Vr::Fd | Vr::Od | Vr::Ov | Vr::Sv | Vr::Uv => 8,
-            Vr::Ow | Vr::Ss | Vr::Us => 2,
-            Vr::Ol | Vr::Si => 4,
-            Vr::Sq => 0,
-            _ => 1,
+            Vr::At | Vr::Fl | Vr::Of | Vr::Sl | Vr::Ul => Some(4),
+            Vr::Fd | Vr::Od | Vr::Ov | Vr::Sv | Vr::Uv => Some(8),
+            Vr::Ow | Vr::Ss | Vr::Us => Some(2),
+            Vr::Ol => Some(4),
+            Vr::Si | Vr::Sq => None,
+            _ => Some(1),
         }
     }
 }
@@ -256,9 +262,12 @@ mod tests {
     #[test]
     fn all_vrs_round_trip() {
         assert_eq!(Vr::ALL.len(), 35);
+        let mut prev = "";
         for vr in Vr::ALL {
             assert_eq!(Vr::from_bytes(vr.code()), Some(vr));
             assert_eq!(vr.to_string().parse::<Vr>().unwrap(), vr);
+            assert!(vr.as_str() > prev, "ALL out of order at {}", vr.as_str());
+            prev = vr.as_str();
         }
         assert_eq!(Vr::from_code("XX"), None);
         assert!("XX".parse::<Vr>().is_err());
@@ -284,5 +293,29 @@ mod tests {
         assert_eq!(Vr::Pn.padding_byte(), 0x20);
         assert_eq!(Vr::Ob.padding_byte(), 0x00);
         assert_eq!(Vr::Us.padding_byte(), 0x00);
+    }
+
+    #[test]
+    fn unit_sizes_match_ps35() {
+        assert_eq!(Vr::Us.unit_size(), Some(2));
+        assert_eq!(Vr::Ss.unit_size(), Some(2));
+        assert_eq!(Vr::Ow.unit_size(), Some(2));
+        assert_eq!(Vr::Ul.unit_size(), Some(4));
+        assert_eq!(Vr::Sl.unit_size(), Some(4));
+        assert_eq!(Vr::Fl.unit_size(), Some(4));
+        assert_eq!(Vr::At.unit_size(), Some(4));
+        assert_eq!(Vr::Of.unit_size(), Some(4));
+        assert_eq!(Vr::Ol.unit_size(), Some(4));
+        assert_eq!(Vr::Fd.unit_size(), Some(8));
+        assert_eq!(Vr::Od.unit_size(), Some(8));
+        assert_eq!(Vr::Ov.unit_size(), Some(8));
+        assert_eq!(Vr::Sv.unit_size(), Some(8));
+        assert_eq!(Vr::Uv.unit_size(), Some(8));
+        assert_eq!(Vr::Lo.unit_size(), Some(1));
+        assert_eq!(Vr::Ob.unit_size(), Some(1));
+        // No fixed unit: sequences hold items, retired SI has no
+        // standard-defined width.
+        assert_eq!(Vr::Sq.unit_size(), None);
+        assert_eq!(Vr::Si.unit_size(), None);
     }
 }

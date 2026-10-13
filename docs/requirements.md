@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | SRS (living) |
-| Version | 0.4.0 |
+| Version | 0.5.0 |
 | Date | 2026-10-13 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.4.0 (crates `vyna-dcm-*`) |
+| Applies to | VynaDCM workspace v0.5.0 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
 implemented baseline (176 tests green, IOD validator + PDF helpers
@@ -15,7 +15,8 @@ implemented baseline (176 tests green, IOD validator + PDF helpers
 charset/XML/img requirements folded in since 0.1.0;
 0.3.0 (2026-10-12) — FR-NET-11 (MPPS/commitment SCP) + cancel
 + ATNA completion + CLI deltas folded in;
-0.4.0 (2026-10-13) — MIT license (NFR-03), quality-gate wording.
+0.4.0 (2026-10-13) — MIT license (NFR-03), quality-gate wording;
+0.5.0 (2026-10-13) — version bump; FR-CORE-05 default-TS clarification.
 
 ## Contents
 
@@ -90,7 +91,7 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   (text, numbers, UIDs, sequences, fragments) and builders; value
   multiplicity preserved.
 - **FR-CORE-04 (M)** Dictionary: ship the full PS3.6 registry
-  (currently 5,217 entries from PS3.6 2026d plus the command group)
+  (currently 5,239 entries from PS3.6 2026d plus the command group)
   mapping tag → (VR, VM, keyword, name, retired flag), sorted for
   binary search, plus `tags` constants; repeating (`xx`) groups stay
   unlisted.
@@ -100,7 +101,11 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   resolve to “unknown”, never to a wrong entry.
 - **FR-CORE-05 (M)** Transfer syntaxes: model 16 transfer syntax UIDs
   with wire properties (endianness, implicit/explicit VR, deflated,
-  encapsulated); default to Explicit VR Little Endian.
+  encapsulated). Two distinct defaults: the enum `Default` is Implicit
+  VR Little Endian (the DICOM Default Transfer Syntax, PS3.5 §10, used
+  when nothing is negotiated), while new associations prefer Explicit
+  VR Little Endian (SCU proposal lists lead with it; file writers take
+  an explicit syntax per call).
 - **FR-CORE-06 (M)** UIDs: validate UID strings, generate new UIDs
   (`2.25.*` UUID-based), and provide SOP Class UID constants.
 - **FR-CORE-07 (M)** Text values: parse PersonName components and

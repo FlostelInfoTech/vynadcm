@@ -49,6 +49,8 @@ jobs:
       - run: cargo check -p vyna-dcm --no-default-features --features cli --all-targets
       - run: cargo check -p vyna-dcm --no-default-features --features cli,net --all-targets
       - run: cargo check -p vyna-dcm --no-default-features --features cli,web --all-targets
+      - run: cargo check -p vyna-dcm --no-default-features --features cli,ecg --all-targets
+      - run: cargo check -p vyna-dcm --no-default-features --features cli,net,web --all-targets
       - run: cargo check -p vyna-dcm-net --no-default-features --all-targets
       - run: cargo check -p vyna-dcm-web --no-default-features --all-targets
       - run: cargo check -p vyna-dcm-atna --no-default-features --all-targets

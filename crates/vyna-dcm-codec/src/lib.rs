@@ -60,7 +60,8 @@ pub use jpeg_ls::JpegLsCodec;
 pub use json::{dataset_from_json, dataset_to_json};
 pub(crate) use part10::meta_section_len;
 pub use part10::{
-    FileMeta, META_VERSION, PREFIX_LEN, read_part10, read_part10_header, write_part10,
+    FileMeta, META_VERSION, PREFIX_LEN, read_part10, read_part10_header,
+    read_part10_header_complete, write_part10,
 };
 pub use transcode::{TranscodeOptions, transcode_dataset};
 pub use vyna_dcm_core::TransferSyntax;
@@ -296,6 +297,8 @@ pub trait PixelCodec: Send + Sync {
     ) -> std::result::Result<Vec<u8>, PixelCodecError>;
 
     /// Encode raw native-order samples into one frame's fragments.
+    /// Callers join the fragments per frame, so returning several is
+    /// fine; returning none is a codec bug and fails the encode.
     fn encode_frame(
         &self,
         ts: TransferSyntax,
@@ -671,14 +674,24 @@ pub fn encode_pixels(
     let mut fragments = Vec::with_capacity(frames);
     for n in 0..frames {
         let frame = &raw[n * frame_len..(n + 1) * frame_len];
-        let mut seq = codec
+        let seq = codec
             .encode_frame(ts, frame, rows, columns, samples, bits)
             .map_err(|e| Error::BadValue {
                 tag: tags::PIXEL_DATA,
                 vr: Vr::Ob,
                 message: e.to_string(),
             })?;
-        fragments.append(&mut seq.fragments);
+        if seq.fragments.is_empty() {
+            return Err(Error::BadValue {
+                tag: tags::PIXEL_DATA,
+                vr: Vr::Ob,
+                message: format!("codec returned no fragments for frame {n}"),
+            });
+        }
+        // One fragment per frame: join multi-fragment frames so the
+        // flat list keeps frame boundaries (an empty basic offset
+        // table stays valid) instead of mis-framing downstream.
+        fragments.push(seq.fragments.concat());
     }
     Ok(FragmentSequence {
         basic_offset_table: vec![],
@@ -748,6 +761,72 @@ mod tests {
         ) -> std::result::Result<FragmentSequence, PixelCodecError> {
             Err(PixelCodecError::Codec("stub cannot encode".into()))
         }
+    }
+
+    /// Codec returning two fragments per frame (plus an empty-frame
+    /// mode) to pin the join-per-frame contract.
+    struct SplitCodec {
+        empty: bool,
+    }
+
+    impl PixelCodec for SplitCodec {
+        fn syntaxes(&self) -> &[TransferSyntax] {
+            &[TS_JPEG]
+        }
+
+        fn decode_frame(
+            &self,
+            _ts: TransferSyntax,
+            _fragments: &FragmentSequence,
+            _rows: u16,
+            _columns: u16,
+            _samples_per_pixel: u16,
+            _bits_allocated: u16,
+        ) -> std::result::Result<Vec<u8>, PixelCodecError> {
+            Err(PixelCodecError::Codec("split cannot decode".into()))
+        }
+
+        fn encode_frame(
+            &self,
+            _ts: TransferSyntax,
+            raw: &[u8],
+            _rows: u16,
+            _columns: u16,
+            _samples_per_pixel: u16,
+            _bits_allocated: u16,
+        ) -> std::result::Result<FragmentSequence, PixelCodecError> {
+            if self.empty {
+                return Ok(FragmentSequence {
+                    basic_offset_table: vec![],
+                    fragments: vec![],
+                });
+            }
+            let mid = raw.len() / 2;
+            Ok(FragmentSequence {
+                basic_offset_table: vec![],
+                fragments: vec![raw[..mid].to_vec(), raw[mid..].to_vec()],
+            })
+        }
+    }
+
+    #[test]
+    fn encode_pixels_joins_multi_fragment_frames() {
+        let ds = geometry_ds(8, 8, 2);
+        let raw = vec![9u8; 8 * 8 * 2 * 2];
+        let codec = SplitCodec { empty: false };
+        let seq = encode_pixels(&ds, TS_JPEG, &raw, Some(&codec)).unwrap();
+        assert_eq!(seq.fragments.len(), 2);
+        assert!(seq.basic_offset_table.is_empty());
+        assert_eq!(seq.fragments.concat(), raw);
+    }
+
+    #[test]
+    fn encode_pixels_rejects_empty_fragment_frames() {
+        let ds = geometry_ds(8, 8, 2);
+        let raw = vec![9u8; 8 * 8 * 2 * 2];
+        let codec = SplitCodec { empty: true };
+        let err = encode_pixels(&ds, TS_JPEG, &raw, Some(&codec)).unwrap_err();
+        assert!(err.to_string().contains("no fragments"), "{err}");
     }
 
     #[test]

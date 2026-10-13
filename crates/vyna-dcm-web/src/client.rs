@@ -89,7 +89,11 @@ impl DicomWebClient {
     /// HTTPS uses the OS certificate store; the ring crypto provider
     /// (shared with `vyna-dcm-net`) is installed as the rustls default.
     /// Empty or unparseable base URLs are [`Error::BadRequest`] now,
-    /// not confusing transport errors at first use.
+    /// not confusing transport errors at first use. URLs with userinfo
+    /// (`https://user:pass@host`) are rejected: credentials belong in
+    /// [`Auth`], not in a string that reaches `Debug` and
+    /// error messages (and that reqwest would turn into surprise
+    /// Basic-auth headers).
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
         let base = base_url.into();
         let base = base.trim_end_matches('/').to_string();
@@ -101,6 +105,11 @@ impl DicomWebClient {
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(Error::BadRequest(format!(
                 "bad base URL {base:?}: want http(s)"
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(Error::BadRequest(format!(
+                "bad base URL {base:?}: userinfo credentials are rejected, use Auth"
             )));
         }
         // reqwest 0.13 `rustls-no-provider` needs the app to install a
@@ -415,7 +424,7 @@ impl DicomWebClient {
         let (ct, bytes) = self.wado_uri(req).await?;
         let mime = ct.split(';').next().unwrap_or("").trim();
         if !mime.eq_ignore_ascii_case("application/dicom") {
-            return Err(Error::Multipart(format!(
+            return Err(Error::BadRequest(format!(
                 "wado-uri returned {mime}, not application/dicom"
             )));
         }
@@ -620,7 +629,9 @@ impl DicomWebClient {
             });
         }
         // Single-part responses (e.g. one frame as image/jpeg) have no
-        // multipart framing; wrap them as one part.
+        // multipart framing; wrap them as one part, keeping the full
+        // Content-Type (parameters like transfer-syntax belong to the
+        // caller, as with real multipart parts).
         let (mime, params) = parse_content_type(&ct);
         if mime == "multipart/related" {
             let boundary = params
@@ -628,7 +639,7 @@ impl DicomWebClient {
                 .ok_or_else(|| Error::Multipart("missing boundary".into()))?;
             Ok(decode_multipart(&body, boundary)?)
         } else {
-            Ok(vec![Part::new(mime, body)])
+            Ok(vec![Part::new(ct, body)])
         }
     }
 }
@@ -929,7 +940,15 @@ mod tests {
     #[test]
     fn new_rejects_bad_base_urls() {
         assert!(DicomWebClient::new("http://localhost:8080").is_ok());
-        for bad in ["", "   ", "not a url", "ftp://x/y", "gopher://x"] {
+        for bad in [
+            "",
+            "   ",
+            "not a url",
+            "ftp://x/y",
+            "gopher://x",
+            "https://user:pass@pacs.example/dw",
+            "https://user@pacs.example/dw",
+        ] {
             let err = DicomWebClient::new(bad).unwrap_err();
             assert!(matches!(err, Error::BadRequest(_)), "{bad}: {err:?}");
         }
@@ -1015,5 +1034,79 @@ mod tests {
             stow.retrieve_url.as_deref(),
             Some("http://stub/studies/1.2.9")
         );
+    }
+
+    #[tokio::test]
+    async fn single_part_wrap_keeps_content_type_params() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Raw-socket stub: answers the WADO GET with a single-part
+        // body carrying a transfer-syntax parameter.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = vec![0u8; 4096];
+            let mut have = 0usize;
+            loop {
+                let n = tcp.read(&mut head[have..]).await.unwrap();
+                have += n;
+                if String::from_utf8_lossy(&head[..have]).contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = b"PAYLOAD";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/dicom; transfer-syntax=1.2.840.10008.1.2.1\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            tcp.write_all(resp.as_bytes()).await.unwrap();
+            tcp.write_all(body).await.unwrap();
+        });
+        let client = DicomWebClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let parts = client
+            .wado_parts("1.2.1", "1.2.2", "1.2.3", None)
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(
+            parts[0].content_type,
+            "application/dicom; transfer-syntax=1.2.840.10008.1.2.1"
+        );
+        assert!(is_dicom_media_type(&parts[0].content_type));
+        assert_eq!(parts[0].body, b"PAYLOAD");
+    }
+
+    #[tokio::test]
+    async fn wado_uri_dataset_wrong_mime_is_bad_request() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Raw-socket stub: answers the WADO-URI GET with an HTML
+        // error page instead of application/dicom.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut head = vec![0u8; 4096];
+            let mut have = 0usize;
+            loop {
+                let n = tcp.read(&mut head[have..]).await.unwrap();
+                have += n;
+                if String::from_utf8_lossy(&head[..have]).contains("\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = b"<html>gone</html>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            tcp.write_all(resp.as_bytes()).await.unwrap();
+            tcp.write_all(body).await.unwrap();
+        });
+        let client = DicomWebClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let req = WadoUriRequest::new("1.2.1", "1.2.2", "1.2.3");
+        let err = client.wado_uri_dataset(&req).await.unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
     }
 }

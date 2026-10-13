@@ -258,12 +258,7 @@ fn run_create(output: &Path, file_set_id: Option<&str>, inputs: &[PathBuf]) -> i
     }
     let refs: Vec<DirEntry> = entries
         .iter()
-        .map(|(file_id, i)| DirEntry {
-            dataset: &held[*i].0,
-            file_id: file_id.clone(),
-            transfer_syntax_uid: held[*i].1.clone(),
-            record_type: None,
-        })
+        .map(|(file_id, i)| DirEntry::new(&held[*i].0, file_id.clone(), held[*i].1.clone()))
         .collect();
     let bytes = match build_dicomdir(&refs, file_set_id) {
         Ok(b) => b,

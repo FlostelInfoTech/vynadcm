@@ -3,17 +3,18 @@
 | Field | Value |
 |---|---|
 | Document | Roadmap (living) |
-| Version | 0.4.0 |
+| Version | 0.5.0 |
 | Date | 2026-10-13 |
 | Status | Living — reprioritized as VynaECG/VynaLink needs evolve |
-| Applies to | VynaDCM workspace v0.4.0 |
+| Applies to | VynaDCM workspace v0.5.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, from comparison
 with dcm4che, DCMTK, pydicom (+pynetdicom), and fo-dicom;
 0.2.0 (2026-10-12) — version bump; all P0–P2 items and both
 comparison rounds DONE;
 0.3.0 (2026-10-12) — post-0.2.0 hardening batch DONE;
-0.4.0 (2026-10-13) — review-fix batch DONE, first public release.
+0.4.0 (2026-10-13) — review-fix batch DONE, first public release;
+0.5.0 (2026-10-13) — version bump to match workspace.
 
 ## Contents
 
@@ -49,7 +50,7 @@ Items move to the SRS (`docs/requirements.md`) when scheduled.
 ### P0.1 Full PS3.6 dictionary + private creators — DONE
 
 Replaced the 266-entry curated table with the complete public registry
-(5,217 entries, PS3.6 2026d) plus private-creator mechanics (424
+(5,239 entries, PS3.6 2026d) plus private-creator mechanics (424
 creators / 8,898 entries) and the missing `SV` VR (35 variants).
 Accepted: registry/private spot tests, 96/96 green, clippy clean.
 

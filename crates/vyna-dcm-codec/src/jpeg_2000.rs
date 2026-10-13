@@ -561,8 +561,14 @@ unsafe extern "C" fn mem_free(data: *mut c_void) {
 }
 
 unsafe extern "C" fn mem_read(buf: *mut c_void, nb: OPJ_SIZE_T, data: *mut c_void) -> OPJ_SIZE_T {
-    if buf.is_null() || data.is_null() || nb == 0 {
+    if buf.is_null() || data.is_null() {
         return OPJ_SIZE_T::MAX;
+    }
+    // A zero-length read is a no-op success: the stream layer casts
+    // the return to isize (negative fails), so the failure sentinel
+    // here would kill a decodable stream.
+    if nb == 0 {
+        return 0;
     }
     let state = unsafe { &mut *data.cast::<MemState>() };
     let remaining = state.data.len().saturating_sub(state.pos);
@@ -643,6 +649,33 @@ unsafe extern "C" fn mem_seek(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_BOOL {
 mod tests {
     use super::*;
     use crate::jpeg::mean_abs_diff;
+
+    #[test]
+    fn mem_read_zero_length_is_success() {
+        let mut st = MemState {
+            data: vec![1u8; 8],
+            out: Rc::new(RefCell::new(Vec::new())),
+            pos: 0,
+            writable: false,
+        };
+        let p = (&mut st as *mut MemState).cast::<c_void>();
+        let mut buf = [0u8; 8];
+        unsafe {
+            // Zero-length reads succeed (0): the stream layer casts
+            // the return to isize, where negative means failure.
+            assert_eq!(mem_read(buf.as_mut_ptr().cast::<c_void>(), 0, p), 0);
+            assert_eq!(st.pos, 0);
+            // Null pointers still fail loudly.
+            assert_eq!(mem_read(std::ptr::null_mut(), 4, p), OPJ_SIZE_T::MAX);
+            assert_eq!(
+                mem_read(buf.as_mut_ptr().cast::<c_void>(), 4, std::ptr::null_mut()),
+                OPJ_SIZE_T::MAX
+            );
+            // Normal reads still work.
+            assert_eq!(mem_read(buf.as_mut_ptr().cast::<c_void>(), 4, p), 4);
+            assert_eq!(st.pos, 4);
+        }
+    }
 
     #[test]
     fn stream_callbacks_clamp_and_cap() {

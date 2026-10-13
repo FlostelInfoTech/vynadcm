@@ -177,7 +177,9 @@ fn floats(it: impl Iterator<Item = f64>) -> Json {
     )
 }
 
-/// VRs allowed to carry `InlineBinary` (Annex F bulk-data VRs).
+/// VRs allowed to carry `InlineBinary` (Annex F bulk-data VRs, plus
+/// retired `SI`: export writes `SI` bytes as `InlineBinary`, so import
+/// must accept it back for round-trip symmetry).
 pub(crate) fn allows_inline_binary(vr: Vr) -> bool {
     matches!(
         vr,
@@ -188,6 +190,7 @@ pub(crate) fn allows_inline_binary(vr: Vr) -> bool {
             | Vr::Ol
             | Vr::Ov
             | Vr::Ow
+            | Vr::Si
             | Vr::St
             | Vr::Uc
             | Vr::Ur
@@ -308,6 +311,9 @@ fn element_from_json_depth(tag: Tag, obj: &Json, depth: usize) -> Result<DataEle
         Vr::Fd | Vr::Od => Value::F64(json_doubles(values, tag)?),
         Vr::Ob | Vr::Ow | Vr::Un => return Err(bad("byte VRs need InlineBinary")),
         Vr::Si => return Err(bad("retired SI unsupported in JSON")),
+        _ => {
+            return Err(Error::Json(format!("{tag}: unsupported VR {vr:?} in JSON")));
+        }
     };
     Ok(DataElement::new(tag, vr, value))
 }
@@ -424,6 +430,14 @@ mod tests {
             back.person_names(tags::PATIENT_NAME).unwrap()[0].to_dicom_string(),
             "A==C"
         );
+    }
+
+    #[test]
+    fn retired_si_bytes_round_trip() {
+        let mut ds = DataSet::new();
+        ds.put_bytes(Tag::new(0x0019, 0x1001), Vr::Si, vec![7, 7, 7, 7]);
+        let back = dataset_from_json(&dataset_to_json(&ds)).unwrap();
+        assert_eq!(back, ds);
     }
 
     #[test]

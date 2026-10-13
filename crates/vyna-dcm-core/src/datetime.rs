@@ -32,7 +32,7 @@ impl Da {
         let year = digits[0..4].parse().ok()?;
         let month: u8 = digits[4..6].parse().ok()?;
         let day: u8 = digits[6..8].parse().ok()?;
-        if year == 0 || month == 0 || month > 12 || day == 0 || day > 31 {
+        if year == 0 || month == 0 || month > 12 || day == 0 || day > days_in_month(year, month) {
             return None;
         }
         Some(Self { year, month, day })
@@ -88,7 +88,9 @@ impl Tm {
             if parts.len() > 3 || parts.iter().any(|p| p.len() != 2) {
                 return None;
             }
-        } else if !matches!(digits.len(), 2 | 4 | 6) {
+        } else if !matches!(digits.len(), 2 | 4 | 6) || digits.len() != main.len() {
+            // No-colon values must be all digits: otherwise "12ab"
+            // would silently parse as hour 12.
             return None;
         }
         // Colon groups are shape-checked above but may carry no digits
@@ -107,6 +109,10 @@ impl Tm {
         }
         let mut micros = 0u32;
         if let Some(f) = frac {
+            // A fraction needs seconds ("13.5" is not a TM; accepting
+            // it would drop the fraction on format).
+            second?;
+
             if f.is_empty() || f.len() > 6 || !f.bytes().all(|b| b.is_ascii_digit()) {
                 return None;
             }
@@ -173,7 +179,9 @@ pub fn is_valid_dt(s: &str) -> bool {
         Some((h, f)) => (h, Some(f)),
         None => (head, None),
     };
-    if date_time.len() < 4 || date_time.len() > 14 || !date_time.bytes().all(|b| b.is_ascii_digit())
+    // DT truncates only on component boundaries: YYYY[MM[DD[HH...]]].
+    if !matches!(date_time.len(), 4 | 6 | 8 | 10 | 12 | 14)
+        || !date_time.bytes().all(|b| b.is_ascii_digit())
     {
         return false;
     }
@@ -201,6 +209,22 @@ pub fn is_valid_dt(s: &str) -> bool {
         }
     }
     true
+}
+
+/// Days in `month` of `year` (Gregorian leap rule).
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        _ => {
+            let y = year as u32;
+            if y.is_multiple_of(4) && (!y.is_multiple_of(100) || y.is_multiple_of(400)) {
+                29
+            } else {
+                28
+            }
+        }
+    }
 }
 
 /// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
@@ -318,5 +342,39 @@ mod tests {
         assert_eq!(Tm::parse("ab:cd:ef"), None);
         assert_eq!(Tm::parse("::"), None);
         assert!(Tm::parse("12:34").is_some());
+    }
+
+    #[test]
+    fn tm_rejects_fraction_without_seconds_and_nondigits() {
+        // "13.5" used to parse (hour 13, fraction kept) then format
+        // back as "13", silently dropping the fraction.
+        assert_eq!(Tm::parse("13.5"), None);
+        assert_eq!(Tm::parse("1345.5"), None);
+        assert!(Tm::parse("134523.5").is_some());
+        // "12ab" used to parse as hour 12, dropping the garbage.
+        assert_eq!(Tm::parse("12ab"), None);
+        assert_eq!(Tm::parse("ab12"), None);
+        assert_eq!(Tm::parse("12 ab"), None);
+    }
+
+    #[test]
+    fn da_rejects_impossible_days() {
+        assert!(Da::parse("20260230").is_none());
+        assert!(Da::parse("20260431").is_none());
+        assert!(Da::parse("20230229").is_none());
+        assert!(Da::parse("20240229").is_some());
+        assert!(Da::parse("20000229").is_some());
+        assert!(Da::parse("19000229").is_none());
+        assert!(Da::parse("20260430").is_some());
+    }
+
+    #[test]
+    fn dt_rejects_off_boundary_heads() {
+        // DT truncates only on component boundaries.
+        assert!(!is_valid_dt("20261"));
+        assert!(!is_valid_dt("2026101"));
+        assert!(!is_valid_dt("202610111"));
+        assert!(is_valid_dt("202610"));
+        assert!(is_valid_dt("2026101113"));
     }
 }

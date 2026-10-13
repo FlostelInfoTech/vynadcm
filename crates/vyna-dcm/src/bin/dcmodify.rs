@@ -198,7 +198,12 @@ fn parse_values(tag: Tag, vr: Vr, text: &str) -> Result<DataElement, String> {
             }
             Value::Text(parts.into_iter().map(str::to_string).collect())
         }
-        Vr::Pn => Value::PersonName(parts.into_iter().map(vyna_dcm::PersonName::parse).collect()),
+        Vr::Pn => parts
+            .into_iter()
+            .map(vyna_dcm::PersonName::try_parse)
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::PersonName)
+            .map_err(|e| bad(&e.to_string()))?,
         Vr::At => parts
             .into_iter()
             .map(parse_tag_spec)
@@ -233,11 +238,15 @@ fn parse_values(tag: Tag, vr: Vr, text: &str) -> Result<DataElement, String> {
             ));
         }
         Vr::Si => {
-            // Retired 64-bit; the codec treats it as bytes.
+            // Retired (no standard-defined width); the codec treats
+            // it as bytes.
             let Some(path) = text.strip_prefix('@') else {
                 return Err(format!("({tag}): binary VR {vr} needs @path"));
             };
             Value::Bytes(read_aux_file(path)?)
+        }
+        _ => {
+            return Err(format!("({tag}): unsupported VR {vr}"));
         }
     };
     Ok(DataElement::new(tag, vr, value))

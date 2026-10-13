@@ -20,7 +20,7 @@
 //!     None,
 //!     "VYNA_SCP",
 //! );
-//! assert!(msg.to_xml().contains("code=\"110103\""));
+//! assert!(msg.to_xml().contains("code=\"110104\""));
 //! let target: SyslogTarget = "udp://127.0.0.1:514".parse().unwrap();
 //! assert_eq!(target.port, 514);
 //! ```

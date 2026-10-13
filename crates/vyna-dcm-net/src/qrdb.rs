@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use vyna_dcm_codec::{read_part10, read_part10_header};
+use vyna_dcm_codec::{read_part10, read_part10_header_complete};
 use vyna_dcm_core::{DataElement, DataSet, Tag, Value, Vr, tags};
 
 use crate::dimse::status;
@@ -102,15 +102,45 @@ impl QrIndex {
     }
 
     fn read_header(path: &Path) -> Option<DataSet> {
-        let bytes = std::fs::read(path).ok()?;
-        // Header-only: pixel data (and anything after it) is never
-        // decoded, so the transient stays headers-sized, not file-sized.
-        let (_, mut ds) = read_part10_header(&bytes).ok()?;
-        // Overlay planes can be large; they are never query keys.
-        for group in 0x6000..0x6020u16 {
-            ds.remove(Tag::new(group, 0x3000));
+        Self::read_header_capped(path, SCAN_FIRST_READ, SCAN_MAX_HEADER)
+    }
+
+    /// Header-only read through a growing prefix: typical headers land
+    /// in the first read, large ones grow toward `max`, and headers
+    /// past `max` skip the file instead of spiking RAM on multi-GB
+    /// pixel payloads (which are never even read, let alone decoded).
+    /// A prefix that decodes without reaching the Pixel Data stop is
+    /// grown, never indexed partial (a boundary-aligned truncation
+    /// would silently drop query keys).
+    fn read_header_capped(path: &Path, first: u64, max: u64) -> Option<DataSet> {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path).ok()?;
+        let mut bytes = Vec::new();
+        let mut want = first.max(1);
+        loop {
+            let before = bytes.len() as u64;
+            let chunk = want.saturating_sub(before);
+            if chunk > 0 {
+                std::io::Read::by_ref(&mut file)
+                    .take(chunk)
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+            }
+            let eof = (bytes.len() as u64) - before < chunk;
+            match read_part10_header_complete(&bytes) {
+                Ok((_, mut ds, complete)) if complete || eof => {
+                    // Overlay planes can be large; they are never keys.
+                    for group in 0x6000..0x6020u16 {
+                        ds.remove(Tag::new(group, 0x3000));
+                    }
+                    return Some(ds);
+                }
+                _ if !eof && (bytes.len() as u64) < max => {
+                    want = want.saturating_mul(4).min(max).max(bytes.len() as u64 + 1);
+                }
+                _ => return None,
+            }
         }
-        Some(ds)
     }
 
     /// Indexed records.
@@ -133,10 +163,25 @@ const MAX_QR_MATCHES: usize = 10_000;
 /// local nesting must not overflow the stack.
 const MAX_SCAN_DEPTH: usize = 64;
 
-/// Maximum match values one query may carry (across all keys and
-/// nested sequence items): a crafted multi-valued query must fail
-/// `A700`/`A701`, not burn CPU/RAM per record.
+/// First header-prefix probe: typical headers (units of KiB) land in
+/// one read; pixel payloads past the headers are never touched.
+const SCAN_FIRST_READ: u64 = 256 * 1024;
+
+/// Headers past this are not indexed (the file is skipped with a
+/// warning): bounds the per-file transient no matter how large the
+/// pixel payload behind them.
+const SCAN_MAX_HEADER: u64 = 64 * 1024 * 1024;
+
+/// Maximum query cost units (one per key, one per sequence item,
+/// one per match value, at every nesting level): a crafted FIND
+/// identifier must fail `A700`/`A701`, not burn CPU/RAM per record.
+/// Legit queries carry dozens of keys and single-item sequences.
 const MAX_QUERY_VALUES: usize = 10_000;
+
+/// Maximum Storage Commitment references per N-ACTION: past this the
+/// SCP fails out-of-resources instead of amplifying peer-controlled
+/// items ~2-3x into RAM. Real requests carry dozens of refs.
+const MAX_COMMIT_REFS: usize = 10_000;
 
 /// Run a C-FIND query (`mwl` selects worklist matching): status plus
 /// one response dataset per match, capped at `MAX_QR_MATCHES` (10,000).
@@ -246,9 +291,15 @@ fn compile_level(query: &DataSet, budget: &mut usize) -> Option<CompiledQuery> {
         if tag == tags::QUERY_RETRIEVE_LEVEL {
             continue;
         }
+        // Every key costs budget: even universal keys loop once per
+        // record in the matcher.
+        *budget = budget.checked_sub(1)?;
         match &qel.value {
             Value::Empty => out.push((tag, CompiledKey::Universal)),
             Value::Sequence(qitems) => {
+                // Every item multiplies the per-record matcher
+                // (query items x record items), so items cost too.
+                *budget = budget.checked_sub(qitems.len())?;
                 let mut items = Vec::with_capacity(qitems.len());
                 for qi in qitems {
                     items.push(compile_level(qi, budget)?);
@@ -519,8 +570,14 @@ impl StgCommitScp {
         let Some(txn) = req.string(tags::TRANSACTION_UID) else {
             return (status::DATASET_MISMATCH, None, Vec::new());
         };
-        let refs: Vec<(String, String)> = req
-            .sequence(tags::REFERENCED_SOP_SEQUENCE)
+        // Count before collecting: each ref amplifies ~2-3x into owned
+        // strings plus a report item, so an uncapped N-ACTION is a RAM
+        // multiplier on peer-controlled input.
+        let items = req.sequence(tags::REFERENCED_SOP_SEQUENCE);
+        if items.map(|v| v.len()).unwrap_or(0) > MAX_COMMIT_REFS {
+            return (status::OUT_OF_RESOURCES, None, Vec::new());
+        }
+        let refs: Vec<(String, String)> = items
             .map(|items| {
                 items
                     .iter()
@@ -600,17 +657,27 @@ fn is_qr_get(sop: &str) -> bool {
 
 // NOTE: Patient/Study Only has no C-GET SOP Class (PS3.4 K.6).
 
+/// Patient/Study Only (PS3.4 K.6.1.2) serves PATIENT/STUDY levels
+/// only: SERIES/IMAGE under its FIND/MOVE SOPs is an identifier
+/// mismatch. Shared by FIND/MOVE/GET so the three cannot drift
+/// (the GET arm never trips — no such SOP exists — but stays for
+/// symmetry if one is ever added).
+fn patient_study_only_level_violation(sop: &str, query: &DataSet) -> bool {
+    matches!(
+        sop,
+        sop_class::PATIENT_STUDY_ONLY_FIND | sop_class::PATIENT_STUDY_ONLY_MOVE
+    ) && matches!(
+        query.string(tags::QUERY_RETRIEVE_LEVEL),
+        Some("SERIES" | "IMAGE")
+    )
+}
+
 impl Handlers for QrScp {
     async fn on_find(&self, ctx: &RequestContext<'_>, query: &DataSet) -> (u16, Vec<DataSet>) {
         if !is_qr_find(&ctx.context.abstract_syntax) {
             return (status::SOP_CLASS_NOT_SUPPORTED, Vec::new());
         }
-        if ctx.context.abstract_syntax == sop_class::PATIENT_STUDY_ONLY_FIND
-            && matches!(
-                query.string(tags::QUERY_RETRIEVE_LEVEL),
-                Some("SERIES" | "IMAGE")
-            )
-        {
+        if patient_study_only_level_violation(&ctx.context.abstract_syntax, query) {
             return (status::DATASET_MISMATCH, Vec::new());
         }
         find_matches(&self.index, query, false)
@@ -628,6 +695,9 @@ impl Handlers for QrScp {
                 RetrievePlan::buffered(Vec::new()),
             );
         }
+        if patient_study_only_level_violation(&ctx.context.abstract_syntax, query) {
+            return (status::DATASET_MISMATCH, RetrievePlan::buffered(Vec::new()));
+        }
         retrieve_plan(&self.index, query)
     }
 
@@ -637,6 +707,9 @@ impl Handlers for QrScp {
                 status::SOP_CLASS_NOT_SUPPORTED,
                 RetrievePlan::buffered(Vec::new()),
             );
+        }
+        if patient_study_only_level_violation(&ctx.context.abstract_syntax, query) {
+            return (status::DATASET_MISMATCH, RetrievePlan::buffered(Vec::new()));
         }
         retrieve_plan(&self.index, query)
     }
@@ -761,6 +834,41 @@ impl Handlers for StgCommitScp {
 mod tests {
     use super::*;
 
+    #[test]
+    fn ps_only_guard_fires_for_find_and_move() {
+        for sop in [
+            sop_class::PATIENT_STUDY_ONLY_FIND,
+            sop_class::PATIENT_STUDY_ONLY_MOVE,
+        ] {
+            for level in ["SERIES", "IMAGE"] {
+                let mut q = DataSet::new();
+                q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, level);
+                assert!(
+                    patient_study_only_level_violation(sop, &q),
+                    "{sop} {level} must trip"
+                );
+            }
+            for level in ["PATIENT", "STUDY"] {
+                let mut q = DataSet::new();
+                q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, level);
+                assert!(
+                    !patient_study_only_level_violation(sop, &q),
+                    "{sop} {level} must pass"
+                );
+            }
+        }
+        // Other models never trip, at any level.
+        for sop in [
+            sop_class::PATIENT_ROOT_FIND,
+            sop_class::STUDY_ROOT_MOVE,
+            sop_class::STUDY_ROOT_GET,
+        ] {
+            let mut q = DataSet::new();
+            q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "IMAGE");
+            assert!(!patient_study_only_level_violation(sop, &q), "{sop}");
+        }
+    }
+
     fn record(patient: &str, study: &str, series: &str, instance: &str, date: &str) -> QrRecord {
         let mut ds = DataSet::new();
         ds.put_text(tags::PATIENT_ID, Vr::Lo, patient);
@@ -832,16 +940,88 @@ mod tests {
     #[test]
     fn query_value_flood_fails_out_of_resources() {
         let idx = index();
-        // One value over budget: A700, no responses.
-        let (s, m) = find_matches(&idx, &uid_list_query(MAX_QUERY_VALUES + 1), false);
+        // One value over budget: A700, no responses (the key itself
+        // costs one unit, so 10000 values already exceed it).
+        let (s, m) = find_matches(&idx, &uid_list_query(MAX_QUERY_VALUES), false);
         assert_eq!(s, status::OUT_OF_RESOURCES);
         assert!(m.is_empty());
-        // Exactly at budget: evaluated normally.
-        let (s, _) = find_matches(&idx, &uid_list_query(MAX_QUERY_VALUES), false);
+        // Exactly at budget (9999 values + 1 key): evaluated normally.
+        let (s, _) = find_matches(&idx, &uid_list_query(MAX_QUERY_VALUES - 1), false);
         assert_eq!(s, status::SUCCESS);
         // MOVE/GET planning fails A701 on the same flood.
-        let (s, _) = retrieve_plan(&idx, &uid_list_query(MAX_QUERY_VALUES + 1));
+        let (s, _) = retrieve_plan(&idx, &uid_list_query(MAX_QUERY_VALUES));
         assert_eq!(s, status::UNABLE_TO_CALCULATE_MATCHES);
+    }
+
+    #[test]
+    fn universal_key_flood_fails_out_of_resources() {
+        let idx = index();
+        // Empty keys cost one unit each: 10001 distinct universal keys
+        // exceed the budget even with no values at all.
+        let mut q = DataSet::new();
+        q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "STUDY");
+        for i in 0..MAX_QUERY_VALUES + 1 {
+            q.put_null(Tag::new(0x0009, i as u16), Vr::Lo);
+        }
+        let (s, m) = find_matches(&idx, &q, false);
+        assert_eq!(s, status::OUT_OF_RESOURCES);
+        assert!(m.is_empty());
+    }
+
+    #[test]
+    fn commitment_ref_flood_fails_out_of_resources() {
+        let scp = StgCommitScp::new(index());
+        let request = |n: usize| {
+            let mut req = DataSet::new();
+            req.put_uid(tags::TRANSACTION_UID, "1.2.9.9");
+            req.put_sequence(
+                tags::REFERENCED_SOP_SEQUENCE,
+                (0..n)
+                    .map(|i| {
+                        let mut it = DataSet::new();
+                        it.put_uid(tags::REFERENCED_SOP_CLASS_UID, "1.2.840.10008.5.1.4.1.1.2");
+                        it.put_uid(tags::REFERENCED_SOP_INSTANCE_UID, format!("1.9.9.{i}"));
+                        it
+                    })
+                    .collect(),
+            );
+            req
+        };
+        // One over cap: A700, no follow-ups.
+        let (s, ds, follow) = scp.commit(
+            Some("1.2.9.8"),
+            Some(COMMITMENT_ACTION_REQUEST),
+            STORAGE_COMMITMENT_PUSH,
+            Some(request(MAX_COMMIT_REFS + 1)),
+        );
+        assert_eq!(s, status::OUT_OF_RESOURCES);
+        assert!(ds.is_none());
+        assert!(follow.is_empty());
+        // Exactly at cap: evaluated normally.
+        let (s, _, follow) = scp.commit(
+            Some("1.2.9.8"),
+            Some(COMMITMENT_ACTION_REQUEST),
+            STORAGE_COMMITMENT_PUSH,
+            Some(request(MAX_COMMIT_REFS)),
+        );
+        assert_eq!(s, status::SUCCESS);
+        assert_eq!(follow.len(), 1);
+    }
+
+    #[test]
+    fn sequence_item_flood_fails_out_of_resources() {
+        let idx = index();
+        // One sequence key with 10000 empty items: the items alone
+        // (plus the key) exceed the budget.
+        let mut q = DataSet::new();
+        q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "STUDY");
+        q.put_sequence(
+            tags::REFERENCED_SERIES_SEQUENCE,
+            vec![DataSet::new(); MAX_QUERY_VALUES],
+        );
+        let (s, m) = find_matches(&idx, &q, false);
+        assert_eq!(s, status::OUT_OF_RESOURCES);
+        assert!(m.is_empty());
     }
 
     #[test]
@@ -970,6 +1150,88 @@ mod tests {
         }
         // Out of range loads fail rather than panic.
         assert!(matches!(plan.load(2).await, RetrieveLoad::Failed));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn header_prefix_grows_skips_and_never_partials() {
+        use vyna_dcm_core::TransferSyntax as Ts;
+        let dir = std::env::temp_dir().join(format!("qrdb-prefix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, ds: &DataSet| {
+            let meta = vyna_dcm_codec::FileMeta::new(
+                "1.2.840.10008.5.1.4.1.1.2",
+                ds.string(vyna_dcm_core::tags::SOP_INSTANCE_UID).unwrap(),
+                Ts::ExplicitVrLittleEndian,
+            );
+            let path = dir.join(name);
+            let bytes = vyna_dcm_codec::write_part10(&meta, ds).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            (path, bytes)
+        };
+        let mut small = DataSet::new();
+        small.put_uid(
+            vyna_dcm_core::tags::SOP_CLASS_UID,
+            "1.2.840.10008.5.1.4.1.1.2",
+        );
+        small.put_uid(vyna_dcm_core::tags::SOP_INSTANCE_UID, "1.2.9.1");
+        small.put_text(tags::PATIENT_ID, Vr::Lo, "P1");
+        // 300 KB of pixels past a 1 KB first probe: indexed without
+        // ever reading the payload (results, not RAM, are asserted —
+        // the bound itself is structural).
+        let mut big_pix = small.clone();
+        big_pix.insert(DataElement::new(
+            tags::PIXEL_DATA,
+            Vr::Ow,
+            Value::Bytes(vec![7u8; 300_000]),
+        ));
+        let (path, _) = write("bigpix.dcm", &big_pix);
+        let got = QrIndex::read_header_capped(&path, 1024, 4096).unwrap();
+        assert_eq!(got.string(tags::PATIENT_ID), Some("P1"));
+        assert!(got.get(tags::PIXEL_DATA).is_none());
+        // 2 KB private blob before the keys, first probe 512 B: the
+        // prefix must grow (all keys still recovered).
+        let mut wide = small.clone();
+        wide.put_text(tags::PATIENT_ID, Vr::Lo, "P2");
+        wide.insert(DataElement::new(
+            Tag::new(0x0009, 0x1001),
+            Vr::Ob,
+            Value::Bytes(vec![8u8; 2000]),
+        ));
+        let (path, _) = write("wide.dcm", &wide);
+        let got = QrIndex::read_header_capped(&path, 512, 8192).unwrap();
+        assert_eq!(got.string(tags::PATIENT_ID), Some("P2"));
+        // Same file, max below the headers: skipped, not partial.
+        assert!(QrIndex::read_header_capped(&path, 512, 1024).is_none());
+        // Razor case: first probe ends exactly at the pixel tag, so it
+        // decodes but the stop is unreached — must grow, not index.
+        let (_, pix_bytes) = write("razor.dcm", &big_pix);
+        let (_, head_bytes) = write(
+            "razor-head.dcm",
+            &DataSet::new()
+                .with(DataElement::new(
+                    vyna_dcm_core::tags::SOP_CLASS_UID,
+                    Vr::Ui,
+                    Value::Text(vec!["1.2.840.10008.5.1.4.1.1.2".into()]),
+                ))
+                .with(DataElement::new(
+                    vyna_dcm_core::tags::SOP_INSTANCE_UID,
+                    Vr::Ui,
+                    Value::Text(vec!["1.2.9.1".into()]),
+                ))
+                .with(DataElement::new(
+                    tags::PATIENT_ID,
+                    Vr::Lo,
+                    Value::Text(vec!["P1".into()]),
+                )),
+        );
+        // Sanity: the head-only file really is a prefix of the pixel one.
+        assert!(pix_bytes.starts_with(&head_bytes));
+        let got =
+            QrIndex::read_header_capped(&dir.join("razor.dcm"), head_bytes.len() as u64, 1 << 20)
+                .unwrap();
+        assert_eq!(got.string(tags::PATIENT_ID), Some("P1"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -99,6 +99,24 @@ pub enum Error {
         limit: u64,
     },
 
+    /// The pushback queue exceeded [`MAX_STASHED_EVENTS`](crate::MAX_STASHED_EVENTS):
+    /// the peer kept sending mid-operation instead of one C-CANCEL or
+    /// release. The operation fails and the association aborts.
+    #[error("stashed DIMSE events exceeded {limit}")]
+    TooManyStashed {
+        /// Pushback-queue cap.
+        limit: usize,
+    },
+
+    /// The pushback queue exceeded [`MAX_STASHED_BYTES`](crate::MAX_STASHED_BYTES)
+    /// aggregate dataset bytes: same flood, measured in bytes instead
+    /// of messages. The operation fails and the association aborts.
+    #[error("stashed DIMSE bytes exceeded {limit}")]
+    StashedTooLarge {
+        /// Pushback-queue byte budget.
+        limit: u64,
+    },
+
     /// Invalid AE title.
     #[error("invalid AE title `{0}`: {1}")]
     BadAeTitle(String, &'static str),

@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use common::{AuditArgs, ListenArgs, SenderWithId, anyhowish::Result, emit_best_effort, host_of};
+use common::{
+    AuditArgs, ListenArgs, MAX_SCP_ASSOCIATIONS, SenderWithId, anyhowish::Result, emit_best_effort,
+    host_of,
+};
 use tokio::net::TcpListener;
 use vyna_dcm::net::AeTitle;
 use vyna_dcm::net::service::{AcceptorOptions, Handlers, RequestContext, ScpOptions, accept};
@@ -157,6 +160,7 @@ async fn main() -> Result<()> {
         our_ip,
     });
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_SCP_ASSOCIATIONS));
     loop {
         let Ok((tcp, peer)) = listener.accept().await else {
             // Back off: a persistent accept failure (e.g. EMFILE)
@@ -165,11 +169,18 @@ async fn main() -> Result<()> {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            eprintln!(
+                "mppsscp: association from {peer} dropped: over {MAX_SCP_ASSOCIATIONS} concurrent"
+            );
+            continue;
+        };
         // DIMSE is small-write chatty; Nagle would stall each PDU on the
         // peer's delayed ACK (~40ms).
         tcp.set_nodelay(true).ok();
         let (acceptor, tls, handlers) = (acceptor.clone(), tls.clone(), handlers.clone());
         tokio::spawn(async move {
+            let _permit = permit;
             println!("association from {peer}");
             let out = match tls {
                 Some(tls) => match tls.accept(tcp).await {

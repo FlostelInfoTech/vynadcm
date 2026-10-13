@@ -17,6 +17,7 @@ pub const CHARSET_UTF8: &str = "ISO_IR 192";
 
 /// Coded concept for Concept Name Code Sequence (0040,A043).
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ConceptName {
     /// Code Value (e.g. `"18748-4"`).
     pub value: String,
@@ -202,9 +203,10 @@ impl PdfInstanceMeta {
 /// can strip wire padding exactly.
 ///
 /// Validated here: UID syntax for the three UID fields, Patient Sex
-/// (`M`/`F`/`O` when non-empty), and Burned In Annotation (`YES`/`NO`).
-/// Other caller strings (modality, conversion type, dates, titles) are
-/// written verbatim: garbage in, non-conformant out.
+/// (`M`/`F`/`O` when non-empty), Burned In Annotation (`YES`/`NO`),
+/// and the non-empty Type 1 modality/conversion-type/series/instance
+/// numbers. Other caller strings (dates, titles) are written verbatim:
+/// garbage in, non-conformant out.
 pub fn pdf_to_dataset(pdf: &[u8], meta: &PdfInstanceMeta) -> Result<DataSet> {
     if pdf.is_empty() {
         return Err(Error::EmptyDocument);
@@ -238,6 +240,18 @@ pub fn pdf_to_dataset(pdf: &[u8], meta: &PdfInstanceMeta) -> Result<DataSet> {
             "Burned In Annotation {:?} (want YES or NO)",
             meta.burned_in_annotation
         )));
+    }
+    // Type 1 caller strings: required with real values (defaults are
+    // non-empty but a caller can empty them).
+    for (tag, v) in [
+        (tags::MODALITY, &meta.modality),
+        (tags::CONVERSION_TYPE, &meta.conversion_type),
+        (tags::SERIES_NUMBER, &meta.series_number),
+        (tags::INSTANCE_NUMBER, &meta.instance_number),
+    ] {
+        if v.is_empty() {
+            return Err(Error::Missing(tag.to_string()));
+        }
     }
     let mut ds = DataSet::new();
     if meta.needs_utf8() {
@@ -316,6 +330,7 @@ fn put_optional_text(ds: &mut DataSet, tag: vyna_dcm_core::Tag, vr: Vr, v: &Opti
 
 /// A PDF extracted from a dataset, with its document metadata.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ExtractedPdf {
     /// The PDF bytes, exactly (wire padding stripped).
     pub bytes: Vec<u8>,
@@ -394,6 +409,27 @@ mod tests {
         meta.content_date = Some("20261011".into());
         meta.content_time = Some("120000".into());
         meta
+    }
+
+    #[test]
+    fn empty_type1_caller_strings_rejected() {
+        let pdf = sample_pdf();
+        for field in [
+            "modality",
+            "conversion_type",
+            "series_number",
+            "instance_number",
+        ] {
+            let mut meta = sample_meta();
+            match field {
+                "modality" => meta.modality.clear(),
+                "conversion_type" => meta.conversion_type.clear(),
+                "series_number" => meta.series_number.clear(),
+                _ => meta.instance_number.clear(),
+            }
+            let err = pdf_to_dataset(&pdf, &meta).unwrap_err();
+            assert!(matches!(err, Error::Missing(_)), "{field}: {err:?}");
+        }
     }
 
     #[test]

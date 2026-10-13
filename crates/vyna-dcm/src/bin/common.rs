@@ -6,6 +6,12 @@ use std::time::Duration;
 
 use vyna_dcm::TransferSyntax;
 use vyna_dcm::core::{Tag, lookup_keyword};
+
+/// Maximum concurrent inbound associations per SCP tool, mirroring
+/// the DICOMweb server's connection cap: past this, the accept loop
+/// drops new connections with a warning instead of spawning
+/// unbounded tasks (slow-loris on the association count).
+pub const MAX_SCP_ASSOCIATIONS: usize = 1024;
 use vyna_dcm::net::service::propose;
 use vyna_dcm::net::{AeTitle, Association, AssociationOptions};
 use vyna_dcm::{DataSet, Vr};

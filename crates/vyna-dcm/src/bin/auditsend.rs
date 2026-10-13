@@ -410,7 +410,7 @@ mod tests {
     #[test]
     fn flow_messages_carry_triples_and_parties() {
         let msg = flow_message(&flow(), "SRCID", FlowKind::Transferred).unwrap();
-        assert_eq!(msg.event.code, "110103");
+        assert_eq!(msg.event.code, "110104");
         assert_eq!(msg.participants.len(), 2);
         assert_eq!(msg.objects.len(), 2);
         let xml = msg.to_xml();

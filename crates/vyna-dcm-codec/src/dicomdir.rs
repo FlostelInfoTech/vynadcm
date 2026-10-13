@@ -463,6 +463,7 @@ pub fn record_type_for_sop_class(sop_class_uid: &str) -> &'static str {
 }
 
 /// One file to index in a DICOMDIR.
+#[non_exhaustive]
 pub struct DirEntry<'a> {
     /// The referenced file's dataset (record keys are copied from it).
     pub dataset: &'a DataSet,
@@ -472,6 +473,20 @@ pub struct DirEntry<'a> {
     pub transfer_syntax_uid: String,
     /// Directory Record Type override (default: mapped from SOP Class).
     pub record_type: Option<String>,
+}
+
+impl<'a> DirEntry<'a> {
+    /// Index `dataset` under `file_id`, stored as `transfer_syntax_uid`.
+    /// The record type maps from the SOP Class unless overwritten via
+    /// the [`DirEntry::record_type`] field.
+    pub fn new(dataset: &'a DataSet, file_id: Vec<String>, transfer_syntax_uid: String) -> Self {
+        Self {
+            dataset,
+            file_id,
+            transfer_syntax_uid,
+            record_type: None,
+        }
+    }
 }
 
 /// Build a DICOMDIR file for `entries` (grouped patient → study →

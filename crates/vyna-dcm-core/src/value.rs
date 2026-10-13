@@ -97,7 +97,46 @@ impl Value {
         }
     }
 
-    /// Value multiplicity (number of values).
+    /// Approximate in-RAM payload bytes: value lengths summed
+    /// recursively (sequences included). Container overhead (Vec/String
+    /// headers, map nodes) is ignored, so this slightly
+    /// underestimates — budgets built on it must leave headroom. For
+    /// DoS accounting, not billing.
+    #[must_use]
+    pub fn approx_bytes(&self) -> u64 {
+        match self {
+            Value::Empty => 0,
+            Value::Text(v) => v.iter().map(|s| s.len() as u64).sum(),
+            Value::PersonName(v) => v.iter().map(person_name_bytes).sum(),
+            Value::Tags(v) => v.len() as u64 * 4,
+            Value::U16(v) => v.len() as u64 * 2,
+            Value::I16(v) => v.len() as u64 * 2,
+            Value::U32(v) => v.len() as u64 * 4,
+            Value::I32(v) => v.len() as u64 * 4,
+            Value::U64(v) => v.len() as u64 * 8,
+            Value::I64(v) => v.len() as u64 * 8,
+            Value::F32(v) => v.len() as u64 * 4,
+            Value::F64(v) => v.len() as u64 * 8,
+            Value::Bytes(v) => v.len() as u64,
+            Value::Sequence(items) => items.iter().map(DataSet::approx_bytes).sum(),
+            Value::Fragments(f) => f.basic_offset_table.len() as u64 * 4 + f.payload_len() as u64,
+        }
+    }
+}
+
+fn person_name_bytes(p: &PersonName) -> u64 {
+    let group = |g: &crate::NameComponents| {
+        g.family.len() + g.given.len() + g.middle.len() + g.prefix.len() + g.suffix.len()
+    };
+    (group(&p.alphabetic)
+        + p.ideographic.as_ref().map(group).unwrap_or(0)
+        + p.phonetic.as_ref().map(group).unwrap_or(0)) as u64
+}
+
+impl Value {
+    /// Value multiplicity (number of values). Bulk values (`Bytes`,
+    /// `Fragments`) always have VM 1 when non-empty (PS3.5 §6.4):
+    /// fragment count is framing, not multiplicity.
     #[must_use]
     pub fn multiplicity(&self) -> usize {
         match self {
@@ -121,7 +160,13 @@ impl Value {
                 }
             }
             Value::Sequence(v) => v.len(),
-            Value::Fragments(f) => f.fragments.len(),
+            Value::Fragments(f) => {
+                if f.fragments.is_empty() {
+                    0
+                } else {
+                    1
+                }
+            }
         }
     }
 
@@ -278,6 +323,61 @@ impl DataElement {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragments_have_vm_one() {
+        // Fragment count is framing, not multiplicity (PS3.5 §6.4).
+        let many = Value::Fragments(FragmentSequence {
+            basic_offset_table: vec![0],
+            fragments: vec![vec![1u8; 4], vec![2u8; 4], vec![3u8; 4]],
+        });
+        assert_eq!(many.multiplicity(), 1);
+        let none = Value::Fragments(FragmentSequence {
+            basic_offset_table: vec![],
+            fragments: vec![],
+        });
+        assert_eq!(none.multiplicity(), 0);
+        assert_eq!(Value::Bytes(vec![0u8; 8]).multiplicity(), 1);
+        assert_eq!(Value::U16(vec![1, 2]).multiplicity(), 2);
+    }
+
+    #[test]
+    fn approx_bytes_sums_payloads() {
+        assert_eq!(Value::Empty.approx_bytes(), 0);
+        assert_eq!(Value::Text(vec!["ab".into(), "c".into()]).approx_bytes(), 3);
+        assert_eq!(Value::U16(vec![1, 2, 3]).approx_bytes(), 6);
+        assert_eq!(Value::I16(vec![1]).approx_bytes(), 2);
+        assert_eq!(Value::U32(vec![1, 2]).approx_bytes(), 8);
+        assert_eq!(Value::I32(vec![1]).approx_bytes(), 4);
+        assert_eq!(Value::U64(vec![1]).approx_bytes(), 8);
+        assert_eq!(Value::I64(vec![1, 2]).approx_bytes(), 16);
+        assert_eq!(Value::F32(vec![1.0, 2.0]).approx_bytes(), 8);
+        assert_eq!(Value::F64(vec![1.0]).approx_bytes(), 8);
+        assert_eq!(
+            Value::Tags(vec![Tag::new(1, 2), Tag::new(3, 4)]).approx_bytes(),
+            8
+        );
+        assert_eq!(Value::Bytes(vec![0u8; 100]).approx_bytes(), 100);
+        assert_eq!(
+            Value::PersonName(vec![PersonName::parse("Doe^Jane")]).approx_bytes(),
+            7 // "Doe" + "Jane", separators not counted
+        );
+        let mut inner = DataSet::new();
+        inner.put_text(Tag::new(0x0009, 0x1001), Vr::Lo, "abcd");
+        assert_eq!(
+            Value::Sequence(vec![inner]).approx_bytes(),
+            4,
+            "sequences recurse"
+        );
+        assert_eq!(
+            Value::Fragments(FragmentSequence {
+                basic_offset_table: vec![0, 10],
+                fragments: vec![vec![0u8; 6]],
+            })
+            .approx_bytes(),
+            14
+        );
+    }
 
     #[test]
     fn value_helpers() {

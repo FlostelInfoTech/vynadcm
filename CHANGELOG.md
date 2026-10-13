@@ -7,6 +7,58 @@ the workspace crate version (`Cargo.toml`).
 
 ### Fixed
 
+- ATNA audit-code corrections, verified against NEMA PS3.16 Annex D
+  (IHE ITI TF convention): participant source role is 110153
+  ("Source Role ID", was 110152/"Source") and destination role is
+  110152 ("Destination Role ID", was 110151/"Destination"); the
+  instances-transferred event is DCM 110104 (was 110103). All three
+  pairs are pinned by tests.
+- Round-1 publish-readiness review batch (2 majors + 68 minors,
+  every finding fixed and test-pinned):
+  - Silent wrong results: FIND/MOVE/GET without a dataset fail
+    (never MATCH-ALL); `require_string`/ECG readers distinguish
+    absent (`Missing`) from unusable (`Value`/`Waveform`); floats
+    from text must be finite; `PersonName::parse` keeps the first
+    backslash value; WADO-URI MIME mismatch is `BadRequest`;
+    encapsulated encode joins fragments per frame; empty BOT stays
+    valid; ECG acquisition-context text counts toward the UTF-8
+    declaration (was Latin-1 mojibake on round-trip).
+  - Secrecy: `Debug` no longer prints syslog keys/CA material, the
+    de-id UID map, web auth headers/bodies, or server tokens;
+    `DicomWebClient` rejects base URLs with userinfo credentials;
+    de-id warnings name tag + VM position instead of values; ATNA
+    I/O failures keep their `io::Error` kind; `wadorsd` warns when
+    binding non-loopback without auth.
+  - DoS/resource: Part-10 header reads complete under a 64 MiB cap;
+    QR query/commit/stash budgets (16 stashed events / 64 MiB,
+    10k commit refs); connect + TLS handshake timeouts (10 s);
+    per-SCP association semaphore (1024); QIDO query-length cap +
+    stable paging; shared 4 GiB DICOMweb in-flight budget with 503
+    fast-fail; saturating byte accounting.
+  - Validation: association negotiation rejects even/zero/duplicate
+    presentation-context IDs; `AeTitle` allows ASCII graphic/space
+    only; syslog frames mask severity and fold non-ASCII headers;
+    Bearer [REDACTED] is case-insensitive (token compare stays
+    constant-time).
+  - API/docs/process: `#[non_exhaustive]` on `TransferSyntax`,
+    `Vr`, `TranscodeOptions`, `DirEntry` (new `DirEntry::new`),
+    `ScpFollowUp`, `ConceptName`, `ExtractedPdf`; `Vr::unit_size`
+    returns `Option` (`None` for `SQ` and retired `SI`, whose width
+    the standard leaves undefined — the old `SI → 4` was
+    unverified); context-VR resolution moved into core as
+    `context_vr_rule` (single table, no drift); `Fragments`
+    multiplicity is 1; `Vr::ALL` is alphabetical; FR-CORE-05
+    disambiguates the two transfer-syntax defaults; CI ladder gains
+    `cli,ecg` + `cli,net,web`; facade `tokio` is optional via
+    `net`/`web` and facade `tracing` is dropped (unused); document
+    control tables bumped to 0.5.0. Pre-1.0 breaking notes:
+    `Deidentifier::with_replacement_name` now returns `Result`
+    (`InvalidReplacementName` on bad input, was silent accept);
+    `Vr::unit_size` returns `Option<usize>`; newly
+    `#[non_exhaustive]` types need wildcard arms / constructors
+    downstream.
+  - Tallies: dictionary is 5,239 rows (was miscounted 5,217 by a
+    grep that missed single-line entries), now pinned by test.
 - C-ECHO-RQ/RSP now carry the mandatory Affected SOP Class UID
   (`1.2.840.10008.1.1`); without it DCMTK `storescp` aborts the
   association on command parse. Found by the new cross-vendor

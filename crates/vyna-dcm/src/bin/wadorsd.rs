@@ -46,11 +46,24 @@ async fn main() {
     }
 }
 
+/// True when the bind needs the loud PHI warning: reachable beyond
+/// loopback with no bearer token configured (and plain HTTP either way).
+fn needs_phi_warning(addr: &std::net::SocketAddr, bearer_token: &Option<String>) -> bool {
+    bearer_token.is_none() && !addr.ip().is_loopback()
+}
+
 async fn run(args: &Args) -> Result<(), String> {
     let addr: std::net::SocketAddr = args
         .bind
         .parse()
         .map_err(|_| format!("bad --bind {:?}", args.bind))?;
+    if needs_phi_warning(&addr, &args.bearer_token) {
+        eprintln!(
+            "wadorsd WARNING: serving PHI over unauthenticated plain HTTP on {addr} \
+             (non-loopback bind without --bearer-token); keep the loopback bind or put \
+             a TLS-terminating proxy in front"
+        );
+    }
     let store = Arc::new(MemoryStore::new());
     let mut skipped = 0usize;
     for file in webcommon::collect_dcm_files(&args.dir) {
@@ -80,4 +93,26 @@ async fn run(args: &Args) -> Result<(), String> {
     serve_forever_with_auth(store, base, addr, auth)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn phi_warning_only_for_exposed_binds() {
+        let token = Some("t".to_string());
+        for (bind, tok, warn) in [
+            ("127.0.0.1:8080", None, false),
+            ("[::1]:8080", None, false),
+            ("0.0.0.0:8080", None, true),
+            ("[::]:8080", None, true),
+            ("192.168.1.5:8080", None, true),
+            ("0.0.0.0:8080", token.clone(), false),
+            ("192.168.1.5:8080", token.clone(), false),
+        ] {
+            let addr: std::net::SocketAddr = bind.parse().unwrap();
+            assert_eq!(needs_phi_warning(&addr, &tok), warn, "{bind}");
+        }
+    }
 }

@@ -19,7 +19,10 @@ use vyna_dcm_core::DataSet;
 
 use crate::{
     AeTitle, Error, Result,
-    association::{Association, AssociationInfo, DimseEvent, NegotiatedContext},
+    association::{
+        Association, AssociationInfo, DimseEvent, MAX_STASHED_BYTES, MAX_STASHED_EVENTS,
+        NegotiatedContext,
+    },
     dimse::{Command, DimseMessage, command_field as CF, priority, status},
     pdu::{AcceptedContext, AssociateAc, AssociateRj, Pdu, ProposedContext},
 };
@@ -137,6 +140,21 @@ pub fn negotiate(
             },
             None => return Err(reject(1, 1, 1)),
         }
+    }
+
+    // Presentation-context IDs are the initiator's responsibility
+    // (PS3.8 §9.3.2.2): odd and nonzero, each used once. A peer that
+    // violates this is protocol-broken, so reject the association
+    // rather than accepting contexts we cannot address unambiguously.
+    let mut seen = [false; 256];
+    for prop in &rq.presentation_contexts {
+        if prop.id == 0 || prop.id % 2 == 0 {
+            return Err(reject(1, 1, 1)); // malformed presentation-context id
+        }
+        if seen[prop.id as usize] {
+            return Err(reject(1, 1, 1)); // duplicate presentation-context id
+        }
+        seen[prop.id as usize] = true;
     }
 
     let mut contexts = Vec::new();
@@ -335,13 +353,16 @@ pub trait Handlers: Send + Sync {
     }
 
     /// C-FIND-RQ + query → final status plus pending matches.
+    /// Dispatch fails dataset-less requests before this runs, so
+    /// `query` always came from a real Identifier.
     /// Return a failure status with no matches to fail the whole FIND.
     async fn on_find(&self, _ctx: &RequestContext<'_>, _query: &DataSet) -> (u16, Vec<DataSet>) {
         (status::SOP_CLASS_NOT_SUPPORTED, Vec::new())
     }
 
     /// C-MOVE-RQ + query + destination AE → final status plus instances
-    /// the framework C-STOREs to the destination.
+    /// the framework C-STOREs to the destination. Dispatch fails
+    /// dataset-less requests first, so `query` is always real.
     ///
     /// Prefer [`Handlers::on_move_plan`] for large result sets: this
     /// eager form holds every instance in RAM before the first send.
@@ -368,7 +389,8 @@ pub trait Handlers: Send + Sync {
     }
 
     /// C-GET-RQ + query → final status plus instances the framework
-    /// C-STOREs back over this same association.
+    /// C-STOREs back over this same association. Dispatch fails
+    /// dataset-less requests first, so `query` is always real.
     ///
     /// Prefer [`Handlers::on_get_plan`] for large result sets: this
     /// eager form holds every instance in RAM before the first send.
@@ -470,7 +492,8 @@ enum CancelPoll {
 
 /// Poll once for a C-CANCEL-RQ targeting `message_id`. Anything else
 /// the peer sends mid-operation (e.g. RELEASE-RQ) is stashed back for
-/// the dispatch loop — never swallowed.
+/// the dispatch loop — never swallowed (past the stash cap the
+/// operation fails and the association aborts instead).
 async fn poll_cancel(assoc: &mut Association, message_id: u16) -> Result<CancelPoll> {
     // Let the peer task run first so an in-flight C-CANCEL lands in
     // the socket buffer before the non-blocking check below.
@@ -478,7 +501,7 @@ async fn poll_cancel(assoc: &mut Association, message_id: u16) -> Result<CancelP
     match assoc.poll_event(CANCEL_POLL_WAIT).await? {
         None => Ok(CancelPoll::KeepGoing),
         Some(DimseEvent::Released) => {
-            assoc.stash(DimseEvent::Released);
+            assoc.stash(DimseEvent::Released)?;
             Ok(CancelPoll::Released)
         }
         Some(DimseEvent::Message(m))
@@ -494,7 +517,7 @@ async fn poll_cancel(assoc: &mut Association, message_id: u16) -> Result<CancelP
                     m.command.name()
                 );
             }
-            assoc.stash(other);
+            assoc.stash(other)?;
             Ok(CancelPoll::KeepGoing)
         }
     }
@@ -504,6 +527,7 @@ async fn poll_cancel(assoc: &mut Association, message_id: u16) -> Result<CancelP
 /// awaited before dispatch continues. The framework assigns the
 /// message ID at send time.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum ScpFollowUp {
     /// N-EVENT-REPORT-RQ (Storage Commitment today; UPS later).
     EventReport {
@@ -660,7 +684,20 @@ async fn dispatch<H: Handlers>(
             assoc.send(ctx_id, &rsp, None).await?;
         }
         CF::C_FIND_RQ => {
-            let query = msg.dataset.unwrap_or_default();
+            // C-FIND-RQ always carries an Identifier (PS3.4 C.4.1.1):
+            // a missing dataset is a protocol violation, not an
+            // empty query (which would MATCH-ALL a worklist). It fails
+            // as an unusable identifier, like a level-less one.
+            let Some(query) = msg.dataset else {
+                let rsp = Command::find_rsp(
+                    rsp_id,
+                    cmd.affected_sop_class_uid.clone(),
+                    status::DATASET_MISMATCH,
+                    false,
+                );
+                assoc.send(ctx_id, &rsp, None).await?;
+                return Ok(());
+            };
             let (final_status, matches) = handlers.on_find(&rctx, &query).await;
             if status::is_failure(final_status) || status::is_cancel(final_status) {
                 let rsp = Command::find_rsp(
@@ -839,14 +876,14 @@ async fn emit_follow_up(assoc: &mut Association, ctx_id: u8, f: ScpFollowUp) -> 
             );
         }
         DimseEvent::Released => {
-            assoc.stash(DimseEvent::Released);
+            assoc.stash(DimseEvent::Released)?;
         }
         DimseEvent::Message(other) => {
             tracing::warn!(
                 "stashing {} instead of a follow-up RSP",
                 other.command.name()
             );
-            assoc.stash(DimseEvent::Message(other));
+            assoc.stash(DimseEvent::Message(other))?;
         }
     }
     Ok(())
@@ -878,14 +915,19 @@ async fn handle_move<H: Handlers>(
     let cmd = msg.command.clone();
     let rsp_id = cmd.message_id.unwrap_or(0);
     let dest = cmd.move_destination.clone().unwrap_or_default();
-    let query = msg.dataset.clone().unwrap_or_default();
-    let (handler_status, plan) = handlers.on_move_plan(rctx, &query, dest.trim()).await;
     let sop = cmd.affected_sop_class_uid.clone();
 
     let fail_final = async |assoc: &mut Association, s: u16| -> Result<()> {
         let rsp = Command::move_get_rsp(true, rsp_id, sop.clone(), s, 0, 0, 0, 0);
         assoc.send(ctx_id, &rsp, None).await
     };
+    // C-MOVE-RQ always carries an Identifier (PS3.4 C.4.2.1); a
+    // missing one fails as an unusable identifier, like retrieve_plan
+    // treats a level-less one.
+    let Some(query) = msg.dataset.clone() else {
+        return fail_final(assoc, status::DATASET_MISMATCH).await;
+    };
+    let (handler_status, plan) = handlers.on_move_plan(rctx, &query, dest.trim()).await;
     if status::is_failure(handler_status) || status::is_cancel(handler_status) {
         return fail_final(assoc, handler_status).await;
     }
@@ -903,7 +945,12 @@ async fn handle_move<H: Handlers>(
         vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian,
         vyna_dcm_core::TransferSyntax::ImplicitVrLittleEndian,
     ];
-    let dest_ae = AeTitle::new(dest.trim()).unwrap_or_else(|_| AeTitle::new("MOVEDEST").unwrap());
+    // Never substitute a fallback AE: associating to the wrong
+    // destination would deliver PHI to a stranger.
+    let Ok(dest_ae) = AeTitle::new(dest.trim()) else {
+        tracing::warn!("C-MOVE destination is not a valid AE title; failing");
+        return fail_final(assoc, status::MOVE_DESTINATION_UNKNOWN).await;
+    };
     let Ok(proposed) = propose(&classes, &ts) else {
         tracing::warn!("C-MOVE proposes too many storage classes; failing");
         return fail_final(assoc, status::PROCESSING_FAILURE).await;
@@ -991,11 +1038,18 @@ async fn handle_move<H: Handlers>(
         }
     }
     outbound.release().await.ok();
+    // A SUCCESS final with failed sub-operations lies to the caller;
+    // PS3.4 C.4.2/C.4.3 report B000 instead.
+    let final_status = if done_fail > 0 {
+        status::SUBOPERATIONS_COMPLETE_WITH_FAILURES
+    } else {
+        status::SUCCESS
+    };
     let rsp = Command::move_get_rsp(
         true,
         rsp_id,
         sop,
-        status::SUCCESS,
+        final_status,
         0,
         done_ok,
         done_fail,
@@ -1014,9 +1068,15 @@ async fn handle_get<H: Handlers>(
 ) -> Result<()> {
     let cmd = msg.command.clone();
     let rsp_id = cmd.message_id.unwrap_or(0);
-    let query = msg.dataset.clone().unwrap_or_default();
-    let (handler_status, plan) = handlers.on_get_plan(rctx, &query).await;
     let sop = cmd.affected_sop_class_uid.clone();
+    // C-GET-RQ always carries an Identifier (PS3.4 C.4.3.1); a
+    // missing one fails as an unusable identifier (see handle_move).
+    let Some(query) = msg.dataset.clone() else {
+        let rsp = Command::move_get_rsp(false, rsp_id, sop, status::DATASET_MISMATCH, 0, 0, 0, 0);
+        assoc.send(ctx_id, &rsp, None).await?;
+        return Ok(());
+    };
+    let (handler_status, plan) = handlers.on_get_plan(rctx, &query).await;
 
     if status::is_failure(handler_status) || status::is_cancel(handler_status) {
         let rsp = Command::move_get_rsp(false, rsp_id, sop, handler_status, 0, 0, 0, 0);
@@ -1071,43 +1131,74 @@ async fn handle_get<H: Handlers>(
             .send(st_ctx.id, &store_cmd, Some(&inst.dataset))
             .await?;
         // Await the C-STORE-RSP (a C-CANCEL for the GET aborts delivery).
-        // Single receive: anything else aborts the GET, so no retry loop.
-        let store_status = match assoc.recv().await? {
-            DimseEvent::Message(m)
-                if m.command.field == CF::C_STORE_RSP
-                    && m.command.message_id_rsp == Some(store_id) =>
-            {
-                m.command.status.unwrap_or(status::PROCESSING_FAILURE)
-            }
-            DimseEvent::Message(m)
-                if m.command.field == CF::C_CANCEL_RQ
-                    && m.command.message_id_rsp == Some(rsp_id) =>
-            {
-                let rsp = Command::move_get_rsp(
-                    false,
-                    rsp_id,
-                    sop,
-                    status::CANCEL,
-                    remaining,
-                    done_ok,
-                    done_fail,
-                    done_warn,
-                );
-                assoc.send(ctx_id, &rsp, None).await?;
-                return Ok(());
-            }
-            DimseEvent::Message(m) => {
-                return Err(Error::UnexpectedPdu {
-                    expected: "C-STORE-RSP",
-                    got: m.command.name().to_string(),
-                });
-            }
-            // Peer released mid-GET: stash for the dispatch loop and
-            // stop quietly like FIND/MOVE — erroring here would make
-            // run_scp send A-ABORT after the release completed.
-            DimseEvent::Released => {
-                assoc.stash(DimseEvent::Released);
-                return Ok(());
+        // Stray messages (a C-CANCEL for another op, etc.) are held
+        // aside and stashed for the dispatch loop once the RSP lands —
+        // stashing inside the loop would replay them through
+        // `recv`'s pending-first queue forever. The hold-aside carries
+        // the stash caps as a twin budget: past either, the GET fails
+        // instead of buffering a flood.
+        let mut strays: Vec<DimseEvent> = Vec::new();
+        let mut strays_bytes: u64 = 0;
+        let store_status = loop {
+            match assoc.recv().await? {
+                DimseEvent::Message(m)
+                    if m.command.field == CF::C_STORE_RSP
+                        && m.command.message_id_rsp == Some(store_id) =>
+                {
+                    for s in strays {
+                        assoc.stash(s)?;
+                    }
+                    break m.command.status.unwrap_or(status::PROCESSING_FAILURE);
+                }
+                DimseEvent::Message(m)
+                    if m.command.field == CF::C_CANCEL_RQ
+                        && m.command.message_id_rsp == Some(rsp_id) =>
+                {
+                    for s in strays {
+                        assoc.stash(s)?;
+                    }
+                    let rsp = Command::move_get_rsp(
+                        false,
+                        rsp_id,
+                        sop.clone(),
+                        status::CANCEL,
+                        remaining,
+                        done_ok,
+                        done_fail,
+                        done_warn,
+                    );
+                    assoc.send(ctx_id, &rsp, None).await?;
+                    return Ok(());
+                }
+                DimseEvent::Message(m) => {
+                    if strays.len() >= MAX_STASHED_EVENTS {
+                        return Err(Error::TooManyStashed {
+                            limit: MAX_STASHED_EVENTS,
+                        });
+                    }
+                    let size = m.dataset.as_ref().map(|ds| ds.approx_bytes()).unwrap_or(0);
+                    if strays_bytes.saturating_add(size) > MAX_STASHED_BYTES {
+                        return Err(Error::StashedTooLarge {
+                            limit: MAX_STASHED_BYTES,
+                        });
+                    }
+                    strays_bytes += size;
+                    tracing::debug!(
+                        "holding {} received mid-GET for message {rsp_id}",
+                        m.command.name()
+                    );
+                    strays.push(DimseEvent::Message(m));
+                }
+                // Peer released mid-GET: stash for the dispatch loop and
+                // stop quietly like FIND/MOVE — erroring here would make
+                // run_scp send A-ABORT after the release completed.
+                DimseEvent::Released => {
+                    for s in strays {
+                        assoc.stash(s)?;
+                    }
+                    assoc.stash(DimseEvent::Released)?;
+                    return Ok(());
+                }
             }
         };
         if status::is_success(store_status) {
@@ -1129,11 +1220,17 @@ async fn handle_get<H: Handlers>(
         );
         assoc.send(ctx_id, &rsp, None).await?;
     }
+    // See handle_move: failures surface as B000, never SUCCESS.
+    let final_status = if done_fail > 0 {
+        status::SUBOPERATIONS_COMPLETE_WITH_FAILURES
+    } else {
+        status::SUCCESS
+    };
     let rsp = Command::move_get_rsp(
         false,
         rsp_id,
         sop,
-        status::SUCCESS,
+        final_status,
         0,
         done_ok,
         done_fail,
@@ -1203,6 +1300,30 @@ mod tests {
         };
         let err = negotiate(&sample_rq(), &limited).unwrap_err();
         assert_eq!((err.result, err.source), (1, 1)); // nothing acceptable
+    }
+
+    #[test]
+    fn rejects_malformed_context_ids() {
+        let opts = AcceptorOptions::default();
+        for bad in [0u8, 2, 4, 254] {
+            let mut rq = sample_rq();
+            rq.presentation_contexts[0].id = bad;
+            let err = negotiate(&rq, &opts).unwrap_err();
+            assert_eq!((err.result, err.source, err.reason), (1, 1, 1), "id {bad}");
+        }
+        // Duplicates: same odd id twice.
+        let mut rq = sample_rq();
+        let dup = rq.presentation_contexts[0].clone();
+        rq.presentation_contexts.push(dup);
+        let err = negotiate(&rq, &opts).unwrap_err();
+        assert_eq!((err.result, err.source, err.reason), (1, 1, 1));
+        // Distinct odd ids still negotiate.
+        let mut rq = sample_rq();
+        let mut second = rq.presentation_contexts[0].clone();
+        second.id = 3;
+        rq.presentation_contexts.push(second);
+        let (_, ctxs) = negotiate(&rq, &opts).unwrap();
+        assert_eq!(ctxs.len(), 2);
     }
 
     #[test]

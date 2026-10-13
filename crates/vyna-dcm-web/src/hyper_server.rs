@@ -28,6 +28,82 @@ pub const MAX_CONN_SECS: u64 = 300;
 /// connections past this are dropped at accept.
 pub const MAX_CONNECTIONS: usize = 1024;
 
+/// Default aggregate cap for in-flight request bodies across one
+/// [`serve_forever`] listener (4 GiB): the per-connection
+/// [`MAX_BODY_LEN`] alone still allows 1024 x 1 GiB of buffered
+/// uploads. Past it, new body bytes fail fast with `503` instead of
+/// OOMing the server; embedders serving from tight boxes can share a
+/// smaller [`InflightBudget`] via [`serve_connection_with_budget`].
+pub const MAX_INFLIGHT_BODY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Shared budget for in-flight request bodies: one of these per
+/// listener (see [`MAX_INFLIGHT_BODY_BYTES`]), cloned into every
+/// connection task. Reservations release on drop, so a slow client
+/// only pins what it has actually sent.
+#[derive(Debug)]
+pub struct InflightBudget {
+    used: std::sync::Mutex<u64>,
+    cap: u64,
+}
+
+impl InflightBudget {
+    /// Budget with an explicit byte cap.
+    #[must_use]
+    pub fn new(cap: u64) -> Self {
+        Self {
+            used: std::sync::Mutex::new(0),
+            cap,
+        }
+    }
+
+    /// Reserve `n` more bytes; false (nothing reserved) past the cap.
+    fn try_reserve(&self, n: u64) -> bool {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        if used.saturating_add(n) > self.cap {
+            return false;
+        }
+        *used = used.saturating_add(n);
+        true
+    }
+
+    /// Release a previous reservation.
+    fn release(&self, n: u64) {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        *used = used.saturating_sub(n);
+    }
+}
+
+impl Default for InflightBudget {
+    /// [`MAX_INFLIGHT_BODY_BYTES`] shared budget.
+    fn default() -> Self {
+        Self::new(MAX_INFLIGHT_BODY_BYTES)
+    }
+}
+
+/// Reserved in-flight body bytes; released back to the budget on drop.
+struct InflightGuard {
+    budget: Arc<InflightBudget>,
+    bytes: u64,
+}
+
+impl InflightGuard {
+    /// Reserve `n` more bytes against the shared budget.
+    fn reserve(&mut self, n: u64) -> bool {
+        if self.budget.try_reserve(n) {
+            self.bytes = self.bytes.saturating_add(n);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.budget.release(self.bytes);
+    }
+}
+
 /// Optional access control for the plain-HTTP front end.
 ///
 /// WARNING: this server speaks unencrypted HTTP and, with default
@@ -62,9 +138,14 @@ fn authorized(headers: &std::collections::HashMap<String, String>, auth: &Server
     let Some(got) = headers.get("authorization") else {
         return false;
     };
-    let Some(token) = got.strip_prefix("Bearer ") else {
+    // Auth schemes are case-insensitive (RFC 9110 §11.4); the
+    // token itself still compares in constant time.
+    let Some((scheme, token)) = got.split_once(' ') else {
         return false;
     };
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return false;
+    }
     constant_time_eq(token, expected)
 }
 
@@ -93,17 +174,41 @@ pub async fn serve_connection<S: DicomWebStore + 'static>(
 }
 
 /// [`serve_connection`] with access control (see [`ServerAuth`]).
+/// Uses a fresh default [`InflightBudget`]: right for a lone
+/// connection (the per-connection cap already bounds it); listeners
+/// sharing one budget across connections want
+/// [`serve_connection_with_budget`].
 pub async fn serve_connection_with_auth<S: DicomWebStore + 'static>(
     store: Arc<S>,
     public_base: String,
     tcp: TcpStream,
     auth: ServerAuth,
 ) -> Result<()> {
+    serve_connection_with_budget(
+        store,
+        public_base,
+        tcp,
+        auth,
+        Arc::new(InflightBudget::default()),
+    )
+    .await
+}
+
+/// [`serve_connection_with_auth`] over a caller-shared [`InflightBudget`]
+/// (used by [`serve_forever`] to cap aggregate in-flight bodies).
+pub async fn serve_connection_with_budget<S: DicomWebStore + 'static>(
+    store: Arc<S>,
+    public_base: String,
+    tcp: TcpStream,
+    auth: ServerAuth,
+    budget: Arc<InflightBudget>,
+) -> Result<()> {
     serve_with_deadline(
         store,
         public_base,
         tcp,
         auth,
+        budget,
         Duration::from_secs(MAX_CONN_SECS),
     )
     .await
@@ -116,6 +221,7 @@ async fn serve_with_deadline<S: DicomWebStore + 'static>(
     public_base: String,
     tcp: TcpStream,
     auth: ServerAuth,
+    budget: Arc<InflightBudget>,
     deadline: Duration,
 ) -> Result<()> {
     let io = TokioIo::new(tcp);
@@ -127,7 +233,8 @@ async fn serve_with_deadline<S: DicomWebStore + 'static>(
                 let store = store.clone();
                 let public_base = public_base.clone();
                 let auth = auth.clone();
-                async move { handle_one(store.as_ref(), &public_base, req, &auth).await }
+                let budget = budget.clone();
+                async move { handle_one(store, public_base, req, auth, budget).await }
             }),
         ),
     )
@@ -159,6 +266,7 @@ pub async fn serve_forever_with_auth<S: DicomWebStore + 'static>(
         .await
         .map_err(|e| Error::Http(e.to_string()))?;
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let budget = Arc::new(InflightBudget::default());
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
             // Back off: a persistent accept failure (e.g. EMFILE)
@@ -170,10 +278,17 @@ pub async fn serve_forever_with_auth<S: DicomWebStore + 'static>(
             tracing::warn!("DICOMweb connection dropped: over {MAX_CONNECTIONS} concurrent");
             continue;
         };
-        let (store, public_base, auth) = (store.clone(), public_base.clone(), auth.clone());
+        let (store, public_base, auth, budget) = (
+            store.clone(),
+            public_base.clone(),
+            auth.clone(),
+            budget.clone(),
+        );
         tokio::spawn(async move {
             let _permit = permit;
-            if let Err(e) = serve_connection_with_auth(store, public_base, tcp, auth).await {
+            if let Err(e) =
+                serve_connection_with_budget(store, public_base, tcp, auth, budget).await
+            {
                 tracing::warn!("DICOMweb connection error: {e}");
             }
         });
@@ -186,11 +301,12 @@ fn body_over_cap(accumulated: usize, next: usize) -> bool {
     accumulated.saturating_add(next) > MAX_BODY_LEN
 }
 
-async fn handle_one<S: DicomWebStore>(
-    store: &S,
-    public_base: &str,
+async fn handle_one<S: DicomWebStore + 'static>(
+    store: Arc<S>,
+    public_base: String,
     req: Request<hyper::body::Incoming>,
-    auth: &ServerAuth,
+    auth: ServerAuth,
+    budget: Arc<InflightBudget>,
 ) -> std::result::Result<Response<Full<Bytes>>, hyper::Error> {
     let (parts, body) = req.into_parts();
     let mut headers = std::collections::HashMap::new();
@@ -199,7 +315,7 @@ async fn handle_one<S: DicomWebStore>(
             headers.insert(name.as_str().to_ascii_lowercase(), v.to_string());
         }
     }
-    if !authorized(&headers, auth) {
+    if !authorized(&headers, &auth) {
         let mut resp = Response::new(Full::new(Bytes::from_static(b"unauthorized")));
         *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
         resp.headers_mut().insert(
@@ -211,8 +327,11 @@ async fn handle_one<S: DicomWebStore>(
     // Stream the body with an early cap: collecting first and
     // checking after would let a huge STOW eat memory before the
     // limit ever applied. BytesMut freezes into the request body
-    // without a further copy.
+    // without a further copy. Each chunk also reserves against the
+    // listener-wide in-flight budget (released when this response
+    // completes); past it the upload fails fast with 503.
     let mut raw_body = BytesMut::new();
+    let mut guard = InflightGuard { budget, bytes: 0 };
     let mut body = body;
     while let Some(frame) = body.frame().await {
         let frame = frame?;
@@ -221,6 +340,13 @@ async fn handle_one<S: DicomWebStore>(
                 let mut resp =
                     Response::new(Full::new(Bytes::from_static(b"request body too large")));
                 *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
+                return Ok(resp);
+            }
+            if !guard.reserve(data.len() as u64) {
+                let mut resp = Response::new(Full::new(Bytes::from_static(
+                    b"server busy: too many large uploads in flight",
+                )));
+                *resp.status_mut() = hyper::StatusCode::SERVICE_UNAVAILABLE;
                 return Ok(resp);
             }
             raw_body.extend_from_slice(data);
@@ -243,7 +369,12 @@ async fn handle_one<S: DicomWebStore>(
         headers,
         body: raw_body,
     };
-    let hresp = dispatch(store, public_base, &hreq);
+    // Dispatch off the tokio worker: STOW multipart scans over up to
+    // 1 GiB are CPU-bound and must not stall the event loop (the
+    // request body moves without copying — `Bytes`, not `Vec<u8>`).
+    let hresp = tokio::task::spawn_blocking(move || dispatch(store.as_ref(), &public_base, &hreq))
+        .await
+        .unwrap_or_else(|_| crate::server::HttpResponse::text(500, "dispatch panicked"));
     let mut builder = Response::builder().status(hresp.status);
     for (k, v) in &hresp.headers {
         builder = builder.header(k, v);
@@ -287,6 +418,16 @@ mod tests {
         let mut good = HashMap::new();
         good.insert("authorization".to_string(), "Bearer s3cret".to_string());
         assert!(authorized(&good, &gated));
+        // Scheme is case-insensitive (RFC 9110 §11.4); a bare scheme
+        // with no token still fails.
+        for scheme in ["bearer", "BEARER", "BeArEr"] {
+            let mut mixed = HashMap::new();
+            mixed.insert("authorization".to_string(), format!("{scheme} s3cret"));
+            assert!(authorized(&mixed, &gated), "{scheme}");
+        }
+        let mut bare = HashMap::new();
+        bare.insert("authorization".to_string(), "Bearer".to_string());
+        assert!(!authorized(&bare, &gated));
     }
 
     #[tokio::test]
@@ -513,6 +654,7 @@ mod tests {
             "http://x".to_string(),
             tcp,
             ServerAuth::default(),
+            Arc::new(InflightBudget::default()),
             Duration::from_millis(50),
         )
         .await
@@ -530,6 +672,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::Http(_)), "{err}");
+    }
+
+    #[test]
+    fn inflight_budget_accounts_and_releases() {
+        let budget = Arc::new(InflightBudget::new(100));
+        assert!(budget.try_reserve(60));
+        assert!(budget.try_reserve(40));
+        assert!(!budget.try_reserve(1), "past cap: nothing reserved");
+        budget.release(60);
+        assert!(budget.try_reserve(1));
+        // Guards release on drop.
+        let used = *budget.used.lock().unwrap();
+        {
+            let mut g = InflightGuard {
+                budget: budget.clone(),
+                bytes: 0,
+            };
+            assert!(g.reserve(10));
+            assert_eq!(*budget.used.lock().unwrap(), used + 10);
+        }
+        assert_eq!(*budget.used.lock().unwrap(), used);
     }
 
     #[test]

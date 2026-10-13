@@ -144,10 +144,21 @@ pub fn read_part10(bytes: &[u8]) -> Result<(FileMeta, DataSet)> {
 /// tools that only need header keys. Standard query keys all sort
 /// before group `0x7FE0`, so nothing a header scan needs is lost.
 pub fn read_part10_header(bytes: &[u8]) -> Result<(FileMeta, DataSet)> {
+    read_part10_header_complete(bytes).map(|(meta, ds, _)| (meta, ds))
+}
+
+/// Like [`read_part10_header`], also reporting whether the Pixel Data
+/// stop was reached: `false` means `bytes` ran out first, so the
+/// headers may be partial (callers feeding a bounded prefix must grow
+/// it and retry rather than index a key-poor record).
+pub fn read_part10_header_complete(bytes: &[u8]) -> Result<(FileMeta, DataSet, bool)> {
     let (meta, body, meta_len) = read_meta(bytes)?;
     let ts = meta.transfer_syntax()?;
-    let (dataset, _) = decode_up_to(&body[meta_len..], ts, Some(tags::PIXEL_DATA))?;
-    Ok((meta, dataset))
+    let slice = &body[meta_len..];
+    let (dataset, used) = decode_up_to(slice, ts, Some(tags::PIXEL_DATA))?;
+    // The stop rewinds without consuming, so anything unconsumed
+    // means the Pixel Data tag was reached (headers complete).
+    Ok((meta, dataset, used < slice.len()))
 }
 
 /// Prefix check plus file-meta walk shared by both readers.
@@ -212,7 +223,7 @@ use vyna_dcm_core::Tag;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vyna_dcm_core::{Vr, tags};
+    use vyna_dcm_core::{DataElement, Value, Vr, tags};
 
     fn sample() -> (FileMeta, DataSet) {
         let meta = FileMeta::new(
@@ -262,5 +273,32 @@ mod tests {
         let mut bad = vec![0u8; 200];
         bad[128..132].copy_from_slice(b"XXXX");
         assert!(read_part10(&bad).is_err());
+    }
+
+    #[test]
+    fn header_completeness_tracks_pixel_data_stop() {
+        let (meta, mut ds) = sample();
+        ds.insert(DataElement::new(
+            tags::PIXEL_DATA,
+            Vr::Ow,
+            Value::Bytes(vec![1, 2, 3, 4]),
+        ));
+        let bytes = write_part10(&meta, &ds).unwrap();
+        // Whole file: the stop is reached.
+        let (_, back, complete) = read_part10_header_complete(&bytes).unwrap();
+        assert!(complete);
+        assert!(back.get(tags::PIXEL_DATA).is_none());
+        assert_eq!(back.string(tags::MODALITY), Some("ECG"));
+        // Explicit VR: tag(4) + VR(2) + reserved(2) + len(4) + value(4).
+        let at_tag = bytes.len() - 16;
+        // Prefix cut one byte into the headers: truncation errors,
+        // never partial success. (Cuts inside the pixel VALUE stay
+        // invisible by design — the header reader stops at its tag.)
+        assert!(read_part10_header_complete(&bytes[..at_tag - 1]).is_err());
+        // Prefix cut exactly at the pixel tag: headers decode but the
+        // stop is unreached, so callers must grow, not index partial.
+        let (_, partial, complete) = read_part10_header_complete(&bytes[..at_tag]).unwrap();
+        assert!(!complete);
+        assert_eq!(partial.string(tags::MODALITY), Some("ECG"));
     }
 }

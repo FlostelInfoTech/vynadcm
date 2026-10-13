@@ -3,17 +3,18 @@
 | Field | Value |
 |---|---|
 | Document | SDS (living) |
-| Version | 0.4.0 |
+| Version | 0.5.0 |
 | Date | 2026-10-13 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.4.0 |
+| Applies to | VynaDCM workspace v0.5.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue; full-dictionary
 (P0.1) update applied same day (generated tables, private dict, `SV`);
 0.2.0 (2026-10-12) — version bump, no design change;
 0.3.0 (2026-10-12) — cancel polling + follow-ups +
 TCP_NODELAY design notes;
-0.4.0 (2026-10-13) — security/correctness batch notes folded in.
+0.4.0 (2026-10-13) — security/correctness batch notes folded in;
+0.5.0 (2026-10-13) — version bump; §8 CI-ladder wording aligned.
 
 ## Contents
 
@@ -59,7 +60,7 @@ spec adds component contracts, algorithms, sequences, and invariants.
 | `Vr` | 35 variants (34 standard + retired `SI`); `is_text()`, fixed byte width where applicable |
 | `Value` | Sum type: text/numbers (per VR width) / bytes / sequences / fragments / tags / person names; `is_empty()` for QIDO pruning |
 | `DataSet` | Insertion-ordered map; typed getters return `Option` (never panic); `put_*` builders; `PartialEq` for round-trip asserts |
-| `ENTRIES` / `tags` | 5,217 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
+| `ENTRIES` / `tags` | 5,239 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
 | Private dict | 424 creators / 8,898 entries via `lookup_private(creator, group, suffix)` with block + group-wildcard fallbacks; `Tag::{private_block, private_creator_element, private_suffix}` mechanics |
 | `TransferSyntax` | 16 UIDs; `is_encapsulated()`, `is_deflated()`, endianness/VR-explicitness; `Default` = Explicit VR LE |
 | `PersonName`, `Da`, `Tm` | `PersonName::parse` is infallible; `Da`/`Tm` validate (`Tm`: `HH[MM[SS[.FFFFFF]]]`, colons optional) |
@@ -267,7 +268,8 @@ spec adds component contracts, algorithms, sequences, and invariants.
 
 - `message.rs`: `AuditMessage` builders (activity, begin-transfer,
   transferred, query, deleted, export/import, custom) rendering
-  RFC 3881 XML with full escaping; participant roles 110150–152,
+  RFC 3881 XML with full escaping; participant roles 110150–153
+  (110150 application, 110152 destination, 110153 source),
   study objects with base64 `(class, instance)` details, patient
   objects; code triples pinned by tests.
 - `syslog.rs`: `SyslogTarget` URL parsing (`udp`/`tcp`/`tls`,
@@ -416,7 +418,7 @@ Gated tests compile out with their features. The supported matrix
 (default, `--all-features`, `--no-default-features`, and each
 facade feature off in turn) must all build; CI checks the default
 workspace plus the `--no-default-features` ladder
-(bare / `cli` / `cli,net` / `cli,web`).
+(bare / `cli` / `cli,net` / `cli,web` / `cli,ecg` / `cli,net,web`).
 
 ## 9. Invariants and limits
 

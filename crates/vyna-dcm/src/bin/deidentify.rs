@@ -180,7 +180,13 @@ fn run() -> i32 {
         deid = deid.with_replacement_id(id.clone());
     }
     if let Some(name) = &args.patient_name {
-        deid = deid.with_replacement_name(name);
+        match deid.with_replacement_name(name) {
+            Ok(d) => deid = d,
+            Err(e) => {
+                eprintln!("deidentify: bad --patient-name: {e}");
+                return 1;
+            }
+        }
     }
     for (input, dest) in &jobs {
         match process_file(&mut deid, input, dest) {

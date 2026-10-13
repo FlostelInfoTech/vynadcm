@@ -8,6 +8,7 @@ use vyna_dcm_core::{DataSet, Tag, TransferSyntax};
 
 use crate::{
     Error, Result,
+    ae::AeTitle,
     association::{Association, DimseEvent},
     dimse::{Command, DimseMessage, command_field as CF, status},
     worklist::{CommitmentResult, parse_commitment_result},
@@ -231,12 +232,15 @@ impl Association {
         destination_ae: &str,
         priority: u16,
     ) -> Result<MoveResult> {
+        // Reject empty/overlong destinations before touching the wire:
+        // a blank (0000,0600) would fail opaquely at the peer.
+        let dest = AeTitle::new(destination_ae)?;
         let ctx = self
             .context_for(sop_class_uid)
             .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
             .clone();
         let id = self.next_message_id();
-        let cmd = Command::move_rq(id, priority, sop_class_uid, destination_ae);
+        let cmd = Command::move_rq(id, priority, sop_class_uid, dest.as_str());
         self.send(ctx.id, &cmd, Some(query)).await?;
         self.await_move_get(CF::C_MOVE_RSP, id).await
     }
@@ -555,12 +559,17 @@ mod tests {
         stored: Mutex<Vec<DataSet>>,
         find_matches: Vec<DataSet>,
         move_instances: Vec<MoveInstance>,
+        fail_store: bool,
     }
 
     impl Handlers for TestScp {
         async fn on_store(&self, _ctx: &RequestContext<'_>, dataset: DataSet) -> u16 {
             self.stored.lock().unwrap().push(dataset);
-            status::SUCCESS
+            if self.fail_store {
+                status::PROCESSING_FAILURE
+            } else {
+                status::SUCCESS
+            }
         }
 
         async fn on_find(
@@ -614,6 +623,7 @@ mod tests {
             stored: Mutex::new(vec![]),
             find_matches: vec![test_ds("1.2.3.1"), test_ds("1.2.3.2")],
             move_instances: vec![],
+            fail_store: false,
         });
         let h2 = handlers.clone();
         tokio::spawn(async move {
@@ -707,6 +717,7 @@ mod tests {
             stored: Mutex::new(vec![]),
             find_matches: matches,
             move_instances: vec![],
+            fail_store: false,
         });
         let h2 = handlers.clone();
         tokio::spawn(async move {
@@ -778,6 +789,7 @@ mod tests {
             stored: Mutex::new(vec![]),
             find_matches: matches,
             move_instances: vec![],
+            fail_store: false,
         });
         let h2 = handlers.clone();
         tokio::spawn(async move {
@@ -983,6 +995,7 @@ mod tests {
             stored: Mutex::new(vec![]),
             find_matches: vec![],
             move_instances: vec![],
+            fail_store: false,
         });
         let d2 = dest_handlers.clone();
         tokio::spawn(async move {
@@ -1016,6 +1029,7 @@ mod tests {
             stored: Mutex::new(vec![]),
             find_matches: vec![],
             move_instances: instances,
+            fail_store: false,
         });
         let h2 = handlers.clone();
         tokio::spawn(async move {
@@ -1091,6 +1105,117 @@ mod tests {
         assert_eq!(dest_handlers.stored.lock().unwrap().len(), 2);
     }
 
+    #[tokio::test]
+    async fn loopback_move_and_get_failed_subop_reports_b000() {
+        // Move destination SCP that fails every C-STORE.
+        let dest_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dest_addr = dest_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = dest_listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let acc = AcceptorOptions {
+                association: short_opts(),
+                ..Default::default()
+            };
+            let dest = TestScp {
+                stored: Mutex::new(vec![]),
+                find_matches: vec![],
+                move_instances: vec![],
+                fail_store: true,
+            };
+            accept(stream, &acc, &dest, &ScpOptions::default())
+                .await
+                .unwrap();
+        });
+
+        // Main SCP serving one instance for MOVE + GET.
+        let instances = vec![MoveInstance {
+            sop_class_uid: vyna_dcm_core::sop_class::CT_IMAGE.into(),
+            sop_instance_uid: "1.2.3.11".into(),
+            dataset: test_ds("1.2.3.11"),
+        }];
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handlers = ArcTestScp::new(TestScp {
+            stored: Mutex::new(vec![]),
+            find_matches: vec![],
+            move_instances: instances,
+            fail_store: false,
+        });
+        let h2 = handlers.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let acc = AcceptorOptions {
+                association: short_opts(),
+                ..Default::default()
+            };
+            let mut dir = HashMap::new();
+            dir.insert(
+                "MOVEDEST".to_string(),
+                ("127.0.0.1".to_string(), dest_addr.port()),
+            );
+            let scp_opts = ScpOptions {
+                move_config: Some(crate::service::ScpMoveConfig {
+                    directory: Arc::new(crate::service::HashMapDirectory { map: dir }),
+                    assoc_options: short_opts(),
+                    calling_ae: AeTitle::new("MOVESCP").unwrap(),
+                }),
+            };
+            accept(stream, &acc, &*h2, &scp_opts).await.unwrap();
+        });
+
+        let ts = [vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian];
+        let mut assoc = Association::request(
+            &short_opts(),
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            &addr.to_string(),
+            propose(
+                &[
+                    vyna_dcm_core::sop_class::STUDY_ROOT_MOVE,
+                    vyna_dcm_core::sop_class::STUDY_ROOT_GET,
+                    vyna_dcm_core::sop_class::CT_IMAGE,
+                ],
+                &ts,
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        // Failed sub-operation: final is B000, not SUCCESS.
+        let r = assoc
+            .move_to(
+                vyna_dcm_core::sop_class::STUDY_ROOT_MOVE,
+                &DataSet::new(),
+                "MOVEDEST",
+                priority::MEDIUM,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.status, r.completed, r.failed),
+            (status::SUBOPERATIONS_COMPLETE_WITH_FAILURES, 0, 1)
+        );
+
+        // Same for C-GET when the receiver rejects the instance.
+        let r = assoc
+            .get_with(
+                vyna_dcm_core::sop_class::STUDY_ROOT_GET,
+                &DataSet::new(),
+                priority::MEDIUM,
+                |_, _, _, _| status::PROCESSING_FAILURE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            (r.status, r.completed, r.failed),
+            (status::SUBOPERATIONS_COMPLETE_WITH_FAILURES, 0, 1)
+        );
+        assoc.release().await.unwrap();
+    }
+
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -1129,6 +1254,18 @@ mod tests {
         match assoc.recv().await.unwrap() {
             DimseEvent::Message(m) => *m,
             DimseEvent::Released => panic!("peer released"),
+        }
+    }
+
+    #[tokio::test]
+    async fn move_to_rejects_bad_destination_before_wire() {
+        let (mut scu, _scp) = dimse_pair();
+        for bad in ["", "   ", "THIS_AE_TITLE_IS_WAY_TOO_LONG"] {
+            let err = scu
+                .move_to("1.2.3", &DataSet::new(), bad, priority::MEDIUM)
+                .await
+                .expect_err("bad dest must fail");
+            assert!(matches!(err, Error::BadAeTitle(_, _)), "{err:?}");
         }
     }
 

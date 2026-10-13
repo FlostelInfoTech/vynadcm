@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use vyna_dcm_core::{DataSet, PersonName, Tag, Value, Vr, new_uid, tags};
+use vyna_dcm_core::{DataElement, DataSet, PersonName, Tag, Value, Vr, new_uid, tags};
 
 use crate::dates::{shift_da, shift_dt};
 use crate::error::{Error, Result};
@@ -12,7 +12,6 @@ use crate::profile::{Action, BASIC_PROFILE};
 pub const DEFAULT_REPLACEMENT: &str = "ANONYMIZED";
 
 /// One de-identification run over a dataset.
-#[derive(Debug)]
 pub struct Deidentifier {
     profile: HashMap<Tag, Action>,
     replacement_id: String,
@@ -21,6 +20,21 @@ pub struct Deidentifier {
     retain_private: bool,
     custom_profile: bool,
     uid_map: HashMap<String, String>,
+}
+
+// Manual `Debug`: `uid_map` keys are ORIGINAL UIDs (linkable PHI)
+// and must never reach logs; only the map size shows.
+impl std::fmt::Debug for Deidentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Deidentifier")
+            .field("replacement_id", &self.replacement_id)
+            .field("replacement_name", &self.replacement_name)
+            .field("date_offset", &self.date_offset)
+            .field("retain_private", &self.retain_private)
+            .field("custom_profile", &self.custom_profile)
+            .field("uid_map_len", &self.uid_map.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Deidentifier {
@@ -80,16 +94,20 @@ impl Deidentifier {
     ///
     /// Panics when any `=`-separated component group exceeds 64 bytes
     /// (the `PN` per-group limit).
-    #[must_use]
-    pub fn with_replacement_name(mut self, name: &str) -> Self {
+    /// Replacement person name stamped into `Dummy`-action `PN`
+    /// elements. Fails instead of truncating: overlong groups and
+    /// over-count components/groups are rejected.
+    pub fn with_replacement_name(mut self, name: &str) -> Result<Self> {
         for group in name.split('=') {
-            assert!(
-                group.len() <= 64,
-                "replacement name group exceeds the 64-byte PN limit: {group:?}"
-            );
+            if group.len() > 64 {
+                return Err(Error::InvalidReplacementName(format!(
+                    "group exceeds the 64-byte PN limit: {group:?}"
+                )));
+            }
         }
-        self.replacement_name = PersonName::parse(name);
-        self
+        self.replacement_name = PersonName::try_parse(name)
+            .map_err(|e| Error::InvalidReplacementName(e.to_string()))?;
+        Ok(self)
     }
 
     /// Shift `DA`/`DT` values by `days` (negative shifts back); without
@@ -135,13 +153,17 @@ impl Deidentifier {
             BurnedIn::Clean => {}
         }
         self.apply_to(ds, &mut report);
-        if report.dates_touched > 0 {
-            // Shifted dates keep intervals (MODIFIED); emptied or
-            // dummied dates do not (REMOVED).
-            let flag = if report.dates_shifted > 0 {
+        if report.dates_touched > 0 || report.dates_lost > 0 {
+            // Shifted dates keep intervals (MODIFIED) — but only when
+            // no date lost its values: a run that both shifts and
+            // empties dates must not claim maintained relationships.
+            // Untouched-by-loss kept dates are originals (UNMODIFIED).
+            let flag = if report.dates_lost > 0 {
+                "REMOVED"
+            } else if report.dates_shifted > 0 {
                 "MODIFIED"
             } else {
-                "REMOVED"
+                "UNMODIFIED"
             };
             ds.put_text(
                 tags::LONGITUDINAL_TEMPORAL_INFORMATION_MODIFIED,
@@ -223,11 +245,17 @@ impl Deidentifier {
             }
             match self.profile.get(&tag).copied() {
                 Some(Action::Remove) => {
+                    if is_longitudinal_date(ds, tag) {
+                        report.dates_lost += 1;
+                    }
                     ds.remove(tag);
                     report.removed += 1;
                 }
                 Some(Action::Zero) => {
                     if let Some(el) = ds.get_mut(tag) {
+                        if matches!(el.vr, Vr::Da | Vr::Dt) {
+                            report.dates_lost += 1;
+                        }
                         el.value = Value::Empty;
                         report.zeroed += 1;
                     }
@@ -259,8 +287,14 @@ impl Deidentifier {
             Vr::Pn => ds.put_person_name(tag, vec![self.replacement_name.clone()]),
             Vr::Tm => ds.put_text(tag, vr, crate::profile::DUMMY_TIME),
             Vr::As => ds.put_text(tag, vr, crate::profile::DUMMY_AGE),
-            Vr::Da => ds.put_text(tag, vr, crate::profile::DUMMY_DATE),
-            Vr::Dt => ds.put_text(tag, vr, crate::profile::DUMMY_DATETIME),
+            Vr::Da => {
+                ds.put_text(tag, vr, crate::profile::DUMMY_DATE);
+                report.dates_lost += 1;
+            }
+            Vr::Dt => {
+                ds.put_text(tag, vr, crate::profile::DUMMY_DATETIME);
+                report.dates_lost += 1;
+            }
             Vr::Sq => ds.put_sequence(tag, vec![DataSet::new()]),
             Vr::Ui => {
                 self.apply_remap(ds, tag, report);
@@ -269,8 +303,44 @@ impl Deidentifier {
             Vr::Ob | Vr::Ow | Vr::Of | Vr::Od | Vr::Ol | Vr::Ov | Vr::Un => {
                 ds.put_bytes(tag, vr, self.replacement_id.clone().into_bytes());
             }
-            _ => {
+            // Plain-text VRs take the replacement id verbatim.
+            Vr::Ae | Vr::Cs | Vr::Sh | Vr::Lo | Vr::St | Vr::Lt | Vr::Ut | Vr::Uc | Vr::Ur => {
                 ds.put_text(tag, vr, self.replacement_id.clone());
+            }
+            // Numeric-string VRs need a numeric dummy: the replacement
+            // id ("ANONYMIZED") is not a valid DS/IS value.
+            Vr::Ds | Vr::Is => {
+                ds.put_text(tag, vr, "0");
+            }
+            // Binary numerics take a zero of their own width. Writing
+            // text under them would emit unencodable DICOM (reachable
+            // via mistyped elements in dirty files or custom profiles
+            // pointing Dummy at numeric tags).
+            Vr::Us => ds.put_u16_single(tag, 0),
+            Vr::Ss => ds.insert(DataElement::new(tag, vr, Value::I16(vec![0]))),
+            Vr::Ul => ds.put_u32_single(tag, 0),
+            Vr::Sl => ds.insert(DataElement::new(tag, vr, Value::I32(vec![0]))),
+            Vr::Uv => ds.insert(DataElement::new(tag, vr, Value::U64(vec![0]))),
+            Vr::Sv => ds.insert(DataElement::new(tag, vr, Value::I64(vec![0]))),
+            Vr::Fl => ds.insert(DataElement::new(tag, vr, Value::F32(vec![0.0]))),
+            Vr::Fd => ds.insert(DataElement::new(tag, vr, Value::F64(vec![0.0]))),
+            Vr::At => ds.insert(DataElement::tags(tag, vec![])),
+            // Retired SI: unknown wire width, so keep + warn rather
+            // than emit bytes that misdeclare the value. The warning
+            // withholds the conformance markers.
+            Vr::Si => {
+                report
+                    .warnings
+                    .push(format!("SI dummy kept (retired VR): {tag:?}"));
+                return;
+            }
+            // Future VRs: same keep-and-warn policy — never emit
+            // bytes that misdeclare the value.
+            _ => {
+                report
+                    .warnings
+                    .push(format!("dummy kept (unsupported VR {vr:?}): {tag:?}"));
+                return;
             }
         }
         report.dummied += 1;
@@ -309,15 +379,20 @@ impl Deidentifier {
         let Some(el) = ds.get_mut(tag) else {
             return;
         };
+        let vr = el.vr;
         let Value::Text(values) = &mut el.value else {
             report
                 .warnings
                 .push(format!("date element kept (not text): {tag:?}"));
             return;
         };
-        let is_dt = el.vr == Vr::Dt;
+        let is_dt = vr == Vr::Dt;
         report.dates_touched += 1;
         let Some(offset) = self.date_offset else {
+            // No offset: the shift degrades to empty/dummy, which
+            // destroys intervals (counted only for real date VRs —
+            // a custom profile can point shift actions anywhere).
+            let longitudinal = matches!(vr, Vr::Da | Vr::Dt);
             if zero_when_no_offset {
                 el.value = Value::Empty;
                 report.zeroed += 1;
@@ -332,9 +407,16 @@ impl Deidentifier {
                 }
                 report.dummied += 1;
             }
+            if longitudinal {
+                report.dates_lost += 1;
+            }
             return;
         };
-        for value in values.iter_mut() {
+        // Empty components hold no PHI: skip them like apply_remap
+        // does instead of warning (a warning would withhold the
+        // Basic Profile markers over nothing). Enumerate before
+        // filtering so the VM position stays truthful.
+        for (i, value) in values.iter_mut().enumerate().filter(|(_, s)| !s.is_empty()) {
             let shifted = if is_dt {
                 shift_dt(value, offset)
             } else {
@@ -345,9 +427,12 @@ impl Deidentifier {
                     *value = shifted;
                     report.dates_shifted += 1;
                 }
-                None => report
-                    .warnings
-                    .push(format!("unshiftable date value kept: {tag:?} = {value:?}")),
+                // Tag + 1-based VM position only: the kept VALUE is a
+                // quasi-identifier and warnings are typically logged.
+                None => report.warnings.push(format!(
+                    "unshiftable date value kept: {tag:?} value {}",
+                    i + 1
+                )),
             }
         }
     }
@@ -373,6 +458,11 @@ pub struct DeidReport {
     /// Date elements seen by either shift action (shifted, dummied,
     /// or zeroed — but not kept values, which warn instead).
     pub dates_touched: usize,
+    /// Date (`DA`/`DT`) elements whose values were emptied, dummied,
+    /// or removed, destroying longitudinal intervals (`TM` excluded:
+    /// times are not longitudinal). Feeds the
+    /// `LONGITUDINAL_TEMPORAL_INFORMATION_MODIFIED` flag.
+    pub dates_lost: usize,
     /// Non-fatal problems, always values kept as-is (any entry
     /// withholds the conformance markers).
     pub warnings: Vec<String>,
@@ -381,6 +471,13 @@ pub struct DeidReport {
 /// Overlay plane groups (`0x6000..=0x60FF`).
 fn is_overlay(tag: Tag) -> bool {
     (0x6000..=0x60FF).contains(&tag.group())
+}
+
+/// Elements whose values carry longitudinal temporal information
+/// (`DA`/`DT`; `TM` times are not longitudinal).
+fn is_longitudinal_date(ds: &DataSet, tag: Tag) -> bool {
+    ds.get(tag)
+        .is_some_and(|el| matches!(el.vr, Vr::Da | Vr::Dt))
 }
 
 /// Curve-data groups: even groups `0x5000..=0x50FE` (E.1 `X`).
@@ -549,6 +646,59 @@ mod tests {
     }
 
     #[test]
+    fn empty_date_components_skipped_not_warned() {
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::new(
+            tags::STUDY_DATE,
+            Vr::Da,
+            Value::Text(vec!["".into(), "20240101".into()]),
+        ));
+        let report = Deidentifier::new()
+            .with_date_offset(30)
+            .apply(&mut ds)
+            .unwrap();
+        // The empty component holds no PHI: skipped silently, left
+        // in place, and the markers are still stamped.
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.dates_shifted, 1);
+        assert_eq!(
+            ds.strings(tags::STUDY_DATE).unwrap(),
+            &["".to_string(), "20240131".to_string()]
+        );
+        assert_eq!(ds.string(tags::PATIENT_IDENTITY_REMOVED), Some("YES"));
+    }
+
+    #[test]
+    fn kept_date_warning_hides_value_shows_vm_position() {
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::new(
+            tags::STUDY_DATE,
+            Vr::Da,
+            Value::Text(vec!["".into(), "NOTADATE".into()]),
+        ));
+        let report = Deidentifier::new()
+            .with_date_offset(30)
+            .apply(&mut ds)
+            .unwrap();
+        assert_eq!(report.warnings.len(), 2); // kept value + withheld markers
+        assert!(
+            !report.warnings[0].contains("NOTADATE"),
+            "{:?}",
+            report.warnings
+        );
+        assert!(
+            report.warnings[0].contains("value 2"),
+            "VM position must count the skipped empty: {:?}",
+            report.warnings
+        );
+        // The kept value itself is untouched.
+        assert_eq!(
+            ds.strings(tags::STUDY_DATE).unwrap(),
+            &["".to_string(), "NOTADATE".to_string()]
+        );
+    }
+
+    #[test]
     fn shift_keeps_longitudinal_intervals() {
         let mut ds = DataSet::new();
         ds.put_text(tags::STUDY_DATE, Vr::Da, "20240101");
@@ -711,6 +861,18 @@ mod tests {
     }
 
     #[test]
+    fn debug_hides_original_uids() {
+        let mut deid = Deidentifier::new();
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::STUDY_INSTANCE_UID, "1.2.3.ORIGINAL");
+        deid.apply(&mut ds).unwrap();
+        assert!(deid.uid_map().contains_key("1.2.3.ORIGINAL"));
+        let shown = format!("{deid:?}");
+        assert!(!shown.contains("1.2.3.ORIGINAL"), "{shown}");
+        assert!(shown.contains("uid_map_len"), "{shown}");
+    }
+
+    #[test]
     fn uid_map_is_visible_to_callers() {
         let mut deid = Deidentifier::new();
         let mut ds = DataSet::new();
@@ -752,6 +914,7 @@ mod tests {
         Deidentifier::new()
             .with_replacement_id("SUBJ-7")
             .with_replacement_name("Subject^Seven")
+            .unwrap()
             .apply(&mut ds)
             .unwrap();
         assert_eq!(ds.string(tags::CLINICAL_TRIAL_SUBJECT_ID), Some("SUBJ-7"));
@@ -792,6 +955,112 @@ mod tests {
         assert_eq!(
             ds.string(tags::LONGITUDINAL_TEMPORAL_INFORMATION_MODIFIED),
             Some("REMOVED")
+        );
+    }
+
+    #[test]
+    fn dummy_shapes_non_text_vrs() {
+        // Dummy under numeric/AT VRs (dirty-file mistypes or custom
+        // profiles) must stay encodable: zeros of the right width,
+        // never text under a binary VR.
+        let mut ds = DataSet::new();
+        ds.put_u16_single(tags::ROWS, 7);
+        ds.put_text(tags::PATIENT_WEIGHT, Vr::Ds, "80");
+        ds.insert(DataElement::tags(
+            tags::FRAME_INCREMENT_POINTER,
+            vec![tags::ROWS],
+        ));
+        ds.insert(DataElement::new(
+            tags::COLUMNS,
+            Vr::Si,
+            Value::Bytes(vec![1, 2]),
+        ));
+        let report = Deidentifier::new()
+            .with_profile(&[
+                (tags::ROWS, Action::Dummy),
+                (tags::PATIENT_WEIGHT, Action::Dummy),
+                (tags::FRAME_INCREMENT_POINTER, Action::Dummy),
+                (tags::COLUMNS, Action::Dummy),
+            ])
+            .apply(&mut ds)
+            .unwrap();
+        assert!(matches!(
+            ds.get(tags::ROWS).map(|e| &e.value),
+            Some(Value::U16(v)) if v == &vec![0u16]
+        ));
+        assert_eq!(ds.string(tags::PATIENT_WEIGHT), Some("0"));
+        assert!(matches!(
+            ds.get(tags::FRAME_INCREMENT_POINTER).map(|e| &e.value),
+            Some(Value::Tags(v)) if v.is_empty()
+        ));
+        // Retired SI kept as-is with a warning, not dummied.
+        assert!(matches!(
+            ds.get(tags::COLUMNS).map(|e| &e.value),
+            Some(Value::Bytes(v)) if v == &vec![1u8, 2]
+        ));
+        assert_eq!(report.dummied, 3);
+        assert!(report.warnings.iter().any(|w| w.contains("SI dummy kept")));
+    }
+
+    #[test]
+    fn mixed_shift_and_loss_reports_removed() {
+        // One date shifted, one emptied: claiming MODIFIED would lie
+        // about maintained intervals.
+        let mut ds = DataSet::new();
+        ds.put_text(tags::STUDY_DATE, Vr::Da, "20240101");
+        ds.put_text(tags::SERIES_DATE, Vr::Da, "20240115");
+        let report = Deidentifier::new()
+            .with_profile(&[
+                (tags::STUDY_DATE, Action::ShiftDate),
+                (tags::SERIES_DATE, Action::Zero),
+            ])
+            .with_date_offset(30)
+            .apply(&mut ds)
+            .unwrap();
+        assert_eq!(ds.string(tags::STUDY_DATE), Some("20240131"));
+        assert_eq!(ds.string(tags::SERIES_DATE), None);
+        assert_eq!((report.dates_shifted, report.dates_lost), (1, 1));
+        assert_eq!(
+            ds.string(tags::LONGITUDINAL_TEMPORAL_INFORMATION_MODIFIED),
+            Some("REMOVED")
+        );
+    }
+
+    #[test]
+    fn lost_only_date_reports_removed() {
+        // No shift action ran at all, but a date was emptied: the
+        // flag must appear (previously only shift-seen dates gated
+        // it, so this run stamped nothing).
+        let mut ds = DataSet::new();
+        ds.put_text(tags::SERIES_DATE, Vr::Da, "20240115");
+        let report = Deidentifier::new()
+            .with_profile(&[(tags::SERIES_DATE, Action::Zero)])
+            .apply(&mut ds)
+            .unwrap();
+        assert_eq!(report.dates_lost, 1);
+        assert_eq!(
+            ds.string(tags::LONGITUDINAL_TEMPORAL_INFORMATION_MODIFIED),
+            Some("REMOVED")
+        );
+    }
+
+    #[test]
+    fn kept_only_dates_report_unmodified() {
+        // Unshiftable values are kept as originals: intervals intact,
+        // so neither MODIFIED (nothing shifted) nor REMOVED (nothing
+        // lost) is honest. Markers are still withheld (warning).
+        let mut ds = DataSet::new();
+        ds.put_text(tags::STUDY_DATE, Vr::Da, "baddate");
+        let report = Deidentifier::new()
+            .with_date_offset(30)
+            .apply(&mut ds)
+            .unwrap();
+        assert_eq!(ds.string(tags::STUDY_DATE), Some("baddate"));
+        assert_eq!((report.dates_shifted, report.dates_lost), (0, 0));
+        assert!(!report.warnings.is_empty());
+        assert_eq!(
+            ds.string(tags::LONGITUDINAL_TEMPORAL_INFORMATION_MODIFIED),
+            Some("UNMODIFIED")
         );
     }
 
@@ -1011,9 +1280,18 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "64-byte")]
-    fn overlong_replacement_name_panics() {
-        let _ = Deidentifier::new().with_replacement_name(&"A".repeat(65));
+    fn bad_replacement_name_is_an_error_not_a_panic() {
+        for bad in [&"A".repeat(65) as &str, "A^B^C^D^E^F", "a=b=c=d", "A\\B"] {
+            let err = Deidentifier::new()
+                .with_replacement_name(bad)
+                .expect_err("bad name must fail");
+            assert!(matches!(err, Error::InvalidReplacementName(_)), "{err:?}");
+        }
+        assert!(
+            Deidentifier::new()
+                .with_replacement_name("Subject^Seven")
+                .is_ok()
+        );
     }
 
     #[test]

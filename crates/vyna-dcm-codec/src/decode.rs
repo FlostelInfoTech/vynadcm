@@ -9,8 +9,8 @@
 use flate2::bufread::ZlibDecoder;
 use std::io::Read;
 use vyna_dcm_core::{
-    DataElement, DataSet, FragmentSequence, PersonName, Tag, TransferSyntax, Value, Vr, delimiter,
-    dictionary_vr, is_context_dependent_vr, tags,
+    ContextVrRule, DataElement, DataSet, FragmentSequence, PersonName, Tag, TransferSyntax, Value,
+    Vr, context_vr_rule, delimiter, dictionary_vr, is_context_dependent_vr, tags,
 };
 
 use crate::{
@@ -276,17 +276,19 @@ fn implicit_vr(tag: Tag, len: u32, ds: &DataSet) -> Option<Vr> {
     Some(Vr::Un)
 }
 
-/// Resolve `ox`/`px`/`xs` tags from already-decoded siblings.
+/// Resolve `ox`/`px`/`xs` tags from already-decoded siblings. The
+/// ambiguous-tag set lives in core ([`context_vr_rule`]); this match
+/// only applies the rule, so the two can never drift apart.
 fn resolve_ambiguous(tag: Tag, ds: &DataSet) -> Vr {
-    match (tag.0, tag.1) {
-        (0x7FE0, 0x0010) => {
+    match context_vr_rule(tag) {
+        Some(ContextVrRule::BitsAllocated) => {
             if ds.uint16(tags::BITS_ALLOCATED).is_some_and(|b| b <= 8) {
                 Vr::Ob
             } else {
                 Vr::Ow
             }
         }
-        (0x5400, 0x0110) | (0x5400, 0x0112) | (0x5400, 0x100A) | (0x5400, 0x1010) => {
+        Some(ContextVrRule::WaveformBitsAllocated) => {
             if ds
                 .uint16(tags::WAVEFORM_BITS_ALLOCATED)
                 .is_some_and(|b| b <= 8)
@@ -296,30 +298,14 @@ fn resolve_ambiguous(tag: Tag, ds: &DataSet) -> Vr {
                 Vr::Ow
             }
         }
-        (0x0018, 0x9810)
-        | (0x0022, 0x1452)
-        | (0x0028, 0x0071)
-        | (0x0028, 0x0104)
-        | (0x0028, 0x0105)
-        | (0x0028, 0x0106)
-        | (0x0028, 0x0107)
-        | (0x0028, 0x0108)
-        | (0x0028, 0x0109)
-        | (0x0028, 0x0110)
-        | (0x0028, 0x0111)
-        | (0x0028, 0x0120)
-        | (0x0028, 0x0121)
-        | (0x0040, 0x9211)
-        | (0x0040, 0x9216)
-        | (0x0060, 0x3004)
-        | (0x0060, 0x3006) => {
+        Some(ContextVrRule::PixelRepresentation) => {
             if ds.uint16(tags::PIXEL_REPRESENTATION) == Some(1) {
                 Vr::Ss
             } else {
                 Vr::Us
             }
         }
-        _ => dictionary_vr(tag).unwrap_or(Vr::Un),
+        None => dictionary_vr(tag).unwrap_or(Vr::Un),
     }
 }
 
@@ -730,8 +716,9 @@ fn decode_primitive(
         Vr::Sv => Ok(Value::I64(numerics(raw, 8, little, i64_from, tag, vr)?)),
         Vr::Fl | Vr::Of => Ok(Value::F32(numerics(raw, 4, little, f32_from, tag, vr)?)),
         Vr::Fd | Vr::Od => Ok(Value::F64(numerics(raw, 8, little, f64_from, tag, vr)?)),
-        Vr::Ob | Vr::Ow | Vr::Un | Vr::Si => {
-            // SI is retired 64-bit; treat remaining binary VRs as bytes.
+        Vr::Ob | Vr::Ow | Vr::Un | Vr::Si | _ => {
+            // Opaque bytes: byte VRs, retired SI (no
+            // standard-defined width), and any future VR.
             Ok(Value::Bytes(raw.to_vec()))
         }
     }

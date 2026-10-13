@@ -128,7 +128,13 @@ fn encode_element(
             ));
         }
         put_vr_len(out, vr, explicit, little, UNDEFINED_LENGTH);
-        encode_bot(out, f, little);
+        let bot_len = bot_byte_len(f.basic_offset_table.len()).ok_or_else(|| {
+            unencodable(format!(
+                "basic offset table with {} entries exceeds 32-bit value length",
+                f.basic_offset_table.len()
+            ))
+        })?;
+        encode_bot(out, f, bot_len, little);
         for frag in &f.fragments {
             put_tag(out, delimiter::ITEM, little);
             put_u32(out, u32_len(frag.len(), "fragment")?, little);
@@ -221,9 +227,16 @@ fn encode_dataset_in(
     Ok(out)
 }
 
-fn encode_bot(out: &mut Vec<u8>, f: &FragmentSequence, little: bool) {
+/// Basic-offset-table byte length (4 per entry): `None` past the
+/// 32-bit value length, including 32-bit `usize` overflow — never a
+/// truncating `as u32`.
+fn bot_byte_len(entries: usize) -> Option<u32> {
+    u32::try_from(entries.checked_mul(4)?).ok()
+}
+
+fn encode_bot(out: &mut Vec<u8>, f: &FragmentSequence, bot_len: u32, little: bool) {
     put_tag(out, delimiter::ITEM, little);
-    put_u32(out, (f.basic_offset_table.len() * 4) as u32, little);
+    put_u32(out, bot_len, little);
     for o in &f.basic_offset_table {
         put_u32(out, *o, little);
     }
@@ -521,6 +534,16 @@ mod tests {
                 Vr::Sv,
                 Value::I64(vec![-5, 7]),
             ))
+    }
+
+    #[test]
+    fn bot_length_rejects_overflow() {
+        assert_eq!(bot_byte_len(0), Some(0));
+        assert_eq!(bot_byte_len(3), Some(12));
+        assert_eq!(bot_byte_len(usize::MAX), None);
+        assert_eq!(bot_byte_len(u32::MAX as usize / 4 + 1), None);
+        // Largest encodable table: exactly 4 GiB - 4 bytes.
+        assert_eq!(bot_byte_len(u32::MAX as usize / 4), Some(u32::MAX - 3));
     }
 
     #[test]

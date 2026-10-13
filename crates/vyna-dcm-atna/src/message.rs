@@ -8,7 +8,7 @@
 /// A coded value triple.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Code {
-    /// Code value (e.g. `110103`).
+    /// Code value (e.g. `110104`).
     pub code: String,
     /// Coding scheme (`DCM`, `RFC-3881`).
     pub system: String,
@@ -115,18 +115,20 @@ impl Participant {
         }
     }
 
-    /// Source participant (role 110152).
+    /// Source participant (role 110153, "Source Role ID" per PS3.16
+    /// Annex D / IHE ITI TF convention).
     pub fn source(user_id: impl Into<String>, network_id: Option<String>, requestor: bool) -> Self {
         Self {
             user_id: user_id.into(),
             alt_user_id: None,
             is_requestor: requestor,
-            role: Code::dcm("110152", "Source"),
+            role: Code::dcm("110153", "Source Role ID"),
             network_id,
         }
     }
 
-    /// Destination participant (role 110151).
+    /// Destination participant (role 110152, "Destination Role ID" per
+    /// PS3.16 Annex D / IHE ITI TF convention).
     pub fn destination(
         user_id: impl Into<String>,
         network_id: Option<String>,
@@ -136,7 +138,7 @@ impl Participant {
             user_id: user_id.into(),
             alt_user_id: None,
             is_requestor: requestor,
-            role: Code::dcm("110151", "Destination"),
+            role: Code::dcm("110152", "Destination Role ID"),
             network_id,
         }
     }
@@ -260,7 +262,7 @@ impl AuditMessage {
         msg
     }
 
-    /// Instances transferred (DCM 110103, Read): `instances` are
+    /// Instances transferred (DCM 110104, Read): `instances` are
     /// `(sop_class_uid, sop_instance_uid)` pairs of one study.
     #[allow(clippy::too_many_arguments)]
     pub fn instances_transferred(
@@ -274,7 +276,7 @@ impl AuditMessage {
         source_id: &str,
     ) -> Self {
         let mut msg = Self::new(
-            Code::dcm("110103", "DICOM Instances Transferred"),
+            Code::dcm("110104", "DICOM Instances Transferred"),
             ActionCode::Read,
             source_id,
         );
@@ -529,7 +531,7 @@ mod tests {
             AuditMessage::instances_transferred(None, "1.2.3", &[], "A", None, "B", None, "SRC");
         assert_eq!(
             (t.event.code.as_str(), t.event.display.as_str(), t.action),
-            ("110103", "DICOM Instances Transferred", ActionCode::Read)
+            ("110104", "DICOM Instances Transferred", ActionCode::Read)
         );
         let b = AuditMessage::begin_transferring(None, "1.2.3", &[], "A", None, "B", None, "SRC");
         assert_eq!(
@@ -627,8 +629,8 @@ mod tests {
         let xml = msg.to_xml();
         assert!(xml.contains("EventActionCode=\"R\""), "{xml}");
         assert!(xml.contains("EventOutcomeIndicator=\"0\""), "{xml}");
-        assert!(xml.contains("code=\"110152\""), "{xml}"); // source
-        assert!(xml.contains("code=\"110151\""), "{xml}"); // destination
+        assert!(xml.contains("code=\"110153\""), "{xml}"); // source
+        assert!(xml.contains("code=\"110152\""), "{xml}"); // destination
         assert!(xml.contains("NetworkAccessPointTypeCode=\"2\""), "{xml}"); // IP
         assert!(xml.contains("NetworkAccessPointTypeCode=\"1\""), "{xml}"); // name
         assert!(xml.contains("ParticipantObjectID=\"1.2.3\""), "{xml}");

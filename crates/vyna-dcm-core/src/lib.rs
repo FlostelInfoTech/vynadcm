@@ -39,7 +39,8 @@ mod vr;
 pub use dataset::DataSet;
 pub use datetime::{Da, Tm, civil_from_days, days_from_civil, is_valid_dt, utc_now_rfc3339};
 pub use dictionary::{
-    DictEntry, ENTRIES, dictionary_vr, is_context_dependent_vr, lookup, lookup_keyword,
+    ContextVrRule, DictEntry, ENTRIES, context_vr_rule, dictionary_vr, is_context_dependent_vr,
+    lookup, lookup_keyword,
 };
 pub use error::{Error, Result};
 pub use person_name::{NameComponents, PersonName};

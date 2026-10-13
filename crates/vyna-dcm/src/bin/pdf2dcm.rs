@@ -151,10 +151,14 @@ fn run(args: &Args) -> i32 {
             args.input.display()
         );
     }
-    let mut meta = PdfInstanceMeta::new(
-        PersonName::parse(&args.patient_name),
-        args.patient_id.clone(),
-    );
+    let patient_name = match PersonName::try_parse(&args.patient_name) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("pdf2dcm: bad --patient-name: {e}");
+            return 1;
+        }
+    };
+    let mut meta = PdfInstanceMeta::new(patient_name, args.patient_id.clone());
     meta.sop_instance_uid = args.sop_uid.clone().unwrap_or_default();
     meta.study_uid = args.study_uid.clone().unwrap_or_default();
     meta.series_uid = args.series_uid.clone().unwrap_or_default();

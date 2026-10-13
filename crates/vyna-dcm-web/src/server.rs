@@ -27,7 +27,7 @@ pub const BULK_TAGS: [Tag; 5] = [
 ];
 
 /// Framework-agnostic HTTP request.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpRequest {
     /// Uppercase method (`GET`, `POST`, ...).
     pub method: String,
@@ -40,6 +40,33 @@ pub struct HttpRequest {
     /// Body bytes (shared buffer: front ends hand over their bytes
     /// without copying, e.g. multi-hundred-MB STOW uploads).
     pub body: Bytes,
+}
+
+// Manual `Debug`: embedders log requests, so the `Authorization`
+// credential stays out and the (possibly PHI-carrying, possibly
+// huge) body shows as a length only.
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let headers: HashMap<&str, &str> = self
+            .headers
+            .iter()
+            .map(|(k, v)| {
+                let v = if k == "authorization" || k == "proxy-authorization" {
+                    "<redacted>"
+                } else {
+                    v.as_str()
+                };
+                (k.as_str(), v)
+            })
+            .collect();
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("query", &self.query)
+            .field("headers", &headers)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// Framework-agnostic HTTP response.
@@ -171,6 +198,8 @@ pub trait DicomWebStore: Send + Sync {
     ) -> std::result::Result<StoredIds, String>;
 
     /// Register blobs, returning one id per blob for `BulkDataURI`s.
+    /// Implementations MUST return exactly `blobs.len()` ids:
+    /// anything else makes the metadata endpoint answer 500.
     fn put_bulk(&self, blobs: Vec<(Vec<u8>, String)>) -> Vec<String>;
 
     /// Resolve a bulk id to `(bytes, content_type)`.
@@ -262,6 +291,9 @@ impl DicomWebStore for MemoryStore {
         let mut seen_series = std::collections::HashSet::new();
         // NOTE: offset applies to *matched* rows below, never to the raw
         // store order — skipping here would page unfiltered instances.
+        // Skipped rows are counted, never cloned: a huge offset must
+        // not clone the whole match set into a transient.
+        let mut seen = 0usize;
         for inst in inner.instances.iter() {
             if let Some(s) = &scope.study
                 && inst.study != *s
@@ -280,7 +312,8 @@ impl DicomWebStore for MemoryStore {
                 continue;
             }
             // Dedup AFTER the match: an unmatched first instance must
-            // not claim its study/series and hide a later match.
+            // not claim its study/series and hide a later match. Skipped
+            // rows still claim, so paging windows are stable.
             if scope.level == "STUDY" && !seen_studies.insert(inst.study.clone()) {
                 continue;
             }
@@ -289,14 +322,19 @@ impl DicomWebStore for MemoryStore {
             {
                 continue;
             }
+            if seen < offset {
+                seen += 1;
+                continue;
+            }
+            if out.len() >= limit {
+                break;
+            }
             let mut ds = inst.dataset.clone();
             strip_bulk(&mut ds);
             out.push(ds);
-            if out.len() >= offset.saturating_add(limit) {
-                break;
-            }
+            seen += 1;
         }
-        out.into_iter().skip(offset).take(limit).collect()
+        out
     }
 
     fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Vec<u8>> {
@@ -366,6 +404,16 @@ impl DicomWebStore for MemoryStore {
         file: &[u8],
         study_hint: Option<&str>,
     ) -> std::result::Result<StoredIds, String> {
+        // A single file over the byte cap would evict the whole store
+        // (including itself) and still report success; refuse it.
+        // This also bounds bulk blobs: blobs are extracted from stored
+        // instances, so none can exceed the cap either.
+        if file.len() > MAX_INSTANCE_BYTES {
+            return Err(format!(
+                "instance ({} bytes) exceeds the store cap of {MAX_INSTANCE_BYTES} bytes",
+                file.len()
+            ));
+        }
         let (meta, dataset) = read_part10(file).map_err(|e| e.to_string())?;
         let study = dataset
             .string(tags::STUDY_INSTANCE_UID)
@@ -392,9 +440,11 @@ impl DicomWebStore for MemoryStore {
         if let Some(pos) = inner.instances.iter().position(|i| i.instance == instance)
             && let Some(old) = inner.instances.remove(pos)
         {
-            inner.instance_bytes -= old.file.len();
+            inner.instance_bytes = inner.instance_bytes.saturating_sub(old.file.len());
         }
-        inner.instance_bytes += file.len();
+        // Saturating: plain `+=` wraps (release) or panics (debug) on
+        // 32-bit / huge direct-dispatch inputs, corrupting eviction.
+        inner.instance_bytes = inner.instance_bytes.saturating_add(file.len());
         inner.instances.push_back(StoredInstance {
             study: study.clone(),
             series: series.clone(),
@@ -407,7 +457,7 @@ impl DicomWebStore for MemoryStore {
             let Some(oldest) = inner.instances.pop_front() else {
                 break;
             };
-            inner.instance_bytes -= oldest.file.len();
+            inner.instance_bytes = inner.instance_bytes.saturating_sub(oldest.file.len());
         }
         Ok(StoredIds {
             study,
@@ -424,7 +474,8 @@ impl DicomWebStore for MemoryStore {
                 // Unpredictable ids: sequential hex ids let anyone
                 // enumerate every stored blob.
                 let id = uuid::Uuid::new_v4().as_simple().to_string();
-                inner.bulk_bytes += bytes.len();
+                // Saturating (see `store_instance`): never wrap eviction.
+                inner.bulk_bytes = inner.bulk_bytes.saturating_add(bytes.len());
                 inner.bulk_order.push_back(id.clone());
                 inner.bulk.insert(id.clone(), (bytes, ct));
                 while inner.bulk.len() > MAX_BULK_BLOBS || inner.bulk_bytes > MAX_BULK_BYTES {
@@ -432,7 +483,7 @@ impl DicomWebStore for MemoryStore {
                         break;
                     };
                     if let Some((b, _)) = inner.bulk.remove(&oldest) {
-                        inner.bulk_bytes -= b.len();
+                        inner.bulk_bytes = inner.bulk_bytes.saturating_sub(b.len());
                     }
                 }
                 id
@@ -779,6 +830,12 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                             .map(|b| (b.bytes, b.content_type))
                             .collect(),
                     );
+                    // A short id list would silently drop BulkDataURIs
+                    // via the zip below; fail loudly instead (custom
+                    // store broke the one-id-per-blob contract).
+                    if ids.len() != keys.len() {
+                        return HttpResponse::text(500, "bulk store returned mismatched ids");
+                    }
                     let mut obj = dataset_to_json(&ds);
                     let map = obj.as_object_mut().unwrap();
                     for ((key, vr), id) in keys.iter().zip(ids) {
@@ -859,12 +916,22 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
 /// tag dictionary, so an unbounded list is a CPU DoS.
 const MAX_QIDO_PARAMS: usize = 100;
 
+/// Maximum total QIDO query-string bytes (the param count alone does
+/// not bound it: one 100 MB filter value would clone through matching
+/// against every instance). 64 KiB is orders of magnitude past real
+/// queries; direct-`dispatch` embedders have no URI cap of their own,
+/// so this is enforced here rather than at the HTTP front end.
+const MAX_QIDO_QUERY_BYTES: usize = 64 * 1024;
+
 /// Maximum frames per WADO-RS `/frames/` request. Duplicates are
 /// rejected outright (see above); this caps the parse/lookup work of
 /// distinct entries. 10,000 covers any real multiframe object.
 const MAX_WADO_FRAMES: usize = 10_000;
 
 fn qido<S: DicomWebStore>(store: &S, scope: QidoScope, query: &str) -> HttpResponse {
+    if query.len() > MAX_QIDO_QUERY_BYTES {
+        return HttpResponse::text(400, "query too long");
+    }
     let params = parse_query(query);
     if params.len() > MAX_QIDO_PARAMS {
         return HttpResponse::text(400, "too many query parameters");
@@ -1131,6 +1198,73 @@ mod tests {
     }
 
     #[test]
+    fn qido_paging_windows_are_stable() {
+        let store = stored();
+        let rows = |path: &str| {
+            let r = dispatch(&store, "http://x/wado", &get(path));
+            assert_eq!(r.status, 200, "{path}");
+            serde_json::from_slice::<serde_json::Value>(&r.body).unwrap()
+        };
+        let uid = |v: &serde_json::Value, i: usize| {
+            v.as_array().unwrap()[i]["0020000E"]["Value"][0]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        // Two series; page through them one at a time.
+        let v = rows("/studies/1.2.3/series?limit=1&offset=0");
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(uid(&v, 0), "1.2.3.1");
+        let v = rows("/studies/1.2.3/series?limit=1&offset=1");
+        assert_eq!(v.as_array().unwrap().len(), 1);
+        assert_eq!(uid(&v, 0), "1.2.3.2");
+        // Past the end (and absurd offsets) return nothing.
+        assert!(
+            rows("/studies/1.2.3/series?offset=99")
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        // Absurd but 32-bit-parseable (larger values fall back to 0).
+        assert!(
+            rows("/studies/1.2.3/series?offset=4000000000")
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(rows("/studies?offset=1").as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn qido_rejects_overlong_query() {
+        let store = stored();
+        let big = format!("PatientID={}", "P".repeat(MAX_QIDO_QUERY_BYTES + 1));
+        let r = dispatch(&store, "http://x/wado", &get(&format!("/studies?{big}")));
+        assert_eq!(r.status, 400);
+        let ok = format!("PatientID={}", "P".repeat(100));
+        let r = dispatch(&store, "http://x/wado", &get(&format!("/studies?{ok}")));
+        assert_eq!(r.status, 200);
+    }
+
+    #[test]
+    fn debug_redacts_auth_and_body() {
+        let mut req = get("/studies?PatientID=1");
+        req.headers
+            .insert("authorization".into(), "Bearer s3cret".into());
+        req.headers
+            .insert("accept".into(), "application/json".into());
+        req.body = Bytes::from_static(b"PHI-BYTES");
+        let shown = format!("{req:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(!shown.contains("PHI-BYTES"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
+        assert!(shown.contains("body_len"), "{shown}");
+        // Non-secret fields still show.
+        assert!(shown.contains("/studies"), "{shown}");
+        assert!(shown.contains("application/json"), "{shown}");
+    }
+
+    #[test]
     fn qido_search_and_filters() {
         let store = stored();
         // All studies.
@@ -1273,6 +1407,84 @@ mod tests {
             &get("/studies/9.9/series/9.9/instances/9.9"),
         );
         assert_eq!(r.status, 404);
+    }
+
+    /// Store double that shortens bulk ids (contract violation).
+    struct ShortBulkStore {
+        inner: MemoryStore,
+    }
+
+    impl DicomWebStore for ShortBulkStore {
+        fn search(
+            &self,
+            scope: &QidoScope,
+            filters: &[(Tag, String)],
+            limit: usize,
+            offset: usize,
+        ) -> Vec<DataSet> {
+            self.inner.search(scope, filters, limit, offset)
+        }
+
+        fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Vec<u8>> {
+            self.inner.instance_file(study, series, instance)
+        }
+
+        fn instance_metadata(
+            &self,
+            study: &str,
+            series: &str,
+            instance: &str,
+        ) -> Option<(DataSet, Vec<BulkBlob>)> {
+            self.inner.instance_metadata(study, series, instance)
+        }
+
+        fn instance_frames(
+            &self,
+            study: &str,
+            series: &str,
+            instance: &str,
+            frames: &[u32],
+        ) -> Option<Vec<Vec<u8>>> {
+            self.inner.instance_frames(study, series, instance, frames)
+        }
+
+        fn store_instance(
+            &self,
+            file: &[u8],
+            study_hint: Option<&str>,
+        ) -> std::result::Result<StoredIds, String> {
+            self.inner.store_instance(file, study_hint)
+        }
+
+        fn put_bulk(&self, blobs: Vec<(Vec<u8>, String)>) -> Vec<String> {
+            let mut ids = self.inner.put_bulk(blobs);
+            ids.pop();
+            ids
+        }
+
+        fn bulk_data(&self, id: &str) -> Option<(Vec<u8>, String)> {
+            self.inner.bulk_data(id)
+        }
+    }
+
+    #[test]
+    fn oversize_single_instance_rejected_not_stored_then_evicted() {
+        let store = MemoryStore::new();
+        let big = vec![0u8; MAX_INSTANCE_BYTES + 1];
+        let err = store.store_instance(&big, None).unwrap_err();
+        assert!(err.contains("exceeds the store cap"), "{err}");
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn metadata_short_bulk_ids_is_500_not_silent_drop() {
+        let store = ShortBulkStore { inner: stored() };
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/metadata"),
+        );
+        assert_eq!(r.status, 500);
     }
 
     #[test]

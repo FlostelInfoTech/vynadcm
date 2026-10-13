@@ -144,6 +144,11 @@ async fn run_async(args: &Args) -> Result<(), String> {
 /// One part lands exactly at `output`; several fan out to
 /// `STEM_N.EXT`.
 fn write_parts(output: &Path, parts: &[Vec<u8>]) -> Result<(), String> {
+    if parts.is_empty() {
+        // Zero parts with exit 0 would look like success while
+        // writing nothing; the server shorted the frame list.
+        return Err("server returned no frame data".to_string());
+    }
     if parts.len() == 1 {
         iocommon::write_atomic(output, &parts[0]).map_err(|e| e.to_string())?;
         println!("{} ({} bytes)", output.display(), parts[0].len());
@@ -177,5 +182,16 @@ mod tests {
         assert!(parse_frames("0").is_err());
         assert!(parse_frames("1,x").is_err());
         assert!(parse_frames("").is_err());
+    }
+
+    #[test]
+    fn zero_parts_is_an_error_not_silent_success() {
+        let dir = std::env::temp_dir().join(format!("wadors-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("f.bin");
+        let err = write_parts(&out, &[]).unwrap_err();
+        assert!(err.contains("no frame data"), "{err}");
+        assert!(!out.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
