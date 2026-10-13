@@ -11,6 +11,17 @@
 #![allow(clippy::all)]
 #![cfg_attr(not(feature = "std"), no_std)]
 
+// VYNA-PATCH: upstream's `no_std` port is unfinished (stream.rs is
+// built on `std::io` buffering, t1.rs needs `thread_local!`, jp2.rs
+// needs byteorder over `std::io`) — upstream 0.6.1 fails
+// `--no-default-features` identically. Lead with one clear message
+// (follow-on resolution errors still collect below it); drop this
+// block if a rebase completes the port.
+#[cfg(not(feature = "std"))]
+compile_error!(
+  "vyna-openjp2 requires the `std` feature: no_std is unfinished upstream work"
+);
+
 #[cfg(not(feature = "std"))]
 #[macro_use]
 extern crate alloc;

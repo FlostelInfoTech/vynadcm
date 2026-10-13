@@ -44,6 +44,25 @@ lifetime; zero behaviour change.
   tile grid empty) and `image.x1/y1` are set after
   `opj_image::create`.
 
+## Features: `std` is required
+
+Upstream ships `std` / `file-io` features and `no_std` scaffolding
+(`extern crate alloc`, cfg'd imports), but the port was never
+finished: `stream.rs` is built on `std::io` buffering, `t1.rs` keeps
+its scratch state in a `thread_local!`, and `jp2.rs` uses byteorder
+over `std::io`. Upstream 0.6.1 fails `--no-default-features` with
+~28 errors, and this fork fails identically by design: completing
+the port would be a large, risky divergence in foreign code for a
+configuration VynaDCM never builds (the codec uses default
+features).
+
+Instead of failing with only the confusing errors, building
+without `std` leads with one explicit `compile_error!` in
+`src/lib.rs` (marked `VYNA-PATCH`). `file-io` without `std` stops
+there too. If upstream ever completes `no_std`, drop that block
+(and this section) during the rebase and add
+`--no-default-features` to CI.
+
 ## Re-basing onto a new upstream
 
 1. Copy the new `openjp2-<version>` crate sources over `src/`.
