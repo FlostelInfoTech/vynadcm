@@ -5,7 +5,7 @@
 //! ([`crate::hyper_server`]); embedders can also adapt `dispatch` to their
 //! own HTTP stack (as VynaLink does).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 use vyna_dcm_codec::{FileMeta, dataset_to_json, decode_pixels, read_part10, write_part10};
 use vyna_dcm_core::{DataSet, Tag, TransferSyntax, Value, Vr, lookup_keyword, tags};
@@ -183,8 +183,17 @@ pub struct MemoryStore {
 struct MemoryInner {
     instances: Vec<StoredInstance>,
     bulk: HashMap<String, (Vec<u8>, String)>,
-    bulk_seq: u64,
+    /// Insertion order for oldest-first bulk eviction.
+    bulk_order: VecDeque<String>,
+    /// Total bulk bytes currently held.
+    bulk_bytes: usize,
 }
+
+/// Oldest bulk blobs are evicted past these bounds (every metadata
+/// GET registers fresh blobs, so an unbounded store is a DoS).
+const MAX_BULK_BLOBS: usize = 10_000;
+/// See [`MAX_BULK_BLOBS`].
+const MAX_BULK_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct StoredInstance {
@@ -203,10 +212,17 @@ impl MemoryStore {
         Self::default()
     }
 
+    /// Lock the store, recovering from a poisoned mutex instead of
+    /// panicking: one panicked request handler must not wedge the
+    /// whole server.
+    fn lock(&self) -> std::sync::MutexGuard<'_, MemoryInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Number of stored instances.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().instances.len()
+        self.lock().instances.len()
     }
 
     /// True when empty.
@@ -227,12 +243,14 @@ impl DicomWebStore for MemoryStore {
         if limit == 0 {
             return Vec::new();
         }
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         let mut out = Vec::new();
         // Study-level responses de-duplicate by Study Instance UID.
         let mut seen_studies = std::collections::HashSet::new();
         let mut seen_series = std::collections::HashSet::new();
-        for inst in inner.instances.iter().skip(offset) {
+        // NOTE: offset applies to *matched* rows below, never to the raw
+        // store order — skipping here would page unfiltered instances.
+        for inst in inner.instances.iter() {
             if let Some(s) = &scope.study
                 && inst.study != *s
             {
@@ -260,15 +278,15 @@ impl DicomWebStore for MemoryStore {
             let mut ds = inst.dataset.clone();
             strip_bulk(&mut ds);
             out.push(ds);
-            if out.len() >= limit {
+            if out.len() >= offset.saturating_add(limit) {
                 break;
             }
         }
-        out
+        out.into_iter().skip(offset).take(limit).collect()
     }
 
     fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Vec<u8>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         inner
             .instances
             .iter()
@@ -282,7 +300,7 @@ impl DicomWebStore for MemoryStore {
         series: &str,
         instance: &str,
     ) -> Option<(DataSet, Vec<BulkBlob>)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         let inst = inner
             .instances
             .iter()
@@ -299,17 +317,19 @@ impl DicomWebStore for MemoryStore {
         instance: &str,
         frames: &[u32],
     ) -> Option<Vec<Vec<u8>>> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock();
         let inst = inner
             .instances
             .iter()
             .find(|i| i.study == study && i.series == series && i.instance == instance)?;
         let pixels = decode_pixels(&inst.dataset, inst.transfer_syntax).ok()?;
+        // decode_pixels already validated the frame count; absent means 1.
         let count: usize = inst
             .dataset
             .string(tags::NUMBER_OF_FRAMES)
             .and_then(|s| s.parse().ok())
-            .unwrap_or(1);
+            .unwrap_or(1)
+            .max(1);
         if pixels.len() % count.max(1) != 0 {
             return None;
         }
@@ -351,7 +371,7 @@ impl DicomWebStore for MemoryStore {
             ));
         }
         let ts = meta.transfer_syntax().map_err(|e| e.to_string())?;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock();
         // Replace on re-store (same SOP Instance UID).
         inner.instances.retain(|i| i.instance != instance);
         inner.instances.push(StoredInstance {
@@ -370,20 +390,31 @@ impl DicomWebStore for MemoryStore {
     }
 
     fn put_bulk(&self, blobs: Vec<(Vec<u8>, String)>) -> Vec<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock();
         blobs
             .into_iter()
             .map(|(bytes, ct)| {
-                inner.bulk_seq += 1;
-                let id = format!("{:x}", inner.bulk_seq);
+                // Unpredictable ids: sequential hex ids let anyone
+                // enumerate every stored blob.
+                let id = uuid::Uuid::new_v4().as_simple().to_string();
+                inner.bulk_bytes += bytes.len();
+                inner.bulk_order.push_back(id.clone());
                 inner.bulk.insert(id.clone(), (bytes, ct));
+                while inner.bulk.len() > MAX_BULK_BLOBS || inner.bulk_bytes > MAX_BULK_BYTES {
+                    let Some(oldest) = inner.bulk_order.pop_front() else {
+                        break;
+                    };
+                    if let Some((b, _)) = inner.bulk.remove(&oldest) {
+                        inner.bulk_bytes -= b.len();
+                    }
+                }
                 id
             })
             .collect()
     }
 
     fn bulk_data(&self, id: &str) -> Option<(Vec<u8>, String)> {
-        self.inner.lock().unwrap().bulk.get(id).cloned()
+        self.lock().bulk.get(id).cloned()
     }
 }
 
@@ -447,16 +478,30 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
             continue;
         }
         if let Some((lo, hi)) = alt.split_once('-') {
-            if !lo.is_empty()
-                && !hi.is_empty()
-                && values.iter().any(|v| v.as_str() >= lo && v.as_str() <= hi)
-            {
+            // Open-ended ranges are half-bounded; a bare `-` matches all.
+            let hit = match (!lo.is_empty(), !hi.is_empty()) {
+                (true, true) => values.iter().any(|v| v.as_str() >= lo && v.as_str() <= hi),
+                (true, false) => values.iter().any(|v| v.as_str() >= lo),
+                (false, true) => values.iter().any(|v| v.as_str() <= hi),
+                (false, false) => true,
+            };
+            if hit {
                 return true;
             }
             continue;
         }
         if let Some(prefix) = alt.strip_suffix('*') {
-            if values.iter().any(|v| v.starts_with(prefix)) {
+            // PN matching is case-insensitive (as for exact matches);
+            // byte-prefix slicing must respect UTF-8 boundaries.
+            let hit = if el.vr == Vr::Pn {
+                values.iter().any(|v| {
+                    v.get(..prefix.len())
+                        .is_some_and(|h| h.eq_ignore_ascii_case(prefix))
+                })
+            } else {
+                values.iter().any(|v| v.starts_with(prefix))
+            };
+            if hit {
                 return true;
             }
             continue;
@@ -580,7 +625,16 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                 list,
             ],
         ) => {
-            let frames: Vec<u32> = list.split(',').filter_map(|f| f.parse().ok()).collect();
+            // Every addressed frame must be a positive integer: bad
+            // entries are a 400 (not silently dropped, and frame 0 is
+            // invalid — frames are 1-based).
+            let mut frames = Vec::new();
+            for f in list.split(',') {
+                match f.parse::<u32>() {
+                    Ok(n) if n >= 1 => frames.push(n),
+                    _ => return HttpResponse::text(400, "bad frame list"),
+                }
+            }
             if frames.is_empty() {
                 return HttpResponse::text(400, "bad frame list");
             }
@@ -863,6 +917,52 @@ mod tests {
     }
 
     #[test]
+    fn qido_offset_applies_after_filters() {
+        let store = stored();
+        let count = |q: &str| {
+            let r = dispatch(&store, "http://x/wado", &get(q));
+            assert_eq!(r.status, 200);
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        // The filter matches only the second stored instance: offset
+        // pages the single match, not the raw store order (offset=1
+        // must yield nothing, not the second instance).
+        assert_eq!(count("/instances?SeriesInstanceUID=1.2.3.2"), 1);
+        assert_eq!(count("/instances?SeriesInstanceUID=1.2.3.2&offset=1"), 0);
+        assert_eq!(count("/instances?offset=1&limit=10"), 1);
+        assert_eq!(count("/instances?offset=9&limit=10"), 0);
+    }
+
+    #[test]
+    fn match_attribute_ranges_and_pn_prefix() {
+        use vyna_dcm_core::PersonName;
+        let mut ds = DataSet::new();
+        ds.put_text(tags::STUDY_DATE, Vr::Da, "20240115");
+        ds.put_person_name(tags::PATIENT_NAME, vec![PersonName::parse("Doe^John")]);
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "W123");
+        // Closed, open-ended, and bare-dash ranges.
+        assert!(match_attribute(&ds, tags::STUDY_DATE, "20240101-20240201"));
+        assert!(match_attribute(&ds, tags::STUDY_DATE, "20240101-"));
+        assert!(match_attribute(&ds, tags::STUDY_DATE, "-20240201"));
+        assert!(match_attribute(&ds, tags::STUDY_DATE, "-"));
+        assert!(!match_attribute(&ds, tags::STUDY_DATE, "20240201-"));
+        assert!(!match_attribute(&ds, tags::STUDY_DATE, "-20240101"));
+        assert!(!match_attribute(&ds, tags::STUDY_DATE, "20240201-20240301"));
+        // PN prefix is case-insensitive like PN exact match; other VRs
+        // keep case-sensitive prefixes.
+        assert!(match_attribute(&ds, tags::PATIENT_NAME, "doe^john"));
+        assert!(match_attribute(&ds, tags::PATIENT_NAME, "DOE^*"));
+        assert!(match_attribute(&ds, tags::PATIENT_NAME, "doe^j*"));
+        assert!(!match_attribute(&ds, tags::PATIENT_NAME, "SMITH*"));
+        assert!(match_attribute(&ds, tags::PATIENT_ID, "W*"));
+        assert!(!match_attribute(&ds, tags::PATIENT_ID, "w*"));
+    }
+
+    #[test]
     fn wado_instance_metadata_and_bulk() {
         let store = stored();
         let r = dispatch(
@@ -905,6 +1005,34 @@ mod tests {
     }
 
     #[test]
+    fn bulk_ids_are_unpredictable_and_evict_oldest() {
+        let store = MemoryStore::new();
+        let ids = store.put_bulk(vec![
+            (vec![1u8; 8], "application/octet-stream".to_string()),
+            (vec![2u8; 8], "application/octet-stream".to_string()),
+        ]);
+        // UUID-simple ids: 32 lowercase hex chars, unique.
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1]);
+        for id in &ids {
+            assert_eq!(id.len(), 32, "{id}");
+            assert!(id.bytes().all(|b| b.is_ascii_hexdigit()), "{id}");
+            assert!(store.bulk_data(id).is_some());
+        }
+        // Past the blob cap the oldest entries are evicted.
+        let mut first_extra = String::new();
+        for i in 0..(MAX_BULK_BLOBS + 10) {
+            let id = store.put_bulk(vec![(vec![0u8; 8], "application/octet-stream".to_string())]);
+            if i == 0 {
+                first_extra = id[0].clone();
+            }
+        }
+        assert!(store.bulk_data(&ids[0]).is_none(), "oldest must evict");
+        assert!(store.bulk_data(&first_extra).is_none());
+        assert_eq!(store.lock().bulk.len(), MAX_BULK_BLOBS);
+    }
+
+    #[test]
     fn frames_and_stow() {
         let store = stored();
         let r = dispatch(
@@ -913,6 +1041,25 @@ mod tests {
             &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/1"),
         );
         assert_eq!(r.status, 200);
+        // Bad frame addresses are 400 (not silently dropped); frame 0
+        // is invalid since frames are 1-based.
+        for bad in ["0", "1,banana", "x", "1,,2", "4294967297"] {
+            let r = dispatch(
+                &store,
+                "http://x/wado",
+                &get(&format!(
+                    "/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/{bad}"
+                )),
+            );
+            assert_eq!(r.status, 400, "{bad}");
+        }
+        // A well-formed but absent frame stays 404.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/2"),
+        );
+        assert_eq!(r.status, 404);
 
         let file = test_file("9.9.9", "9.9.9.1", "9.9.9.1.1", 2, 2);
         let (ct, body) = encode_multipart(

@@ -5,6 +5,65 @@ the workspace crate version (`Cargo.toml`).
 
 ## [Unreleased]
 
+### Fixed (security)
+
+- DICOMweb client no longer forwards `Authorization` to cross-origin
+  `BulkDataURI`s (SSRF/credential leak); same-origin keeps auth.
+- Part-10 decoder bounds every read by the enclosing item end
+  (overrunning element lengths now fail instead of silently
+  consuming the next item); length arithmetic is saturating.
+- Planar Configuration 1 conversion handles every frame (frames 2+
+  were zero-filled) and errors on truncated input.
+- DICOMweb server: optional bearer-token auth (`ServerAuth`,
+  `wadorsd --Bearer [REDACTED] plus plaintext/PHI warnings.
+
+### Fixed (denial of service)
+
+- STOW bodies stream against the 1 GiB cap instead of
+  collect-then-check; Deflated datasets inflate against a 512 MiB
+  cap; DICOM JSON/XML parsing caps nesting depth at 64.
+- Associations cap reassembled DIMSE messages (new
+  `AssociationOptions::max_message_bytes`, default 1 GiB, new
+  `Error::MessageTooLarge`).
+- Bulk store uses unpredictable UUID ids with oldest-first eviction
+  (10k blobs / 1 GiB).
+
+### Fixed (correctness)
+
+- QIDO `offset`/`limit` paginate matched rows, not raw store order.
+- QIDO ranges: open-ended `lo-`/`-hi` and bare `-` match per DICOM
+  semantics; PN prefix matching is case-insensitive.
+- WADO frame lists reject bad entries with 400 (frame 0 included);
+  absent frames stay 404.
+- PDU item/user-identity/role lengths error past 65535 instead of
+  truncating; `propose` errors past 128 SOP classes instead of
+  wrapping context IDs (now returns `Result`).
+- MPPS N-SET can no longer rewrite the stamped SOP Class/Instance
+  UIDs; poisoned store locks recover instead of panicking.
+- DICOM JSON round-trips non-finite floats as `"NaN"`/`"Infinity"`/
+  `"-Infinity"` (DS `"NaN"` stays a string) instead of null;
+  `InlineBinary` is restricted to bulk-data VRs (JSON and XML).
+- XML numeric VRs reject `Item`/`PersonName` children instead of
+  dropping them; multipart bodies require the closing delimiter.
+- `movescu`/`getscu`/`mppsscu`/`stgcmtscu` require feature `net`
+  (cli-only builds were broken).
+- Smaller fixes: big-endian PNG export swaps pairs; `float_list`
+  covers integer VRs; bad Number of Frames errors (absent still
+  means 1); fragment padding only at stream end; ECG recordings
+  validate shape/rate; zero Encapsulated Document Length no longer
+  empties the document; directory scans never follow symlinks;
+  DICOMweb client defaults to a 300 s timeout; TLS server names
+  handle IPv6; `dcmodify` in-place writes use unique create-new
+  temp files; `storescp` logs patient names only with `--verbose`.
+
+### Added
+
+- `.gitlab-ci.yml` gates (fmt, clippy `-D warnings`, workspace
+  tests, feature-combination builds); root `Cargo.lock` is now
+  tracked for reproducible binary builds.
+- `AcceptorOptions::strict()` plus Called-AE/SOP hardening docs;
+  stale doc counts/versions refreshed.
+
 ## [0.3.0] — 2026-10-12
 
 ### Added

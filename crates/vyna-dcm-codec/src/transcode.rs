@@ -86,7 +86,7 @@ pub fn transcode_dataset(
                 message: "planar YBR_FULL_422 has unequal planes and is not supported".into(),
             });
         }
-        raw = deinterleave_planar(&raw, &geo);
+        raw = deinterleave_planar(&raw, &geo)?;
     }
     // Decoded bytes are RGB when stored that way or when a JPEG
     // decoder produced them (native/RLE YBR stays stored-form).
@@ -349,26 +349,50 @@ impl Geometry {
 }
 
 /// Swap 16-bit sample byte order (big-endian working conversion).
-fn swap_pairs(raw: &mut [u8]) {
+pub(crate) fn swap_pairs(raw: &mut [u8]) {
     for pair in raw.as_chunks_mut::<2>().0 {
         pair.swap(0, 1);
     }
 }
 
 /// Color-by-plane (concatenated planes) to color-by-pixel (interleaved).
-pub(crate) fn deinterleave_planar(raw: &[u8], geo: &Geometry) -> Vec<u8> {
-    let pixels = geo.rows as usize * geo.columns as usize;
+///
+/// Planar Configuration 1 stores *each frame* as concatenated planes
+/// (`RRR...GGG...BBB`), so every frame is converted independently.
+pub(crate) fn deinterleave_planar(raw: &[u8], geo: &Geometry) -> Result<Vec<u8>> {
+    let pixels = (geo.rows as usize).saturating_mul(geo.columns as usize);
     let bps = geo.bits.div_ceil(8) as usize;
-    let plane = pixels * bps;
+    let plane = pixels.saturating_mul(bps);
+    let frame_stride = plane.saturating_mul(geo.samples as usize);
+    if frame_stride == 0 {
+        return Err(Error::BadValue {
+            tag: tags::PLANAR_CONFIGURATION,
+            vr: Vr::Us,
+            message: "planar de-interleave with empty frame geometry".into(),
+        });
+    }
+    if raw.len() < frame_stride || !raw.len().is_multiple_of(frame_stride) {
+        return Err(Error::BadValue {
+            tag: tags::PLANAR_CONFIGURATION,
+            vr: Vr::Us,
+            message: format!(
+                "planar pixel data is {} bytes, not a whole number of {}-byte frames",
+                raw.len(),
+                frame_stride
+            ),
+        });
+    }
     let mut out = vec![0u8; raw.len()];
-    for p in 0..pixels {
-        for c in 0..geo.samples as usize {
-            let src = c * plane + p * bps;
-            let dst = (p * geo.samples as usize + c) * bps;
-            out[dst..dst + bps].copy_from_slice(&raw[src..src + bps]);
+    for base in (0..raw.len()).step_by(frame_stride) {
+        for p in 0..pixels {
+            for c in 0..geo.samples as usize {
+                let src = base + c * plane + p * bps;
+                let dst = base + (p * geo.samples as usize + c) * bps;
+                out[dst..dst + bps].copy_from_slice(&raw[src..src + bps]);
+            }
         }
     }
-    out
+    Ok(out)
 }
 
 /// BT.601 `YBR_FULL` / `YBR_FULL_422` to interleaved RGB (8-bit only).
@@ -776,6 +800,28 @@ mod tests {
         let back =
             transcode_dataset(&out, TransferSyntax::RleLossless, TS_EXPLICIT, &opts()).unwrap();
         assert_eq!(pixel_bytes(&back), raw);
+    }
+
+    #[test]
+    fn planar_multiframe_converts_every_frame() {
+        // Two frames, each stored as concatenated planes: frame 2 must
+        // convert too (not stay zero-filled).
+        let f1 = rgb(4, 4);
+        let f2: Vec<u8> = f1.iter().map(|v| 255 - v).collect();
+        let mut planar = to_planar(&f1);
+        planar.extend_from_slice(&to_planar(&f2));
+        let mut expected = f1.clone();
+        expected.extend_from_slice(&f2);
+        let mut ds = descriptors(4, 4, 3, 8, 2, "RGB", Some(1));
+        ds.put_bytes(tags::PIXEL_DATA, Vr::Ob, planar);
+        let geo = Geometry::read(&ds).unwrap();
+        assert_eq!(
+            deinterleave_planar(pixel_bytes(&ds).as_slice(), &geo).unwrap(),
+            expected
+        );
+        // Truncated planar input errors instead of panicking.
+        let short = vec![0u8; 4 * 4 * 3 - 1];
+        assert!(deinterleave_planar(&short, &geo).is_err());
     }
 
     #[test]

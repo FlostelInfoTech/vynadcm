@@ -561,11 +561,18 @@ fn decode_user_identity(sv: &[u8]) -> Result<UserIdentity> {
 
 // -- encode ---------------------------------------------------------------
 
-fn put_item(out: &mut Vec<u8>, typ: u8, value: &[u8]) {
+/// A PDU item length field: oversized values error out rather than
+/// being silently truncated onto the wire by `as u16`.
+fn item_len(len: usize, what: &'static str) -> Result<u16> {
+    u16::try_from(len).map_err(|_| Error::BadPdu(format!("{what} exceeds 65535 bytes")))
+}
+
+fn put_item(out: &mut Vec<u8>, typ: u8, value: &[u8]) -> Result<()> {
     out.push(typ);
     out.push(0);
-    out.extend_from_slice(&(value.len() as u16).to_be_bytes());
+    out.extend_from_slice(&item_len(value.len(), "PDU item")?.to_be_bytes());
     out.extend_from_slice(value);
+    Ok(())
 }
 
 fn encode_assoc_rq(rq: &AssociateRq) -> Result<Vec<u8>> {
@@ -575,53 +582,55 @@ fn encode_assoc_rq(rq: &AssociateRq) -> Result<Vec<u8>> {
     out.extend_from_slice(&rq.called_ae.to_wire());
     out.extend_from_slice(&rq.calling_ae.to_wire());
     out.extend_from_slice(&[0u8; 32]);
-    put_item(&mut out, 0x10, rq.application_context.as_bytes());
+    put_item(&mut out, 0x10, rq.application_context.as_bytes())?;
     for pc in &rq.presentation_contexts {
         let mut v = vec![pc.id, 0, 0, 0];
-        put_item(&mut v, 0x30, pc.abstract_syntax.as_bytes());
+        put_item(&mut v, 0x30, pc.abstract_syntax.as_bytes())?;
         for ts in &pc.transfer_syntaxes {
-            put_item(&mut v, 0x40, ts.as_bytes());
+            put_item(&mut v, 0x40, ts.as_bytes())?;
         }
-        put_item(&mut out, 0x20, &v);
+        put_item(&mut out, 0x20, &v)?;
     }
-    put_item(&mut out, 0x50, &encode_user_info_rq(rq));
+    put_item(&mut out, 0x50, &encode_user_info_rq(rq)?)?;
     Ok(out)
 }
 
-fn encode_user_info_rq(rq: &AssociateRq) -> Vec<u8> {
+fn encode_user_info_rq(rq: &AssociateRq) -> Result<Vec<u8>> {
     let mut u = Vec::new();
-    put_item(&mut u, 0x51, &rq.max_pdu_len.to_be_bytes());
-    put_item(&mut u, 0x52, rq.implementation_class_uid.as_bytes());
+    put_item(&mut u, 0x51, &rq.max_pdu_len.to_be_bytes())?;
+    put_item(&mut u, 0x52, rq.implementation_class_uid.as_bytes())?;
     if let Some(v) = &rq.implementation_version {
-        put_item(&mut u, 0x55, v.as_bytes());
+        put_item(&mut u, 0x55, v.as_bytes())?;
     }
     if let Some((inv, perf)) = rq.async_ops {
         let mut v = Vec::new();
         v.extend_from_slice(&inv.to_be_bytes());
         v.extend_from_slice(&perf.to_be_bytes());
-        put_item(&mut u, 0x53, &v);
+        put_item(&mut u, 0x53, &v)?;
     }
     for r in &rq.role_selection {
-        put_item(&mut u, 0x54, &encode_role(r));
+        put_item(&mut u, 0x54, &encode_role(r)?)?;
     }
     if let Some(id) = &rq.user_identity {
         let mut v = vec![id.identity_type, id.positive_response_requested as u8];
-        v.extend_from_slice(&(id.primary.len() as u16).to_be_bytes());
+        v.extend_from_slice(&item_len(id.primary.len(), "user identity primary")?.to_be_bytes());
         v.extend_from_slice(&id.primary);
-        v.extend_from_slice(&(id.secondary.len() as u16).to_be_bytes());
+        v.extend_from_slice(
+            &item_len(id.secondary.len(), "user identity secondary")?.to_be_bytes(),
+        );
         v.extend_from_slice(&id.secondary);
-        put_item(&mut u, 0x58, &v);
+        put_item(&mut u, 0x58, &v)?;
     }
-    u
+    Ok(u)
 }
 
-fn encode_role(r: &RoleSelection) -> Vec<u8> {
+fn encode_role(r: &RoleSelection) -> Result<Vec<u8>> {
     let mut v = Vec::new();
-    v.extend_from_slice(&(r.sop_class_uid.len() as u16).to_be_bytes());
+    v.extend_from_slice(&item_len(r.sop_class_uid.len(), "role selection UID")?.to_be_bytes());
     v.extend_from_slice(r.sop_class_uid.as_bytes());
     v.push(r.scu_role as u8);
     v.push(r.scp_role as u8);
-    v
+    Ok(v)
 }
 
 fn encode_assoc_ac(ac: &AssociateAc) -> Result<Vec<u8>> {
@@ -629,36 +638,36 @@ fn encode_assoc_ac(ac: &AssociateAc) -> Result<Vec<u8>> {
     out.extend_from_slice(&1u16.to_be_bytes());
     out.extend_from_slice(&[0, 0]);
     out.extend_from_slice(&[0u8; 64]); // AE-sized + trailing fields are reserved in AC
-    put_item(&mut out, 0x10, ac.application_context.as_bytes());
+    put_item(&mut out, 0x10, ac.application_context.as_bytes())?;
     for pc in &ac.presentation_contexts {
         let mut v = vec![pc.id, pc.result, 0, 0];
         if let Some(ts) = &pc.transfer_syntax {
-            put_item(&mut v, 0x40, ts.as_bytes());
+            put_item(&mut v, 0x40, ts.as_bytes())?;
         }
-        put_item(&mut out, 0x21, &v);
+        put_item(&mut out, 0x21, &v)?;
     }
     let mut u = Vec::new();
-    put_item(&mut u, 0x51, &ac.max_pdu_len.to_be_bytes());
-    put_item(&mut u, 0x52, ac.implementation_class_uid.as_bytes());
+    put_item(&mut u, 0x51, &ac.max_pdu_len.to_be_bytes())?;
+    put_item(&mut u, 0x52, ac.implementation_class_uid.as_bytes())?;
     if let Some(v) = &ac.implementation_version {
-        put_item(&mut u, 0x55, v.as_bytes());
+        put_item(&mut u, 0x55, v.as_bytes())?;
     }
     if let Some((inv, perf)) = ac.async_ops {
         let mut v = Vec::new();
         v.extend_from_slice(&inv.to_be_bytes());
         v.extend_from_slice(&perf.to_be_bytes());
-        put_item(&mut u, 0x53, &v);
+        put_item(&mut u, 0x53, &v)?;
     }
     for r in &ac.role_selection {
-        put_item(&mut u, 0x54, &encode_role(r));
+        put_item(&mut u, 0x54, &encode_role(r)?)?;
     }
     if let Some(resp) = &ac.user_identity_response {
         let mut v = Vec::new();
-        v.extend_from_slice(&(resp.len() as u16).to_be_bytes());
+        v.extend_from_slice(&item_len(resp.len(), "user identity response")?.to_be_bytes());
         v.extend_from_slice(resp);
-        put_item(&mut u, 0x58, &v);
+        put_item(&mut u, 0x58, &v)?;
     }
-    put_item(&mut out, 0x50, &u);
+    put_item(&mut out, 0x50, &u)?;
     Ok(out)
 }
 
@@ -700,6 +709,15 @@ mod tests {
         let (_, bytes) = encode_pdu(&Pdu::AssociateRq(rq.clone())).unwrap();
         let back = decode_pdu(0x01, &bytes).unwrap();
         assert_eq!(back, Pdu::AssociateRq(rq));
+    }
+
+    #[test]
+    fn oversized_items_error_instead_of_truncating() {
+        assert!(item_len(65535, "test").is_ok());
+        assert!(item_len(65536, "test").is_err());
+        let mut rq = sample_rq();
+        rq.presentation_contexts[0].abstract_syntax = "1.".repeat(40000);
+        assert!(encode_pdu(&Pdu::AssociateRq(rq)).is_err());
     }
 
     #[test]

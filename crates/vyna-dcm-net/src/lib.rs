@@ -23,7 +23,7 @@
 //!     &AeTitle::new("VYNA_SCU")?,
 //!     &AeTitle::new("PACS")?,
 //!     "127.0.0.1:11112",
-//!     propose(&[sop_class::VERIFICATION], &[TransferSyntax::ExplicitVrLittleEndian]),
+//!     propose(&[sop_class::VERIFICATION], &[TransferSyntax::ExplicitVrLittleEndian])?,
 //! )
 //! .await?;
 //! let status = assoc.echo(sop_class::VERIFICATION).await?;

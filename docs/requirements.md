@@ -377,14 +377,14 @@ Rust 1.98+, edition 2024, async via tokio, proprietary license
   code beyond what dependencies require.
 - **NFR-06 (M)** Determinism: encoders emit canonical output so
   dataset/Part-10/JSON round-trips are stable.
-- **NFR-07 (M)** Quality gates for every change: unit + doc tests
-  green (currently 167 + 2 + 7), `cargo clippy --workspace --all-targets`
+- **NFR-07 (M)** Quality gates for every change: unit + integration
+  + doc tests green, `cargo clippy --workspace --all-targets`
   with zero warnings, `cargo fmt --check` clean.
 - **NFR-08 (S)** Documentation: public API documented
   (`missing_docs` enforced); this SRS, the design spec, integration
   and user guides, and the SBOM are maintained as living documents.
 
-## 5. Out of scope (v0.1)
+## 5. Out of scope (v0.3)
 
 JPEG Extended 12-bit (`.51`), JPEG 2000 Part 2, and HTJ2K pixel
 codecs; private-vendor dictionaries; media interchange (PS3.11/12); print

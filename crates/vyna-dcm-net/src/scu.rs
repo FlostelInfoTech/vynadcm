@@ -573,7 +573,8 @@ mod tests {
                     vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian,
                     vyna_dcm_core::TransferSyntax::ImplicitVrLittleEndian,
                 ],
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -661,7 +662,8 @@ mod tests {
                     vyna_dcm_core::sop_class::STUDY_ROOT_FIND,
                 ],
                 &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -725,7 +727,8 @@ mod tests {
             propose(
                 &[sop],
                 &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -817,7 +820,8 @@ mod tests {
             propose(
                 &[sop],
                 &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();
@@ -913,7 +917,8 @@ mod tests {
                     vyna_dcm_core::sop_class::CT_IMAGE,
                 ],
                 &ts,
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();

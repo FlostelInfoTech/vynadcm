@@ -1,0 +1,30 @@
+# VynaDCM quality gates (see NFR-07 in docs/requirements.md).
+image: rust:1.98
+
+stages: [lint, test]
+
+variables:
+  CARGO_TERM_COLOR: never
+  CARGO_NET_RETRY: "3"
+
+fmt:
+  stage: lint
+  script: cargo fmt --all -- --check
+
+clippy:
+  stage: lint
+  script: cargo clippy --workspace --all-targets -- -D warnings
+
+test:
+  stage: test
+  script: cargo test --workspace
+
+# Every feature combination must build (guards feature-gate drift
+# between the bins and the optional net/web/ecg dependencies).
+features:
+  stage: test
+  script:
+    - cargo check -p vyna-dcm --no-default-features
+    - cargo check -p vyna-dcm --no-default-features --features cli
+    - cargo check -p vyna-dcm --no-default-features --features cli,net
+    - cargo check -p vyna-dcm --no-default-features --features cli,web

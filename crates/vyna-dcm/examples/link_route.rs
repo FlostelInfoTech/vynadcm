@@ -48,7 +48,8 @@ impl Handlers for Forwarder {
                     TransferSyntax::ExplicitVrLittleEndian,
                     TransferSyntax::ImplicitVrLittleEndian,
                 ],
-            ),
+            )
+            .unwrap(),
         )
         .await
         {

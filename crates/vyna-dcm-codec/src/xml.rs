@@ -20,7 +20,7 @@ use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use vyna_dcm_core::{DataElement, DataSet, NameComponents, PersonName, Tag, Value, Vr, lookup};
 
-use crate::json::{parse_tag_key, tag_key};
+use crate::json::{allows_inline_binary, parse_tag_key, tag_key};
 use crate::{Error, Result};
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
@@ -212,7 +212,7 @@ pub fn dataset_from_xml(xml: &str) -> Result<DataSet> {
     loop {
         match next(&mut reader, &mut buf)? {
             Event::Start(e) if is(&e, b"NativeDicomModel") => {
-                return read_attributes(&mut reader, &mut buf, b"NativeDicomModel");
+                return read_attributes(&mut reader, &mut buf, b"NativeDicomModel", 0);
             }
             Event::Empty(e) if is(&e, b"NativeDicomModel") => return Ok(DataSet::new()),
             Event::Eof => return Err(Error::Xml("missing NativeDicomModel root".into())),
@@ -232,14 +232,25 @@ fn is(e: &BytesStart<'_>, name: &[u8]) -> bool {
     e.name().as_ref() == name
 }
 
+/// Maximum XML nesting depth (stack-exhaustion guard).
+const MAX_XML_DEPTH: usize = 64;
+
 /// Read `DicomAttribute` children until `</end>`.
-fn read_attributes(reader: &mut Reader<&[u8]>, buf: &mut Vec<u8>, end: &[u8]) -> Result<DataSet> {
+fn read_attributes(
+    reader: &mut Reader<&[u8]>,
+    buf: &mut Vec<u8>,
+    end: &[u8],
+    depth: usize,
+) -> Result<DataSet> {
+    if depth > MAX_XML_DEPTH {
+        return Err(Error::Xml("nesting too deep".into()));
+    }
     let mut ds = DataSet::new();
     loop {
         match next(reader, buf)? {
             Event::Start(e) if is(&e, b"DicomAttribute") => {
                 let (tag, vr) = attribute_head(&e)?;
-                ds.insert(read_attribute_body(reader, buf, tag, vr)?);
+                ds.insert(read_attribute_body(reader, buf, tag, vr, depth)?);
             }
             Event::Empty(e) if is(&e, b"DicomAttribute") => {
                 let (tag, vr) = attribute_head(&e)?;
@@ -289,6 +300,7 @@ fn read_attribute_body(
     buf: &mut Vec<u8>,
     tag: Tag,
     vr: Vr,
+    depth: usize,
 ) -> Result<DataElement> {
     let mut texts = Vec::new();
     let mut names = Vec::new();
@@ -314,7 +326,7 @@ fn read_attribute_body(
                 saw.push("PersonName");
             }
             Event::Start(e) if is(&e, b"Item") => {
-                items.push(read_attributes(reader, buf, b"Item")?);
+                items.push(read_attributes(reader, buf, b"Item", depth + 1)?);
                 saw.push("Item");
             }
             Event::Empty(e) if is(&e, b"Item") => {
@@ -531,8 +543,8 @@ fn build_value(
         if saw.len() != 1 {
             return Err(bad("InlineBinary must be the only child"));
         }
-        if vr == Vr::Sq {
-            return Err(bad("InlineBinary with SQ"));
+        if !allows_inline_binary(vr) {
+            return Err(bad("InlineBinary not allowed for this VR"));
         }
         // Fragments arrive joined (as in the JSON mapping); callers
         // re-fragment for encapsulated syntaxes.
@@ -585,46 +597,66 @@ fn build_value(
             }
             Ok(Value::Text(texts))
         }
-        Vr::Us => texts
-            .iter()
-            .map(|s| parse_int(s, tag))
-            .collect::<Result<_>>()
-            .map(Value::U16),
-        Vr::Ss => texts
-            .iter()
-            .map(|s| parse_int(s, tag))
-            .collect::<Result<_>>()
-            .map(Value::I16),
-        Vr::Ul | Vr::Ol => texts
-            .iter()
-            .map(|s| parse_int(s, tag))
-            .collect::<Result<_>>()
-            .map(Value::U32),
-        Vr::Sl => texts
-            .iter()
-            .map(|s| parse_int(s, tag))
-            .collect::<Result<_>>()
-            .map(Value::I32),
-        Vr::Uv | Vr::Ov => texts
-            .iter()
-            .map(|s| parse_int(s, tag))
-            .collect::<Result<_>>()
-            .map(Value::U64),
-        Vr::Sv => texts
-            .iter()
-            .map(|s| parse_int(s, tag))
-            .collect::<Result<_>>()
-            .map(Value::I64),
-        Vr::Fl | Vr::Of => texts
-            .iter()
-            .map(|s| parse_float(s, tag))
-            .collect::<Result<_>>()
-            .map(Value::F32),
-        Vr::Fd | Vr::Od => texts
-            .iter()
-            .map(|s| parse_float(s, tag))
-            .collect::<Result<_>>()
-            .map(Value::F64),
+        Vr::Us
+        | Vr::Ss
+        | Vr::Ul
+        | Vr::Ol
+        | Vr::Sl
+        | Vr::Uv
+        | Vr::Ov
+        | Vr::Sv
+        | Vr::Fl
+        | Vr::Of
+        | Vr::Fd
+        | Vr::Od => {
+            // Numeric VRs hold Value children only: Item/PersonName
+            // children must error, not silently vanish.
+            if !names.is_empty() || !items.is_empty() {
+                return Err(bad("numeric VRs hold Value children only"));
+            }
+            match vr {
+                Vr::Us => texts
+                    .iter()
+                    .map(|s| parse_int(s, tag))
+                    .collect::<Result<_>>()
+                    .map(Value::U16),
+                Vr::Ss => texts
+                    .iter()
+                    .map(|s| parse_int(s, tag))
+                    .collect::<Result<_>>()
+                    .map(Value::I16),
+                Vr::Ul | Vr::Ol => texts
+                    .iter()
+                    .map(|s| parse_int(s, tag))
+                    .collect::<Result<_>>()
+                    .map(Value::U32),
+                Vr::Sl => texts
+                    .iter()
+                    .map(|s| parse_int(s, tag))
+                    .collect::<Result<_>>()
+                    .map(Value::I32),
+                Vr::Uv | Vr::Ov => texts
+                    .iter()
+                    .map(|s| parse_int(s, tag))
+                    .collect::<Result<_>>()
+                    .map(Value::U64),
+                Vr::Sv => texts
+                    .iter()
+                    .map(|s| parse_int(s, tag))
+                    .collect::<Result<_>>()
+                    .map(Value::I64),
+                Vr::Fl | Vr::Of => texts
+                    .iter()
+                    .map(|s| parse_float(s, tag))
+                    .collect::<Result<_>>()
+                    .map(Value::F32),
+                _ => texts
+                    .iter()
+                    .map(|s| parse_float(s, tag))
+                    .collect::<Result<_>>()
+                    .map(Value::F64),
+            }
+        }
         Vr::Ob | Vr::Ow | Vr::Un => Err(bad("byte VRs need InlineBinary")),
         Vr::Si => Err(bad("retired SI unsupported in XML")),
     }
@@ -758,6 +790,33 @@ mod tests {
         assert!(dataset_from_xml(&bad).is_err());
         // Missing root is refused.
         assert!(dataset_from_xml("<Nothing/>").is_err());
+        // Item/PersonName children under a numeric VR are refused
+        // (not silently dropped).
+        let bad = wrap(
+            r#"<DicomAttribute tag="00280010" vr="US"><Value number="1">1</Value><Item number="1"/></DicomAttribute>"#,
+        );
+        assert!(dataset_from_xml(&bad).is_err());
+        let bad = wrap(r#"<DicomAttribute tag="00280010" vr="US"><PersonName/></DicomAttribute>"#);
+        assert!(dataset_from_xml(&bad).is_err());
+        // InlineBinary under a non-bulk VR is refused.
+        let bad = wrap(
+            r#"<DicomAttribute tag="00280010" vr="US"><InlineBinary>AA==</InlineBinary></DicomAttribute>"#,
+        );
+        assert!(dataset_from_xml(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_items() {
+        let mut body = String::from(
+            r#"<DicomAttribute tag="00100020" vr="LO"><Value number="1">x</Value></DicomAttribute>"#,
+        );
+        for n in 0..(MAX_XML_DEPTH + 8) {
+            body = format!(
+                r#"<DicomAttribute tag="00081140" vr="SQ"><Item number="{n}">{body}</Item></DicomAttribute>"#
+            );
+        }
+        let xml = format!("<NativeDicomModel>{body}</NativeDicomModel>");
+        assert!(dataset_from_xml(&xml).is_err());
     }
 
     #[test]

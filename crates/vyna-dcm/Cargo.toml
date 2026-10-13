@@ -160,22 +160,22 @@ required-features = ["cli"]
 [[bin]]
 name = "movescu"
 path = "src/bin/movescu.rs"
-required-features = ["cli"]
+required-features = ["cli", "net"]
 
 [[bin]]
 name = "getscu"
 path = "src/bin/getscu.rs"
-required-features = ["cli"]
+required-features = ["cli", "net"]
 
 [[bin]]
 name = "mppsscu"
 path = "src/bin/mppsscu.rs"
-required-features = ["cli"]
+required-features = ["cli", "net"]
 
 [[bin]]
 name = "stgcmtscu"
 path = "src/bin/stgcmtscu.rs"
-required-features = ["cli"]
+required-features = ["cli", "net"]
 
 [[bin]]
 name = "stgcmtscp"

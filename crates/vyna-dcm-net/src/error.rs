@@ -74,6 +74,13 @@ pub enum Error {
     #[error("operation timed out: {0}")]
     Timeout(&'static str),
 
+    /// A reassembled DIMSE command or dataset exceeded the size cap.
+    #[error("DIMSE message exceeds {limit} bytes")]
+    MessageTooLarge {
+        /// Configured cap in bytes.
+        limit: u64,
+    },
+
     /// Invalid AE title.
     #[error("invalid AE title `{0}`: {1}")]
     BadAeTitle(String, &'static str),

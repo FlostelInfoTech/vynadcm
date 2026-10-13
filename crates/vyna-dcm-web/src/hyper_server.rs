@@ -18,11 +18,52 @@ use crate::server::{DicomWebStore, HttpRequest, dispatch};
 /// Cap for STOW request bodies (1 GiB).
 pub const MAX_BODY_LEN: usize = 1024 * 1024 * 1024;
 
+/// Optional access control for the plain-HTTP front end.
+///
+/// WARNING: this server speaks unencrypted HTTP and, with default
+/// settings, accepts every request without authentication. DICOM
+/// payloads routinely contain PHI: bind to loopback only, or put a
+/// TLS-terminating reverse proxy (with its own auth) in front, and
+/// consider setting [`ServerAuth::bearer_token`].
+#[derive(Clone, Debug, Default)]
+pub struct ServerAuth {
+    /// When set, every request must carry
+    /// `Authorization: Bearer <token>` or gets `401 Unauthorized`.
+    pub bearer_token: Option<String>,
+}
+
+/// Whether `headers` (lowercased names) satisfy `auth`.
+fn authorized(headers: &std::collections::HashMap<String, String>, auth: &ServerAuth) -> bool {
+    let Some(expected) = auth.bearer_token.as_deref() else {
+        return true;
+    };
+    let Some(got) = headers.get("authorization") else {
+        return false;
+    };
+    let Some(token) = got.strip_prefix("Bearer ") else {
+        return false;
+    };
+    token == expected
+}
+
 /// Serve one TCP connection (HTTP/1.1, keep-alive) to completion.
+///
+/// See [`ServerAuth`] for the plaintext/no-auth warning; use
+/// [`serve_connection_with_auth`] to require a bearer token.
 pub async fn serve_connection<S: DicomWebStore + 'static>(
     store: Arc<S>,
     public_base: String,
     tcp: TcpStream,
+) -> Result<(), String> {
+    serve_connection_with_auth(store, public_base, tcp, ServerAuth::default()).await
+}
+
+/// [`serve_connection`] with access control (see [`ServerAuth`]).
+pub async fn serve_connection_with_auth<S: DicomWebStore + 'static>(
+    store: Arc<S>,
+    public_base: String,
+    tcp: TcpStream,
+    auth: ServerAuth,
 ) -> Result<(), String> {
     let io = TokioIo::new(tcp);
     http1::Builder::new()
@@ -31,7 +72,8 @@ pub async fn serve_connection<S: DicomWebStore + 'static>(
             service_fn(move |req: Request<hyper::body::Incoming>| {
                 let store = store.clone();
                 let public_base = public_base.clone();
-                async move { handle_one(store.as_ref(), &public_base, req).await }
+                let auth = auth.clone();
+                async move { handle_one(store.as_ref(), &public_base, req, &auth).await }
             }),
         )
         .await
@@ -39,19 +81,32 @@ pub async fn serve_connection<S: DicomWebStore + 'static>(
 }
 
 /// Bind and serve forever (each connection in its own task).
+///
+/// See [`ServerAuth`] for the plaintext/no-auth warning; use
+/// [`serve_forever_with_auth`] to require a bearer token.
 pub async fn serve_forever<S: DicomWebStore + 'static>(
     store: Arc<S>,
     public_base: String,
     bind: SocketAddr,
+) -> Result<(), String> {
+    serve_forever_with_auth(store, public_base, bind, ServerAuth::default()).await
+}
+
+/// [`serve_forever`] with access control (see [`ServerAuth`]).
+pub async fn serve_forever_with_auth<S: DicomWebStore + 'static>(
+    store: Arc<S>,
+    public_base: String,
+    bind: SocketAddr,
+    auth: ServerAuth,
 ) -> Result<(), String> {
     let listener = TcpListener::bind(bind).await.map_err(|e| e.to_string())?;
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
             continue;
         };
-        let (store, public_base) = (store.clone(), public_base.clone());
+        let (store, public_base, auth) = (store.clone(), public_base.clone(), auth.clone());
         tokio::spawn(async move {
-            if let Err(e) = serve_connection(store, public_base, tcp).await {
+            if let Err(e) = serve_connection_with_auth(store, public_base, tcp, auth).await {
                 tracing::warn!("DICOMweb connection error: {e}");
             }
         });
@@ -62,14 +117,42 @@ async fn handle_one<S: DicomWebStore>(
     store: &S,
     public_base: &str,
     req: Request<hyper::body::Incoming>,
+    auth: &ServerAuth,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let (parts, body) = req.into_parts();
-    let raw_body = body.collect().await?.to_bytes();
-    if raw_body.len() > MAX_BODY_LEN {
-        let mut resp = Response::new(Full::new(Bytes::from_static(b"request body too large")));
-        *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
+    let mut headers = std::collections::HashMap::new();
+    for (name, value) in parts.headers.iter() {
+        if let Ok(v) = value.to_str() {
+            headers.insert(name.as_str().to_ascii_lowercase(), v.to_string());
+        }
+    }
+    if !authorized(&headers, auth) {
+        let mut resp = Response::new(Full::new(Bytes::from_static(b"unauthorized")));
+        *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
+        resp.headers_mut().insert(
+            hyper::header::WWW_AUTHENTICATE,
+            hyper::header::HeaderValue::from_static("Bearer"),
+        );
         return Ok(resp);
     }
+    // Stream the body with an early cap: collecting first and
+    // checking after would let a huge STOW eat memory before the
+    // limit ever applied.
+    let mut raw_body = Vec::new();
+    let mut body = body;
+    while let Some(frame) = body.frame().await {
+        let frame = frame?;
+        if let Some(data) = frame.data_ref() {
+            if raw_body.len() + data.len() > MAX_BODY_LEN {
+                let mut resp =
+                    Response::new(Full::new(Bytes::from_static(b"request body too large")));
+                *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
+                return Ok(resp);
+            }
+            raw_body.extend_from_slice(data);
+        }
+    }
+    let raw_body = Bytes::from(raw_body);
     let path_query = parts
         .uri
         .path_and_query()
@@ -79,12 +162,6 @@ async fn handle_one<S: DicomWebStore>(
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (path_query.to_string(), String::new()),
     };
-    let mut headers = std::collections::HashMap::new();
-    for (name, value) in parts.headers.iter() {
-        if let Ok(v) = value.to_str() {
-            headers.insert(name.as_str().to_ascii_lowercase(), v.to_string());
-        }
-    }
     let hreq = HttpRequest {
         method: parts.method.to_string(),
         path,
@@ -112,6 +189,26 @@ mod tests {
     use super::*;
     use crate::client::DicomWebClient;
     use crate::server::{MemoryStore, test_file};
+
+    #[test]
+    fn bearer_token_gates_requests() {
+        use std::collections::HashMap;
+        let open = ServerAuth::default();
+        assert!(authorized(&HashMap::new(), &open));
+        let gated = ServerAuth {
+            bearer_token: Some("s3cret".to_string()),
+        };
+        assert!(!authorized(&HashMap::new(), &gated));
+        let mut wrong = HashMap::new();
+        wrong.insert("authorization".to_string(), "Bearer nope".to_string());
+        assert!(!authorized(&wrong, &gated));
+        let mut basic = HashMap::new();
+        basic.insert("authorization".to_string(), "Basic c2NyZXQ=".to_string());
+        assert!(!authorized(&basic, &gated));
+        let mut good = HashMap::new();
+        good.insert("authorization".to_string(), "Bearer s3cret".to_string());
+        assert!(authorized(&good, &gated));
+    }
 
     #[tokio::test]
     async fn end_to_end_client_against_hyper() {

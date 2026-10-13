@@ -52,8 +52,16 @@ fn collect_dir(dir: &Path, out: &mut Vec<PathBuf>) {
         return;
     };
     for entry in entries.flatten() {
+        // Never follow symlinks: a looped link would recurse forever
+        // (and any link escapes the served root).
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_symlink() {
+            continue;
+        }
         let path = entry.path();
-        if path.is_dir() {
+        if ft.is_dir() {
             collect_dir(&path, out);
         } else if path
             .extension()

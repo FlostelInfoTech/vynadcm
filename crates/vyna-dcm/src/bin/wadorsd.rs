@@ -10,10 +10,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use vyna_dcm::web::hyper_server::serve_forever;
+use vyna_dcm::web::hyper_server::{ServerAuth, serve_forever_with_auth};
 use vyna_dcm::web::server::{DicomWebStore, MemoryStore};
 
 /// DICOMweb stub server.
+///
+/// Plain HTTP without auth by default: keep the loopback bind or put
+/// a TLS-terminating proxy in front (PHI on the wire otherwise).
 #[derive(Parser, Debug)]
 #[command(name = "wadorsd", about = "Serve QIDO/WADO/STOW from a directory")]
 struct Args {
@@ -26,6 +29,9 @@ struct Args {
     /// Public base URL for BulkDataURIs (defaults to `http://{bind}/`).
     #[arg(long)]
     public_base: Option<String>,
+    /// Require `Authorization: Bearer <token>` on every request.
+    #[arg(long)]
+    bearer_token: Option<String>,
 }
 
 #[tokio::main]
@@ -68,5 +74,8 @@ async fn run(args: &Args) -> Result<(), String> {
         .public_base
         .clone()
         .unwrap_or_else(|| format!("http://{addr}/"));
-    serve_forever(store, base, addr).await
+    let auth = ServerAuth {
+        bearer_token: args.bearer_token.clone(),
+    };
+    serve_forever_with_auth(store, base, addr, auth).await
 }

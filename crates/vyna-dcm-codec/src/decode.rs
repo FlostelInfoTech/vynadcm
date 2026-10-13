@@ -22,14 +22,30 @@ use crate::{
 pub const UNDEFINED_LENGTH: u32 = 0xFFFF_FFFF;
 /// Maximum sequence nesting depth (guards against malicious input).
 const MAX_DEPTH: usize = 64;
+/// Maximum bytes a Deflated dataset may inflate to (zip-bomb guard).
+const MAX_INFLATED_LEN: usize = 512 * 1024 * 1024;
+
+/// Inflate zlib data, refusing output past `max_len` (zip-bomb guard).
+fn inflate_capped(bytes: &[u8], max_len: usize) -> Result<Vec<u8>> {
+    let mut dec = ZlibDecoder::new(bytes);
+    // Read one byte past the cap: that detects overflow without
+    // ever allocating an unbounded buffer.
+    let mut take = (&mut dec).take(max_len.saturating_add(1) as u64);
+    let mut inflated = Vec::new();
+    take.read_to_end(&mut inflated)
+        .map_err(|e| Error::Deflate(e.to_string()))?;
+    if inflated.len() > max_len {
+        return Err(Error::Deflate(format!(
+            "inflated size exceeds {max_len} bytes"
+        )));
+    }
+    Ok(inflated)
+}
 
 /// Decode a whole dataset buffer in `ts`.
 pub fn decode_dataset(bytes: &[u8], ts: TransferSyntax) -> Result<DataSet> {
     if ts.is_deflated() {
-        let mut dec = ZlibDecoder::new(bytes);
-        let mut inflated = Vec::new();
-        dec.read_to_end(&mut inflated)
-            .map_err(|e| Error::Deflate(e.to_string()))?;
+        let inflated = inflate_capped(bytes, MAX_INFLATED_LEN)?;
         return decode_dataset(&inflated, TransferSyntax::ExplicitVrLittleEndian);
     }
     let (ds, used) = decode_up_to(bytes, ts, None)?;
@@ -79,10 +95,7 @@ pub(crate) fn decode_dataset_capture_items(
     seq_tag: Tag,
 ) -> Result<(DataSet, Vec<usize>)> {
     if ts.is_deflated() {
-        let mut dec = ZlibDecoder::new(bytes);
-        let mut inflated = Vec::new();
-        dec.read_to_end(&mut inflated)
-            .map_err(|e| Error::Deflate(e.to_string()))?;
+        let inflated = inflate_capped(bytes, MAX_INFLATED_LEN)?;
         return decode_dataset_capture_items(
             &inflated,
             TransferSyntax::ExplicitVrLittleEndian,
@@ -112,6 +125,7 @@ fn decode_up_to_capture(
     let mut r = Reader {
         buf: bytes,
         pos: 0,
+        end: bytes.len(),
         little: ts.is_little_endian(),
         // Encapsulated syntaxes still encode the *dataset* in Explicit VR
         // Little Endian; only pixel/waveform data is fragmented.
@@ -126,18 +140,20 @@ fn decode_up_to_capture(
 struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
+    /// Reads must not cross this boundary: the enclosing item end
+    /// for nested content, `buf.len()` at top level.
+    end: usize,
     little: bool,
     explicit: bool,
     encapsulated: bool,
 }
 
 impl<'a> Reader<'a> {
-    fn rest(&self) -> usize {
-        self.buf.len().saturating_sub(self.pos)
-    }
-
     fn take(&mut self, n: usize, what: &'static str) -> Result<&'a [u8]> {
-        if self.rest() < n {
+        // Bounded by the enclosing item, not just the buffer: an
+        // element claiming bytes past its item end is malformed, and
+        // must not silently consume the next item's bytes.
+        if n > self.end.saturating_sub(self.pos) {
             return Err(Error::Truncated {
                 offset: self.pos,
                 what,
@@ -306,7 +322,7 @@ fn read_value(
     if vr == Vr::Sq {
         return Ok(Value::Sequence(read_defined_items(
             r,
-            r.pos + len,
+            r.pos.saturating_add(len),
             depth,
             tag,
             capture,
@@ -372,7 +388,7 @@ fn read_defined_items(
             message: "nesting too deep".into(),
         });
     }
-    if end > r.buf.len() {
+    if end > r.end {
         return Err(Error::Truncated {
             offset: r.pos,
             what: "sequence content",
@@ -398,7 +414,7 @@ fn read_defined_items(
                 &mut *charset,
             )?);
         } else {
-            let item_end = r.pos + len as usize;
+            let item_end = r.pos.saturating_add(len as usize);
             if item_end > end {
                 return Err(Error::Truncated {
                     offset: r.pos,
@@ -408,6 +424,7 @@ fn read_defined_items(
             let mut sub = Reader {
                 buf: r.buf,
                 pos: r.pos,
+                end: item_end,
                 little: r.little,
                 explicit: r.explicit,
                 encapsulated: r.encapsulated,
@@ -470,8 +487,8 @@ fn read_undefined_items(
                 &mut *charset,
             )?);
         } else {
-            let item_end = r.pos + len as usize;
-            if item_end > r.buf.len() {
+            let item_end = r.pos.saturating_add(len as usize);
+            if item_end > r.end {
                 return Err(Error::Truncated {
                     offset: r.pos,
                     what: "item content",
@@ -480,6 +497,7 @@ fn read_undefined_items(
             let mut sub = Reader {
                 buf: r.buf,
                 pos: r.pos,
+                end: item_end,
                 little: r.little,
                 explicit: r.explicit,
                 encapsulated: r.encapsulated,
@@ -885,6 +903,26 @@ mod tests {
     }
 
     #[test]
+    fn rejects_element_length_past_item_end() {
+        // Defined-length item whose element claims 64 bytes while the
+        // item holds 8: the overrun must fail, not silently consume
+        // the next item's bytes (and rewind afterwards).
+        let mut bytes = vec![0x08, 0x00, 0x40, 0x11, b'S', b'Q', 0x00, 0x00];
+        let sq_len = 8u32 + 8 + 8 + 8; // two item headers + 8 content bytes each
+        bytes.extend(sq_len.to_le_bytes());
+        // Item 1 (len 8): (0008,1150) UI claiming len 64.
+        bytes.extend([0xFE, 0xFF, 0x00, 0xE0]);
+        bytes.extend(8u32.to_le_bytes());
+        bytes.extend([0x08, 0x00, 0x50, 0x11, b'U', b'I', 64, 0x00]);
+        // Item 2 (len 8): empty padding content.
+        bytes.extend([0xFE, 0xFF, 0x00, 0xE0]);
+        bytes.extend(8u32.to_le_bytes());
+        bytes.extend([0u8; 8]);
+        let err = explicit_le(&bytes).unwrap_err();
+        assert!(matches!(err, Error::Truncated { .. }), "{err:?}");
+    }
+
+    #[test]
     fn decodes_fragments_with_bot() {
         // Pixel Data undefined length: BOT item (1 frame @0), one fragment "AB".
         let bytes = [
@@ -901,6 +939,20 @@ mod tests {
             }
             v => panic!("expected fragments, got {v:?}"),
         }
+    }
+
+    #[test]
+    fn inflate_capped_refuses_zip_bombs() {
+        use flate2::Compression;
+        use flate2::write::ZlibEncoder;
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::best());
+        enc.write_all(&vec![0u8; 1024]).unwrap();
+        let bomb = enc.finish().unwrap();
+        assert!(bomb.len() < 100, "fixture should compress well");
+        assert_eq!(inflate_capped(&bomb, 1024).unwrap().len(), 1024);
+        let err = inflate_capped(&bomb, 100).unwrap_err();
+        assert!(matches!(err, Error::Deflate(_)), "{err:?}");
     }
 
     #[test]

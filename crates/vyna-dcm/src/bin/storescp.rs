@@ -33,6 +33,9 @@ struct Args {
     /// argument (values with spaces stay in one argv element).
     #[arg(long)]
     exec: Option<String>,
+    /// Log patient names with each store (PHI: off by default).
+    #[arg(long)]
+    verbose: bool,
     #[command(flatten)]
     audit: AuditArgs,
 }
@@ -115,6 +118,7 @@ struct StoreScp {
     audit: Option<SenderWithId>,
     our_ip: String,
     exec: Option<ExecHook>,
+    verbose: bool,
 }
 
 impl Handlers for StoreScp {
@@ -137,8 +141,13 @@ impl Handlers for StoreScp {
                 let path = self.directory.join(format!("{safe}.dcm"));
                 match std::fs::write(&path, bytes) {
                     Ok(()) => {
-                        let patient = dataset.string(tags::PATIENT_NAME).unwrap_or("?");
-                        println!("stored {} ({patient}) -> {}", inst, path.display());
+                        // Patient names are PHI: only log them with --verbose.
+                        if self.verbose {
+                            let patient = dataset.string(tags::PATIENT_NAME).unwrap_or("?");
+                            println!("stored {} ({patient}) -> {}", inst, path.display());
+                        } else {
+                            println!("stored {} -> {}", inst, path.display());
+                        }
                         if let Some(hook) = &self.exec {
                             let file = path.display().to_string();
                             run_hook(
@@ -263,6 +272,7 @@ async fn main() -> Result<()> {
         audit,
         our_ip,
         exec,
+        verbose: args.verbose,
     });
 
     loop {

@@ -95,6 +95,17 @@ pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
     if marks.is_empty() {
         return Err(Error::Multipart("no boundary delimiters found".into()));
     }
+    // The body must end with the closing delimiter: without it the
+    // payload is truncated, and returning partial (or, for a single
+    // mark, empty) parts would silently corrupt STOW/WADO receives.
+    // Anything past the first closing mark is epilogue, ignored.
+    let Some(close_idx) = marks
+        .iter()
+        .position(|m| body[m + needle.len()..].starts_with(b"--"))
+    else {
+        return Err(Error::Multipart("missing closing delimiter".into()));
+    };
+    let marks = &marks[..=close_idx];
     let mut parts = Vec::new();
     for w in marks.windows(2) {
         let (start, end) = (w[0], w[1]);
@@ -242,5 +253,18 @@ mod tests {
     #[test]
     fn rejects_missing_boundary() {
         assert!(decode_multipart(b"no delimiters here", "B").is_err());
+    }
+
+    #[test]
+    fn rejects_unclosed_body() {
+        // Truncated after the first boundary: no closing delimiter.
+        let cut = b"--B\r\nContent-Type: application/octet-stream\r\n\r\nxx";
+        assert!(decode_multipart(cut, "B").is_err());
+        // Even a complete-looking part without the close is refused.
+        let cut = b"--B\r\nContent-Type: text/plain\r\n\r\nxx\r\n--B\r\nContent-Type: text/plain\r\n\r\nyy";
+        assert!(decode_multipart(cut, "B").is_err());
+        // Epilogue past the closing delimiter stays ignored.
+        let ok = b"--B\r\nContent-Type: text/plain\r\n\r\nxx\r\n--B--\r\ntrailing junk";
+        assert_eq!(decode_multipart(ok, "B").unwrap().len(), 1);
     }
 }

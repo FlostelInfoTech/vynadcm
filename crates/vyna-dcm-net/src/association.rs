@@ -39,6 +39,10 @@ pub struct AssociationOptions {
     pub application_context: String,
     /// Hard cap for any incoming PDU (DoS guard).
     pub max_incoming_pdu: u32,
+    /// Hard cap for one reassembled DIMSE command or dataset across
+    /// all its PDVs (DoS guard; the per-PDU cap alone does not bound
+    /// a many-PDU message).
+    pub max_message_bytes: u64,
 }
 
 impl Default for AssociationOptions {
@@ -52,6 +56,7 @@ impl Default for AssociationOptions {
             ),
             application_context: APPLICATION_CONTEXT_NAME.to_string(),
             max_incoming_pdu: 64 * 1024 * 1024,
+            max_message_bytes: 1024 * 1024 * 1024,
         }
     }
 }
@@ -97,6 +102,7 @@ pub struct Association {
     info: AssociationInfo,
     our_max_pdu: u32,
     max_incoming_pdu: u32,
+    max_message_bytes: u64,
     read_timeout: Duration,
     next_id: u16,
     /// Pushback queue: events seen by a cancel poll that belong to the
@@ -156,6 +162,7 @@ impl Association {
             },
             our_max_pdu: opts.max_pdu_len,
             max_incoming_pdu: opts.max_incoming_pdu,
+            max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
             next_id: 1,
             pending: VecDeque::new(),
@@ -242,6 +249,7 @@ impl Association {
             info,
             our_max_pdu: opts.max_pdu_len,
             max_incoming_pdu: opts.max_incoming_pdu,
+            max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
             next_id: 1,
             pending: VecDeque::new(),
@@ -369,6 +377,12 @@ impl Association {
                                 }
                                 _ => cmd_ctx = Some(pdv.context_id),
                             }
+                            if cmd_buf.len() as u64 + pdv.data.len() as u64 > self.max_message_bytes
+                            {
+                                return Err(Error::MessageTooLarge {
+                                    limit: self.max_message_bytes,
+                                });
+                            }
                             cmd_buf.extend_from_slice(&pdv.data);
                             if pdv.is_last {
                                 let cmd = decode_command(&cmd_buf)?;
@@ -387,6 +401,13 @@ impl Association {
                             };
                             if Some(pdv.context_id) != cmd_ctx {
                                 return Err(Error::BadPdu("dataset PDV on wrong context".into()));
+                            }
+                            if data_buf.len() as u64 + pdv.data.len() as u64
+                                > self.max_message_bytes
+                            {
+                                return Err(Error::MessageTooLarge {
+                                    limit: self.max_message_bytes,
+                                });
                             }
                             data_buf.extend_from_slice(&pdv.data);
                             if pdv.is_last {
@@ -500,6 +521,7 @@ mod tests {
             },
             our_max_pdu: opts.max_pdu_len,
             max_incoming_pdu: opts.max_incoming_pdu,
+            max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
             next_id: u16::MAX,
             pending: VecDeque::new(),
@@ -513,5 +535,62 @@ mod tests {
         assert_eq!(chunk_bytes(&[], 10), vec![Vec::<u8>::new()]);
         assert_eq!(chunk_bytes(&[1, 2, 3], 10), vec![vec![1, 2, 3]]);
         assert_eq!(chunk_bytes(&[1, 2, 3, 4], 2), vec![vec![1, 2], vec![3, 4]]);
+    }
+
+    #[tokio::test]
+    async fn recv_enforces_total_message_cap() {
+        use crate::dimse::priority;
+        // Loopback pair: the sender fragments into ~52-byte PDVs
+        // (small peer max PDU) while the receiver allows 256 bytes
+        // total, so a 308-byte dataset must fail even though every
+        // single PDU is far below the per-PDU cap.
+        let sender_opts = AssociationOptions::default();
+        let receiver_opts = AssociationOptions {
+            max_message_bytes: 256,
+            ..AssociationOptions::default()
+        };
+        let (a, b) = tokio::io::duplex(65536);
+        let ctx = || NegotiatedContext {
+            id: 1,
+            abstract_syntax: vyna_dcm_core::sop_class::CT_IMAGE.to_string(),
+            transfer_syntax: TransferSyntax::ExplicitVrLittleEndian,
+            transfer_syntax_uid: TransferSyntax::ExplicitVrLittleEndian.uid().to_string(),
+        };
+        let info = |local: &str, peer: &str| AssociationInfo {
+            local_ae: AeTitle::new(local).unwrap(),
+            peer_ae: AeTitle::new(peer).unwrap(),
+            peer_max_pdu: 0,
+        };
+        let mut sender =
+            Association::from_accepted(Box::new(a), info("SCU", "SCP"), vec![ctx()], &sender_opts);
+        sender.info.peer_max_pdu = 64;
+        let mut receiver = Association::from_accepted(
+            Box::new(b),
+            info("SCP", "SCU"),
+            vec![ctx()],
+            &receiver_opts,
+        );
+        let mut ds = vyna_dcm_core::DataSet::new();
+        ds.put_bytes(
+            vyna_dcm_core::tags::PIXEL_DATA,
+            vyna_dcm_core::Vr::Ow,
+            vec![0xABu8; 300],
+        );
+        let cmd = Command::store_rq(
+            1,
+            priority::MEDIUM,
+            vyna_dcm_core::sop_class::CT_IMAGE,
+            "1.2.3.4",
+        );
+        let sent = tokio::spawn(async move {
+            let mut sender = sender;
+            sender.send(1, &cmd, Some(&ds)).await.unwrap();
+        });
+        let err = receiver.recv().await.unwrap_err();
+        assert!(
+            matches!(err, Error::MessageTooLarge { limit: 256 }),
+            "{err:?}"
+        );
+        sent.await.unwrap();
     }
 }

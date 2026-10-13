@@ -22,6 +22,35 @@ pub enum Auth {
     },
 }
 
+/// Lowercased `scheme://authority` of an absolute HTTP(S) URL, or
+/// `None` when the URL is relative or not HTTP(S).
+fn origin_of(url: &str) -> Option<String> {
+    let (scheme, rest) = url
+        .strip_prefix("https://")
+        .map(|r| ("https", r))
+        .or_else(|| url.strip_prefix("http://").map(|r| ("http", r)))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    if authority.is_empty() {
+        return None;
+    }
+    // Lowercasing the whole authority is safe (host is
+    // case-insensitive, port/userinfo are matched verbatim anyway).
+    Some(format!("{}://{}", scheme, authority.to_ascii_lowercase()))
+}
+
+/// Whether `url` may carry this client's credentials.
+///
+/// True for relative URLs (resolved against our own base) and for
+/// absolute URLs on the same origin as `base`. When either side is
+/// unparseable we keep the legacy behavior (send) so exotic but
+/// same-server setups do not break; only a proven mismatch strips.
+fn same_origin(url: &str, base: &str) -> bool {
+    match (origin_of(url), origin_of(base)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
 /// DICOMweb client over a service base URL like
 /// `https://pacs.example/dicom-web`.
 #[derive(Clone, Debug)]
@@ -41,6 +70,9 @@ impl DicomWebClient {
         // provider; ignore failure (another ring install already done).
         let _ = rustls::crypto::ring::default_provider().install_default();
         let http = reqwest::Client::builder()
+            // A hung server must not hang us forever; bulk transfers
+            // can legitimately take minutes, hence the budget.
+            .timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| Error::Http(e.to_string()))?;
         Ok(Self {
@@ -64,6 +96,17 @@ impl DicomWebClient {
             username: username.into(),
             password: password.into(),
         });
+        self
+    }
+
+    /// Override the default 300 s total request timeout.
+    #[must_use]
+    pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
+        // `reqwest` clients are immutable once built; rebuild with
+        // the same settings plus the new timeout.
+        if let Ok(http) = reqwest::Client::builder().timeout(timeout).build() {
+            self.http = http;
+        }
         self
     }
 
@@ -259,6 +302,10 @@ impl DicomWebClient {
     }
 
     /// Fetch a BulkDataURI (absolute URL or server-relative path).
+    ///
+    /// Absolute URIs on another origin are fetched *without* our
+    /// credentials: BulkDataURIs are server-supplied and may point
+    /// anywhere, so forwarding `Authorization` would leak it (SSRF).
     pub async fn wado_bulkdata(&self, uri: &str) -> Result<(String, Vec<u8>)> {
         let url = if uri.starts_with("http://") || uri.starts_with("https://") {
             uri.to_string()
@@ -267,11 +314,12 @@ impl DicomWebClient {
         } else {
             format!("{}/{uri}", self.base_url)
         };
-        let resp = self
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+        // Same-origin (including server-relative URIs resolved above)
+        // keeps auth; cross-origin absolute URIs must not carry it.
+        let same = same_origin(&url, &self.base_url);
+        let req = self.http.get(url);
+        let req = if same { self.apply_auth(req) } else { req };
+        let resp = req.send().await.map_err(|e| Error::Http(e.to_string()))?;
         Self::expect_ok(resp).await
     }
 
@@ -639,6 +687,34 @@ mod tests {
         assert_eq!(get("presentationUID"), Some("1.2.9"));
         assert_eq!(get("presentationSeriesUID"), Some("1.2.10"));
         assert_eq!(get("charset"), Some("ISO_IR 192"));
+    }
+
+    #[test]
+    fn bulkdata_auth_same_origin_only() {
+        let base = "https://pacs.example/dicom-web";
+        // Server-relative and same-origin absolute URIs keep auth.
+        assert!(same_origin(
+            "https://pacs.example/dicom-web/studies/1/bulk/2",
+            base
+        ));
+        assert!(same_origin(
+            "https://PACS.example:443/dicom-web/studies/1",
+            "https://pacs.example:443/other"
+        ));
+        // Cross-origin absolute URIs must not carry credentials.
+        assert!(!same_origin("https://evil.example/bulk", base));
+        assert!(!same_origin(
+            "http://pacs.example/dicom-web/studies/1",
+            base
+        ));
+        assert!(!same_origin(
+            "https://pacs.example:8443/dicom-web/studies/1",
+            base
+        ));
+        assert!(!same_origin("https://pacs.example.evil.example/bulk", base));
+        // Unparseable sides keep legacy behavior (send).
+        assert!(same_origin("/studies/1/bulk/2", base));
+        assert!(same_origin("studies/1", base));
     }
 
     #[test]

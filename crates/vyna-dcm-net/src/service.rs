@@ -27,6 +27,14 @@ use crate::{
 pub type UserIdentityAuth = Arc<dyn Fn(&crate::pdu::UserIdentity) -> Option<Vec<u8>> + Send + Sync>;
 
 /// What the acceptor is willing to negotiate.
+///
+/// The defaults accept any Called-AE title, any proposed SOP class,
+/// and no user identity: convenient for loopback tests and trusted
+/// networks, but an Internet- or hospital-facing SCP should set
+/// [`AcceptorOptions::check_called_ae`], restrict
+/// [`AcceptorOptions::accepted_sop_classes`], and install
+/// [`AcceptorOptions::user_identity_auth`] (see
+/// [`AcceptorOptions::strict`] for the Called-AE half).
 #[derive(Clone)]
 pub struct AcceptorOptions {
     /// Our AE title.
@@ -35,12 +43,25 @@ pub struct AcceptorOptions {
     pub association: crate::association::AssociationOptions,
     /// Transfer syntaxes we accept (checked in SCU-offered order).
     pub accepted_transfer_syntaxes: Vec<String>,
-    /// Abstract syntaxes we accept; `None` = accept anything proposed.
+    /// Abstract syntaxes we accept; `None` = accept anything
+    /// proposed (restrict this on exposed SCPs).
     pub accepted_sop_classes: Option<Vec<String>>,
-    /// Reject when Called-AE != ours (lenient by default).
+    /// Reject when Called-AE != ours. Off by default (many peers
+    /// misconfigure it); enable on exposed SCPs.
     pub check_called_ae: bool,
     /// User-identity gate; `None` = no authentication.
     pub user_identity_auth: Option<UserIdentityAuth>,
+}
+
+impl AcceptorOptions {
+    /// Defaults with Called-AE checking enabled.
+    #[must_use]
+    pub fn strict() -> Self {
+        Self {
+            check_called_ae: true,
+            ..Self::default()
+        }
+    }
 }
 
 impl Default for AcceptorOptions {
@@ -60,22 +81,31 @@ impl Default for AcceptorOptions {
 }
 
 /// Build odd-ID presentation contexts for SCU proposals.
+///
+/// At most 128 SOP classes fit (odd IDs `1..=255`); proposing more
+/// is an error rather than wrapped-around duplicate IDs.
 pub fn propose(
     sop_classes: &[&str],
     transfer_syntaxes: &[vyna_dcm_core::TransferSyntax],
-) -> Vec<ProposedContext> {
-    sop_classes
+) -> Result<Vec<ProposedContext>> {
+    if sop_classes.len() > 128 {
+        return Err(Error::BadPdu(format!(
+            "cannot propose {} SOP classes (odd context IDs 1..=255 hold 128)",
+            sop_classes.len()
+        )));
+    }
+    Ok(sop_classes
         .iter()
         .enumerate()
         .map(|(i, sop)| ProposedContext {
-            id: (i as u8 * 2 + 1).max(1),
+            id: (i * 2 + 1) as u8,
             abstract_syntax: sop.to_string(),
             transfer_syntaxes: transfer_syntaxes
                 .iter()
                 .map(|ts| ts.uid().to_string())
                 .collect(),
         })
-        .collect()
+        .collect())
 }
 
 /// Negotiate an A-ASSOCIATE-RQ into AC (+ contexts) or RJ.
@@ -728,12 +758,16 @@ async fn handle_move<H: Handlers>(
         vyna_dcm_core::TransferSyntax::ImplicitVrLittleEndian,
     ];
     let dest_ae = AeTitle::new(dest.trim()).unwrap_or_else(|_| AeTitle::new("MOVEDEST").unwrap());
+    let Ok(proposed) = propose(&classes, &ts) else {
+        tracing::warn!("C-MOVE proposes too many storage classes; failing");
+        return fail_final(assoc, status::PROCESSING_FAILURE).await;
+    };
     let mut outbound = match Association::request(
         &move_cfg.assoc_options,
         &move_cfg.calling_ae,
         &dest_ae,
         &format!("{host}:{port}"),
-        propose(&classes, &ts),
+        proposed,
     )
     .await
     {
@@ -992,7 +1026,26 @@ mod tests {
         let pcs = propose(
             &["1.1", "1.2", "1.3"],
             &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
-        );
+        )
+        .unwrap();
         assert_eq!(pcs.iter().map(|p| p.id).collect::<Vec<_>>(), vec![1, 3, 5]);
+        // 128 classes use IDs 1..=255 exactly; the 129th errors
+        // instead of wrapping to a duplicate ID.
+        let many: Vec<String> = (0..129).map(|i| format!("1.2.{i}")).collect();
+        let many_ref: Vec<&str> = many.iter().map(String::as_str).collect();
+        let pcs = propose(
+            &many_ref[..128],
+            &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
+        )
+        .unwrap();
+        assert_eq!(pcs.len(), 128);
+        assert_eq!(pcs[127].id, 255);
+        assert!(
+            propose(
+                &many_ref,
+                &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian]
+            )
+            .is_err()
+        );
     }
 }

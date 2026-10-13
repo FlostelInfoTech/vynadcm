@@ -309,7 +309,10 @@ pub fn pdf_from_dataset(ds: &DataSet) -> Result<ExtractedPdf> {
         Value::Fragments(f) => f.joined(),
         _ => return Err(Error::NoDocumentBytes),
     };
+    // A zero length with stored bytes is contradictory, not an
+    // empty document: only truncate to a positive sane length.
     if let Some(len) = ds.uint32(tags::ENCAPSULATED_DOCUMENT_LENGTH)
+        && len > 0
         && (len as usize) <= bytes.len()
     {
         bytes.truncate(len as usize);
@@ -590,6 +593,10 @@ mod tests {
             tags::ENCAPSULATED_DOCUMENT_LENGTH,
             stored.len() as u32 + 100,
         );
+        assert_eq!(pdf_from_dataset(&ds).unwrap().bytes, stored);
+        // Zero length with stored bytes is contradictory, not empty:
+        // keep the stored bytes instead of truncating to nothing.
+        ds.put_u32_single(tags::ENCAPSULATED_DOCUMENT_LENGTH, 0);
         assert_eq!(pdf_from_dataset(&ds).unwrap().bytes, stored);
     }
 

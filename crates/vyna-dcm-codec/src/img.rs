@@ -13,7 +13,7 @@
 use image::{DynamicImage, ImageFormat};
 use vyna_dcm_core::{DataElement, DataSet, TransferSyntax, Value, Vr, tags};
 
-use crate::transcode::{Geometry, Photometric, deinterleave_planar};
+use crate::transcode::{Geometry, Photometric, deinterleave_planar, swap_pairs};
 use crate::{BundledCodec, Error, Result, decode_pixels};
 
 /// Render one 1-based frame of `ds` (stored in `src`) to PNG bytes.
@@ -45,9 +45,14 @@ pub fn frame_to_png(ds: &DataSet, src: TransferSyntax, frame: usize) -> Result<V
         });
     }
     let mut raw = decode_pixels(ds, src)?;
+    // Big-endian natives arrive stored-order; the 16-bit path below
+    // reads little-endian, so swap first (as the transcoder does).
+    if src == TransferSyntax::ExplicitVrBigEndian && geo.bits > 8 {
+        swap_pairs(&mut raw);
+    }
     // JPEG decoders return interleaved RGB by construction.
     if geo.planar == 1 && !BundledCodec::SYNTAXES.contains(&src) {
-        raw = deinterleave_planar(&raw, &geo);
+        raw = deinterleave_planar(&raw, &geo)?;
     }
     let frame_len = raw.len() / geo.frames;
     let bytes = &raw[(frame - 1) * frame_len..frame * frame_len];
@@ -161,6 +166,27 @@ mod tests {
             .collect();
         ds.insert(DataElement::bytes(tags::PIXEL_DATA, Vr::Ow, px));
         ds
+    }
+
+    #[test]
+    fn big_endian_mono16_swaps() {
+        // Same pixels as mono16_signed but stored big-endian: the PNG
+        // must match the little-endian rendering, not byte-swapped.
+        let mut ds = DataSet::new();
+        ds.put_u16_single(tags::ROWS, 2);
+        ds.put_u16_single(tags::COLUMNS, 2);
+        ds.put_u16_single(tags::SAMPLES_PER_PIXEL, 1);
+        ds.put_u16_single(tags::BITS_ALLOCATED, 16);
+        ds.put_u16_single(tags::PIXEL_REPRESENTATION, 1);
+        ds.put_text(tags::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "MONOCHROME2");
+        let px: Vec<u8> = [-2i16, -1, 0, 1]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        ds.insert(DataElement::bytes(tags::PIXEL_DATA, Vr::Ow, px));
+        let png = frame_to_png(&ds, TransferSyntax::ExplicitVrBigEndian, 1).unwrap();
+        let img = image::load_from_memory(&png).unwrap();
+        assert_eq!(img.into_luma16().as_raw(), &[32766, 32767, 32768, 32769]);
     }
 
     #[test]

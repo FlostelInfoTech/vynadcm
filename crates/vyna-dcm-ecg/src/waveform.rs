@@ -101,13 +101,33 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
             rec.bits_allocated
         )));
     }
+    // Fields are public, so `EcgRecording::new`'s checks are
+    // bypassable: re-validate shape here, since unequal lead
+    // lengths would panic the interleaver below.
+    if rec.leads.is_empty() {
+        return Err(Error::Waveform("recording without leads".into()));
+    }
+    let samples = rec.samples_per_lead();
+    if samples == 0 {
+        return Err(Error::Waveform("recording without samples".into()));
+    }
+    if rec.leads.iter().any(|l| l.len() != samples) {
+        return Err(Error::Waveform("leads have unequal sample counts".into()));
+    }
+    if !rec.sampling_frequency_hz.is_finite() || rec.sampling_frequency_hz <= 0.0 {
+        return Err(Error::Waveform(format!(
+            "bad sampling frequency {}",
+            rec.sampling_frequency_hz
+        )));
+    }
+    let channels =
+        u16::try_from(rec.leads.len()).map_err(|_| Error::Waveform("too many leads".into()))?;
+    let sample_count =
+        u32::try_from(samples).map_err(|_| Error::Waveform("too many samples".into()))?;
     let mut item = DataSet::new();
     item.put_text(tags::WAVEFORM_ORIGINALITY, Vr::Cs, rec.originality.clone());
-    item.put_u16_single(tags::NUMBER_OF_WAVEFORM_CHANNELS, rec.leads.len() as u16);
-    item.put_u32_single(
-        tags::NUMBER_OF_WAVEFORM_SAMPLES,
-        rec.samples_per_lead() as u32,
-    );
+    item.put_u16_single(tags::NUMBER_OF_WAVEFORM_CHANNELS, channels);
+    item.put_u32_single(tags::NUMBER_OF_WAVEFORM_SAMPLES, sample_count);
     item.put_text(
         tags::SAMPLING_FREQUENCY,
         Vr::Ds,
@@ -551,5 +571,27 @@ mod tests {
         let mut bad = recording_to_waveform_item(&twelve_lead()).unwrap();
         bad.put_bytes(tags::WAVEFORM_DATA, Vr::Ow, vec![1, 2, 3]); // truncated
         assert!(recording_from_waveform_item(&bad).is_err());
+    }
+
+    #[test]
+    fn rejects_misshapen_recordings() {
+        // Unequal lead lengths must error, not panic the interleaver.
+        let mut rec = twelve_lead();
+        rec.leads[1].samples.pop();
+        assert!(recording_to_waveform_item(&rec).is_err());
+        // Empty leads, empty samples, and bad rates are refused too.
+        let mut rec = twelve_lead();
+        rec.leads.clear();
+        assert!(recording_to_waveform_item(&rec).is_err());
+        let mut rec = twelve_lead();
+        for lead in &mut rec.leads {
+            lead.samples.clear();
+        }
+        assert!(recording_to_waveform_item(&rec).is_err());
+        for rate in [0.0, -500.0, f64::NAN, f64::INFINITY] {
+            let mut rec = twelve_lead();
+            rec.sampling_frequency_hz = rate;
+            assert!(recording_to_waveform_item(&rec).is_err(), "{rate}");
+        }
     }
 }

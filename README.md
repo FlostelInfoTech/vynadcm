@@ -42,7 +42,7 @@ Requires Rust 1.98+ (edition 2024).
 
 ```sh
 cargo build --workspace
-cargo test --workspace        # 167 unit + 2 integration + 7 doc tests
+cargo test --workspace        # unit + integration + doc tests
 cargo clippy --workspace --all-targets
 cargo fmt --all -- --check
 ```
@@ -114,12 +114,12 @@ file tools need only `cli`.
 | `vyna-dcm-web` | `server` (on) | hyper HTTP/1.1 front end; off = client + dispatch core only |
 | `vyna-dcm` | `net`, `web`, `ecg`, `cli` (all on) | Facade re-exports and CLI availability |
 
-Every combination builds; without defaults the gated tests drop out
-(net: 18 tests without `tls`; web: 10 tests without `server`).
+Every combination builds; feature-gated tests compile out with
+their features.
 
 ```toml
 # Minimal embed: model + codec only
-vyna-dcm = { git = "https://gitlab.flostel.com/alexshao/VynaDCM", version = "0.1", default-features = false }
+vyna-dcm = { git = "https://gitlab.flostel.com/alexshao/VynaDCM", version = "0.3", default-features = false }
 # VynaECG: features = ["ecg", "net"]. VynaLink: features = ["net", "web"].
 ```
 

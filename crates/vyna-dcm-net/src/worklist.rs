@@ -265,6 +265,12 @@ impl MppsScp {
         }
     }
 
+    /// Lock the step map, recovering from a poisoned mutex instead of
+    /// panicking: one panicked handler must not wedge the SCP.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, DataSet>> {
+        self.steps.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Load persisted `*.dcm` steps (filename stem = MPPS UID);
     /// returns the store plus the skip count.
     #[must_use]
@@ -304,19 +310,19 @@ impl MppsScp {
     /// A copy of the stored step, if present.
     #[must_use]
     pub fn get(&self, uid: &str) -> Option<DataSet> {
-        self.steps.lock().unwrap().get(uid).cloned()
+        self.lock().get(uid).cloned()
     }
 
     /// Number of stored steps.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.steps.lock().unwrap().len()
+        self.lock().len()
     }
 
     /// True when no steps are stored.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.steps.lock().unwrap().is_empty()
+        self.lock().is_empty()
     }
 
     /// N-CREATE: insert a new step (stamping SOP Class/Instance UIDs
@@ -336,7 +342,7 @@ impl MppsScp {
         let Some(mut ds) = dataset else {
             return (status::DATASET_MISMATCH, None);
         };
-        let mut steps = self.steps.lock().unwrap();
+        let mut steps = self.lock();
         if steps.contains_key(uid) {
             return (status::DUPLICATE_SOP_INSTANCE, None);
         }
@@ -366,7 +372,7 @@ impl MppsScp {
         let Some(update) = dataset else {
             return (status::DATASET_MISMATCH, None);
         };
-        let mut steps = self.steps.lock().unwrap();
+        let mut steps = self.lock();
         let Some(stored) = steps.get(uid) else {
             return (status::NO_SUCH_SOP_INSTANCE, None);
         };
@@ -380,6 +386,11 @@ impl MppsScp {
         for (_tag, el) in update.iter() {
             merged.insert(el.clone());
         }
+        // N-SET must not change identity: re-stamp the SOP Class and
+        // Instance UIDs the N-CREATE established, so the stored step
+        // always agrees with its map key and file name.
+        merged.put_uid(tags::SOP_CLASS_UID, MODALITY_PPS);
+        merged.put_uid(tags::SOP_INSTANCE_UID, uid);
         if let Err(e) = self.persist(uid, &merged) {
             tracing::warn!("mpps: persist failed for {uid}: {e}");
             return (status::OUT_OF_RESOURCES, None);
@@ -575,6 +586,33 @@ mod tests {
             Some("PPS1")
         );
         assert!(dir.join("1.2.3.1.dcm").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mpps_set_cannot_change_identity() {
+        let dir = mpps_test_dir("identity");
+        let scp = MppsScp::new(dir.clone());
+        let (s, _) = scp.create(
+            "1.2.3.1",
+            MODALITY_PPS,
+            Some(mpps_create_data().to_create_dataset()),
+        );
+        assert_eq!(s, crate::dimse::status::SUCCESS);
+        // A rogue N-SET carrying foreign identity UIDs must not
+        // rewrite the stamped SOP Class/Instance UIDs.
+        let mut rogue = MppsData {
+            status: "IN PROGRESS".into(),
+            ..MppsData::default()
+        }
+        .to_set_dataset();
+        rogue.put_uid(tags::SOP_CLASS_UID, "1.2.3.rogue");
+        rogue.put_uid(tags::SOP_INSTANCE_UID, "9.9.9.9");
+        let (s, _) = scp.set("1.2.3.1", MODALITY_PPS, Some(rogue));
+        assert_eq!(s, crate::dimse::status::SUCCESS);
+        let stored = scp.get("1.2.3.1").unwrap();
+        assert_eq!(stored.string(tags::SOP_CLASS_UID), Some(MODALITY_PPS));
+        assert_eq!(stored.string(tags::SOP_INSTANCE_UID), Some("1.2.3.1"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

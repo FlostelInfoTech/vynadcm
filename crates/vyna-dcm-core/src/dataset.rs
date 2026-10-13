@@ -152,7 +152,8 @@ impl DataSet {
         }
     }
 
-    /// Parse *all* `DS`/`IS` text values as `f64`, skipping unparseable ones.
+    /// Parse *all* `DS`/`IS`/numeric values as `f64`, skipping
+    /// unparseable text ones (mirrors [`DataSet::float`]).
     #[must_use]
     pub fn float_list(&self, tag: Tag) -> Option<Vec<f64>> {
         match self.get(tag).map(|e| &e.value) {
@@ -163,6 +164,10 @@ impl DataSet {
             ),
             Some(Value::F32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
             Some(Value::F64(v)) => Some(v.clone()),
+            Some(Value::U16(v)) => Some(v.iter().map(|f| *f as f64).collect()),
+            Some(Value::U32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
+            Some(Value::I16(v)) => Some(v.iter().map(|f| *f as f64).collect()),
+            Some(Value::I32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
             _ => None,
         }
     }
@@ -261,6 +266,15 @@ mod tests {
         assert_eq!(ds.string(tags::PATIENT_NAME), Some("Doe^Jane"));
         assert_eq!(ds.uint16(tags::COMMAND_FIELD), Some(0x0030));
         assert_eq!(ds.float_list(tags::SAMPLING_FREQUENCY), Some(vec![500.0]));
+        // float_list covers the same numeric VRs as float.
+        ds.insert(DataElement::new(tags::ROWS, Vr::Us, Value::U16(vec![4, 8])));
+        assert_eq!(ds.float_list(tags::ROWS), Some(vec![4.0, 8.0]));
+        ds.insert(DataElement::new(
+            tags::SELECTOR_SS_VALUE,
+            Vr::Ss,
+            Value::I16(vec![-2]),
+        ));
+        assert_eq!(ds.float_list(tags::SELECTOR_SS_VALUE), Some(vec![-2.0]));
         assert_eq!(ds.string(tags::PATIENT_ID), None);
         assert!(ds.require_string(tags::PATIENT_ID).is_err());
 

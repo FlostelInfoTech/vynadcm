@@ -240,12 +240,19 @@ fn encode_bot(out: &mut Vec<u8>, f: &FragmentSequence, little: bool) {
 }
 
 /// Split a payload into fragments (empty BOT).
+///
+/// Non-final fragments keep even length, so at most the very last
+/// fragment carries a pad byte: pads inside the stream would corrupt
+/// consumers that join fragments back together.
 pub fn fragment_payload(data: &[u8], fragment_len: usize) -> FragmentSequence {
     let len = fragment_len.max(2);
     let mut fragments = Vec::new();
     let mut rest = data;
     while !rest.is_empty() {
-        let n = rest.len().min(len);
+        let mut n = rest.len().min(len);
+        if n < rest.len() && n % 2 == 1 {
+            n -= 1; // spill the odd byte into the next fragment
+        }
         let mut frag = rest[..n].to_vec();
         if frag.len() % 2 == 1 {
             frag.push(0); // fragments are always even-length
@@ -525,6 +532,17 @@ mod tests {
             let back = decode_dataset(&bytes, ts).unwrap();
             assert_eq!(back, ds, "round trip failed for {ts:?}");
         }
+    }
+
+    #[test]
+    fn fragments_pad_only_at_the_end() {
+        // Odd split length: pad bytes must not land mid-stream.
+        let f = fragment_payload(&[1, 2, 3, 4, 5, 6, 7], 3);
+        assert!(f.fragments.iter().all(|f| f.len() % 2 == 0));
+        assert_eq!(f.joined(), vec![1, 2, 3, 4, 5, 6, 7, 0]);
+        // Even data needs no padding at all.
+        let f = fragment_payload(&[1, 2, 3, 4, 5, 6], 4);
+        assert_eq!(f.joined(), vec![1, 2, 3, 4, 5, 6]);
     }
 
     #[test]

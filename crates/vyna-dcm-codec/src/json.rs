@@ -2,9 +2,13 @@
 //!
 //! - Tags become 8-uppercase-hex keys (`"00100010"`).
 //! - Each value object carries `"vr"` plus `"Value"` (or `"InlineBinary"`
-//!   for byte VRs, base64), or `"DataFragment"` for encapsulated data.
+//!   for byte VRs, base64). Encapsulated data uses the compact joined
+//!   form (`"InlineBinary"` plus `"BasicOffsetTable"`).
 //! - `PN` values become `{"Alphabetic": "..."}` objects; `AT` values are
 //!   8-hex-digit strings; `DS`/`IS` accept numbers or strings on input.
+//! - Non-finite floats have no Annex F spelling: `FL`/`FD`/`OF`/`OD`
+//!   `NaN`/`±Infinity` encode as the strings `"NaN"`/`"Infinity"`/
+//!   `"-Infinity"` (and parse back), instead of silently becoming null.
 
 use base64::Engine;
 use serde_json::{Map, Value as Json, json};
@@ -14,6 +18,9 @@ use crate::{Error, Result};
 
 const B64: base64::engine::general_purpose::GeneralPurpose =
     base64::engine::general_purpose::STANDARD;
+
+/// Maximum JSON nesting depth (stack-exhaustion guard).
+const MAX_JSON_DEPTH: usize = 64;
 
 /// Convert a dataset to a DICOM JSON object.
 #[must_use]
@@ -27,13 +34,20 @@ pub fn dataset_to_json(ds: &DataSet) -> Json {
 
 /// Parse a DICOM JSON object back into a dataset.
 pub fn dataset_from_json(v: &Json) -> Result<DataSet> {
+    dataset_from_json_depth(v, 0)
+}
+
+fn dataset_from_json_depth(v: &Json, depth: usize) -> Result<DataSet> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(Error::Json("nesting too deep".into()));
+    }
     let map = v
         .as_object()
         .ok_or_else(|| Error::Json("top level must be an object".into()))?;
     let mut ds = DataSet::new();
     for (key, obj) in map {
         let tag = parse_tag_key(key)?;
-        ds.insert(element_from_json(tag, obj)?);
+        ds.insert(element_from_json_depth(tag, obj, depth)?);
     }
     Ok(ds)
 }
@@ -105,13 +119,19 @@ fn element_to_json(el: &DataElement) -> Json {
 }
 
 /// `DS`/`IS`/numeric-ish text becomes JSON numbers when parseable.
+///
+/// `DS` spellings that parse to non-finite doubles (`"NaN"`,
+/// `"inf"`, ...) stay strings: `serde_json` would render them as
+/// null, silently corrupting the export.
 fn text_json(vr: Vr, s: &str) -> Json {
     match vr {
         Vr::Ds => s
             .trim()
             .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite())
             .map(Json::from)
-            .unwrap_or_else(|_| Json::String(s.into())),
+            .unwrap_or_else(|| Json::String(s.into())),
         Vr::Is => s
             .trim()
             .parse::<i64>()
@@ -128,10 +148,44 @@ fn inums(it: impl Iterator<Item = i64>) -> Json {
     Json::Array(it.map(Json::from).collect())
 }
 fn floats(it: impl Iterator<Item = f64>) -> Json {
-    Json::Array(it.map(Json::from).collect())
+    // `Json::from` maps non-finite doubles to null; spell them
+    // explicitly so the export round-trips (see module docs).
+    Json::Array(
+        it.map(|f| {
+            if f.is_finite() {
+                Json::from(f)
+            } else if f.is_nan() {
+                Json::String("NaN".into())
+            } else if f.is_sign_positive() {
+                Json::String("Infinity".into())
+            } else {
+                Json::String("-Infinity".into())
+            }
+        })
+        .collect(),
+    )
 }
 
-fn element_from_json(tag: Tag, obj: &Json) -> Result<DataElement> {
+/// VRs allowed to carry `InlineBinary` (Annex F bulk-data VRs).
+pub(crate) fn allows_inline_binary(vr: Vr) -> bool {
+    matches!(
+        vr,
+        Vr::Lt
+            | Vr::Ob
+            | Vr::Od
+            | Vr::Of
+            | Vr::Ol
+            | Vr::Ov
+            | Vr::Ow
+            | Vr::St
+            | Vr::Uc
+            | Vr::Ur
+            | Vr::Ut
+            | Vr::Un
+    )
+}
+
+fn element_from_json_depth(tag: Tag, obj: &Json, depth: usize) -> Result<DataElement> {
     let obj = obj
         .as_object()
         .ok_or_else(|| Error::Json(format!("{tag}: not an object")))?;
@@ -144,8 +198,10 @@ fn element_from_json(tag: Tag, obj: &Json) -> Result<DataElement> {
 
     if let Some(b64) = obj.get("InlineBinary").and_then(Json::as_str) {
         let bytes = B64.decode(b64).map_err(|e| Error::Base64(e.to_string()))?;
-        if vr == Vr::Sq {
-            return Err(Error::Json(format!("{tag}: InlineBinary with SQ")));
+        if !allows_inline_binary(vr) {
+            return Err(Error::Json(format!(
+                "{tag}: InlineBinary not allowed for {vr}"
+            )));
         }
         // Fragments cannot be distinguished from bytes in the compact form;
         // keep bytes (callers re-fragment for encapsulated syntaxes).
@@ -163,7 +219,7 @@ fn element_from_json(tag: Tag, obj: &Json) -> Result<DataElement> {
         Vr::Sq => {
             let mut items = Vec::with_capacity(values.len());
             for v in values {
-                items.push(dataset_from_json(v)?);
+                items.push(dataset_from_json_depth(v, depth + 1)?);
             }
             Value::Sequence(items)
         }
@@ -264,6 +320,9 @@ fn json_floats(values: &[Json], tag: Tag) -> Result<Vec<f32>> {
     values
         .iter()
         .map(|v| {
+            if let Some(f) = nonfinite_token(v) {
+                return Ok(f as f32);
+            }
             v.as_f64()
                 .ok_or_else(|| Error::Json(format!("{tag}: expected number")))
                 .map(|f| f as f32)
@@ -275,10 +334,23 @@ fn json_doubles(values: &[Json], tag: Tag) -> Result<Vec<f64>> {
     values
         .iter()
         .map(|v| {
+            if let Some(f) = nonfinite_token(v) {
+                return Ok(f);
+            }
             v.as_f64()
                 .ok_or_else(|| Error::Json(format!("{tag}: expected number")))
         })
         .collect()
+}
+
+/// Explicit non-finite spellings emitted by [`floats`].
+fn nonfinite_token(v: &Json) -> Option<f64> {
+    match v.as_str()? {
+        "NaN" => Some(f64::NAN),
+        "Infinity" => Some(f64::INFINITY),
+        "-Infinity" => Some(f64::NEG_INFINITY),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -322,6 +394,59 @@ mod tests {
         assert!(dataset_from_json(&json!([1, 2])).is_err());
         assert!(dataset_from_json(&json!({"ZZZZ": {}})).is_err());
         assert!(dataset_from_json(&json!({"00100010": {"vr": "PN", "Value": [42]}})).is_err());
+    }
+
+    #[test]
+    fn rejects_deeply_nested_sequences() {
+        let mut v = json!({"00100020": {"vr": "LO", "Value": ["x"]}});
+        for _ in 0..(MAX_JSON_DEPTH + 8) {
+            v = json!({"00081140": {"vr": "SQ", "Value": [v]}});
+        }
+        assert!(dataset_from_json(&v).is_err());
+    }
+
+    #[test]
+    fn nonfinite_floats_round_trip() {
+        let tag = Tag::new(0x0019, 0x1001);
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::new(
+            tag,
+            Vr::Fd,
+            Value::F64(vec![1.5, f64::NAN, f64::INFINITY, f64::NEG_INFINITY]),
+        ));
+        let j = dataset_to_json(&ds);
+        let vals = j["00191001"]["Value"].as_array().unwrap();
+        assert_eq!(vals[0], json!(1.5));
+        assert_eq!(vals[1], json!("NaN"));
+        assert_eq!(vals[2], json!("Infinity"));
+        assert_eq!(vals[3], json!("-Infinity"));
+        let back = dataset_from_json(&j).unwrap();
+        match &back.get(tag).unwrap().value {
+            Value::F64(v) => {
+                assert_eq!(v[0], 1.5);
+                assert!(v[1].is_nan());
+                assert_eq!(v[2], f64::INFINITY);
+                assert_eq!(v[3], f64::NEG_INFINITY);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // DS text spelling "NaN" stays a string (not null).
+        let mut ds2 = DataSet::new();
+        ds2.put_text(tags::SAMPLING_FREQUENCY, Vr::Ds, "NaN");
+        let j2 = dataset_to_json(&ds2);
+        assert_eq!(j2["003A001A"]["Value"][0], json!("NaN"));
+        let back2 = dataset_from_json(&j2).unwrap();
+        assert_eq!(back2.string(tags::SAMPLING_FREQUENCY), Some("NaN"));
+    }
+
+    #[test]
+    fn inline_binary_rejects_non_bulk_vrs() {
+        let bulk = json!({"7FE00010": {"vr": "OW", "InlineBinary": "AA=="}});
+        assert!(dataset_from_json(&bulk).is_ok());
+        for vr in ["US", "SS", "FL", "FD", "PN", "SQ", "AT", "UI"] {
+            let v = json!({"00280010": {"vr": vr, "InlineBinary": "AA=="}});
+            assert!(dataset_from_json(&v).is_err(), "{vr}");
+        }
     }
 
     #[test]

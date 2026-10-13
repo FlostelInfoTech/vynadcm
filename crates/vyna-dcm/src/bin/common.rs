@@ -60,7 +60,8 @@ pub struct ListenArgs {
     /// Per-read timeout in seconds.
     #[arg(long, default_value_t = 300)]
     pub timeout_secs: u64,
-    /// Require a matching Called-AE title.
+    /// Require a matching Called-AE title (recommended: without
+    /// it, any peer calling any AE title is accepted).
     #[arg(long, default_value_t = false)]
     pub strict_ae: bool,
     /// TLS server certificate chain (PEM); enables TLS when present.
@@ -103,18 +104,15 @@ impl ConnArgs {
         let opts = self.assoc_options();
         let calling = AeTitle::new(self.calling.clone())?;
         let called = AeTitle::new(self.called.clone())?;
-        let proposed = propose(sop_classes, syntaxes);
+        let proposed = propose(sop_classes, syntaxes)?;
         if !self.tls {
             return Ok(
                 Association::request(&opts, &calling, &called, &self.connect, proposed).await?,
             );
         }
-        let host = self
-            .connect
-            .split(':')
-            .next()
-            .unwrap_or("localhost")
-            .to_string();
+        // host_of (not a naive first-':' split) so IPv6 literals
+        // yield a usable TLS server name.
+        let host = host_of(&self.connect).to_string();
         let server_name = self.tls_server_name.clone().unwrap_or(host);
         let ca = read_opt(&self.tls_ca)?;
         let identity = match (&self.tls_cert, &self.tls_key) {
@@ -350,5 +348,19 @@ pub mod anyhowish {
         fn from(s: String) -> Self {
             Self(s)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_of;
+
+    #[test]
+    fn host_parsing_covers_ipv6() {
+        assert_eq!(host_of("pacs.example:11112"), "pacs.example");
+        assert_eq!(host_of("pacs.example"), "pacs.example");
+        assert_eq!(host_of("[::1]:11112"), "::1");
+        assert_eq!(host_of("[2001:db8::1]:11112"), "2001:db8::1");
+        assert_eq!(host_of("::1"), "::1");
     }
 }

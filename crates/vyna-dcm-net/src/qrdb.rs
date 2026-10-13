@@ -41,6 +41,9 @@ pub struct QrIndex {
 
 impl QrIndex {
     /// Scan `dir` recursively for Part-10 files.
+    ///
+    /// Symlinks are never followed (a looped link would recurse
+    /// forever, and any link escapes the scanned root).
     pub fn scan(dir: &Path) -> crate::Result<Self> {
         let mut index = Self::default();
         Self::walk(dir, &mut index)?;
@@ -59,10 +62,20 @@ impl QrIndex {
                 index.skipped += 1;
                 continue;
             };
+            // Never follow symlinks: `Path::is_dir` follows them, so a
+            // looped link would recurse forever (and any link escapes
+            // the scanned root).
+            let Ok(ft) = entry.file_type() else {
+                index.skipped += 1;
+                continue;
+            };
+            if ft.is_symlink() {
+                continue;
+            }
             let path = entry.path();
-            if path.is_dir() {
+            if ft.is_dir() {
                 Self::walk(&path, index)?;
-            } else if path.is_file() {
+            } else if ft.is_file() {
                 match Self::read_header(&path) {
                     Some(ds) => index.records.push(QrRecord { path, dataset: ds }),
                     None => {
@@ -621,6 +634,21 @@ mod tests {
         q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "STUDY");
         q.put_null(tags::STUDY_INSTANCE_UID, Vr::Ui);
         q
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn scan_skips_symlink_loops() {
+        // A symlink pointing back at an ancestor must not recurse
+        // forever (nor escape the scanned root).
+        let dir = std::env::temp_dir().join(format!("qrdb-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::os::unix::fs::symlink(dir.join("sub"), dir.join("sub").join("loop")).unwrap();
+        std::os::unix::fs::symlink("/nonexistent-target", dir.join("dangling")).unwrap();
+        let index = QrIndex::scan(&dir).unwrap();
+        assert!(index.records.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -135,7 +135,8 @@ async fn connect(addr: &str, sops: &[&str]) -> Association {
                 TransferSyntax::ExplicitVrLittleEndian,
                 TransferSyntax::ImplicitVrLittleEndian,
             ],
-        ),
+        )
+        .unwrap(),
     )
     .await
     .unwrap()

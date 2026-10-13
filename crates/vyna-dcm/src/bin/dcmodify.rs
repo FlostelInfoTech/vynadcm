@@ -442,19 +442,37 @@ fn run(args: &Args) -> i32 {
 
 /// Write the edited file; in-place replacement goes through a
 /// temporary file + rename so a failed run keeps the original.
+///
+/// The temp name carries the pid plus an attempt counter and is
+/// created with create-new semantics: concurrent runs on the same
+/// file must not share one fixed temp name (and a planted symlink
+/// must not redirect the write elsewhere).
 fn write_output(dest: &Path, input: &Path, bytes: &[u8]) -> Result<(), String> {
     if dest != input {
         return std::fs::write(dest, bytes).map_err(|e| format!("{}: {e}", dest.display()));
     }
-    let tmp = input.with_extension("vyna-tmp");
-    if let Err(e) = std::fs::write(&tmp, bytes) {
-        return Err(format!("{}: {e}", tmp.display()));
+    for attempt in 0..100u32 {
+        let tmp = input.with_extension(format!("vyna-tmp-{}-{attempt}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        match opts.write(true).create_new(true).open(&tmp) {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(bytes) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(format!("{}: {e}", tmp.display()));
+                }
+                drop(f);
+                if let Err(e) = std::fs::rename(&tmp, input) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(format!("{}: {e}", input.display()));
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", tmp.display())),
+        }
     }
-    if let Err(e) = std::fs::rename(&tmp, input) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("{}: {e}", input.display()));
-    }
-    Ok(())
+    Err(format!("{}: cannot pick a temporary name", input.display()))
 }
 
 #[cfg(test)]
@@ -756,5 +774,28 @@ mod tests {
         )
         .unwrap();
         assert!(report.is_clean());
+    }
+
+    #[test]
+    fn in_place_write_replaces_and_cleans_up() {
+        let dir = std::env::temp_dir().join(format!("dcmodify-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("edit.dcm");
+        std::fs::write(&file, b"original").unwrap();
+        write_output(&file, &file, b"edited").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"edited");
+        // No temp litter left behind.
+        let litter: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|n| n.contains("vyna-tmp"))
+            })
+            .collect();
+        assert!(litter.is_empty(), "{litter:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

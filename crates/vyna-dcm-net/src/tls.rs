@@ -203,7 +203,8 @@ mod tests {
             propose(
                 &[vyna_dcm_core::sop_class::VERIFICATION],
                 &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
-            ),
+            )
+            .unwrap(),
         )
         .await
         .unwrap();

@@ -109,6 +109,25 @@ pub(crate) fn stored_frame_len(ds: &DataSet, rows: u16, columns: u16, decoded_le
     }
 }
 
+/// Frame count from Number of Frames: absent means 1
+/// (single-frame default), present-but-bad is an error rather than
+/// a silent 1 (which would mis-split multi-frame pixels).
+pub(crate) fn frame_count(ds: &DataSet) -> Result<usize> {
+    use vyna_dcm_core::{Vr, tags};
+    match ds.string(tags::NUMBER_OF_FRAMES) {
+        None => Ok(1),
+        Some(s) => s
+            .parse::<usize>()
+            .ok()
+            .filter(|n| *n >= 1)
+            .ok_or_else(|| Error::BadValue {
+                tag: tags::NUMBER_OF_FRAMES,
+                vr: Vr::Is,
+                message: format!("bad frame count {s:?}"),
+            }),
+    }
+}
+
 /// Whether a basic offset table is usable for JPEG-family framing:
 /// one entry per frame, starting at 0, strictly increasing, and each
 /// pointing at a codestream start (`FF D8` for JPEG/JPEG-LS, `FF 4F`
@@ -338,10 +357,7 @@ pub fn decode_pixels_with(
     let samples = ds.uint16(tags::SAMPLES_PER_PIXEL).unwrap_or(1);
     let bits = req_u16(tags::BITS_ALLOCATED)?;
     let bytes_per_sample = bits.div_ceil(8) as usize;
-    let frames: usize = ds
-        .string(tags::NUMBER_OF_FRAMES)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let frames = frame_count(ds)?;
     let frame_len = rows as usize * columns as usize * samples as usize * bytes_per_sample;
     let expected = frame_len * frames;
     let stored_len = stored_frame_len(ds, rows, columns, frame_len);
@@ -505,10 +521,7 @@ pub fn encode_pixels(
     let samples = ds.uint16(tags::SAMPLES_PER_PIXEL).unwrap_or(1);
     let bits = req_u16(tags::BITS_ALLOCATED)?;
     let bytes_per_sample = bits.div_ceil(8) as usize;
-    let frames: usize = ds
-        .string(tags::NUMBER_OF_FRAMES)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1);
+    let frames = frame_count(ds)?;
     let frame_len = rows as usize * columns as usize * samples as usize * bytes_per_sample;
     // RLE preserves stored bytes (possibly subsampled); JPEG encoders
     // take decoded RGB/mono.

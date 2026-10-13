@@ -1,6 +1,10 @@
 /target/
-Cargo.lock
 *.orig
+# The workspace ships binaries: the root lock file belongs in git for
+# reproducible builds (negated below). Nested locks (vendored crates)
+# stay ignored.
+Cargo.lock
+!/Cargo.lock
 *.rej
 .DS_Store
 .idea/
