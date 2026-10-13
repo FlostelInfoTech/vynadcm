@@ -1,0 +1,51 @@
+# VynaDCM quality gates (mirrors .gitlab-ci.yml; see NFR-07).
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+          components: clippy
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+      - run: cargo test --workspace
+
+  # Every feature combination must build (guards feature-gate drift
+  # between the bins and the optional net/web/ecg dependencies).
+  features:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.98"
+      - run: cargo check -p vyna-dcm --no-default-features
+      - run: cargo check -p vyna-dcm --no-default-features --features cli
+      - run: cargo check -p vyna-dcm --no-default-features --features cli,net
+      - run: cargo check -p vyna-dcm --no-default-features --features cli,web
