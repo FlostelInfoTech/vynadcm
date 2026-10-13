@@ -40,7 +40,7 @@ cargo build --release -p vyna-dcm --bins
 # binaries land in target/release/
 ```
 
-Requires Rust 1.98+. The tools are also runnable in place with
+Requires Rust 1.99+. The tools are also runnable in place with
 `cargo run -p vyna-dcm --bin <tool> -- <args>`.
 
 ## 2. Common connection options

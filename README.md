@@ -40,7 +40,7 @@ External crates are used only for generic infrastructure
 
 ## Quick start
 
-Requires Rust 1.98+ (edition 2024).
+Requires Rust 1.99+ (edition 2024).
 
 ```sh
 cargo build --workspace

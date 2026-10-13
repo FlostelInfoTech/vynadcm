@@ -74,7 +74,7 @@ functionality may come from outside this workspace (NFR-02).
 
 ### 2.3 Constraints
 
-Rust 1.98+, edition 2024, async via tokio, MIT license
+Rust 1.99+, edition 2024, async via tokio, MIT license
 (see NFR-01…NFR-03).
 
 ## 3. Functional requirements
@@ -366,7 +366,7 @@ Rust 1.98+, edition 2024, async via tokio, MIT license
 
 ## 4. Non-functional requirements
 
-- **NFR-01 (M)** Toolchain: Rust 1.98+, edition 2024; MSRV changes are
+- **NFR-01 (M)** Toolchain: Rust 1.99+, edition 2024; MSRV changes are
   breaking and must be announced in the changelog.
 - **NFR-02 (M)** From-scratch DICOM: no DICOM crates outside this
   workspace; third-party crates only for generic infrastructure

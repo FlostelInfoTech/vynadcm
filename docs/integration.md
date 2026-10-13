@@ -40,7 +40,7 @@ vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.4"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 ```
 
-Requires Rust 1.98+, edition 2024. `core` + `codec` are always
+Requires Rust 1.99+, edition 2024. `core` + `codec` are always
 included; gate the rest by feature:
 
 | Consumer profile | Features |

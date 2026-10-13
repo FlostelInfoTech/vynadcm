@@ -36,6 +36,8 @@ the workspace crate version (`Cargo.toml`).
 
 ### Changed
 
+- **Breaking:** MSRV raised from Rust 1.98 to 1.99 (workspace
+  `rust-version`, CI images, README/docs).
 - **Breaking (pre-1.0):** `EcgRecording::new` returns
   `vyna_dcm_ecg::Error` instead of `String`; DICOMweb `serve_*`
   functions return `vyna_dcm_web::Error` instead of `String`.

@@ -1,5 +1,5 @@
 # VynaDCM quality gates (see NFR-07 in docs/requirements.md).
-image: rust:1.98
+image: rust:1.99
 
 stages: [lint, test]
 
