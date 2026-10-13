@@ -27,20 +27,15 @@ fn deidentified_ecg_validates_with_identical_samples() {
     meta.sex = Some("M".into());
     meta.study_id = Some("S1".into());
     meta.content_date = Some("20261011".into());
+    meta.content_time = Some("120000".into());
+    meta.acquisition_datetime = Some("20261011120000".into());
+    meta.study_date = Some("20261011".into());
+    meta.study_time = Some("120000".into());
+    meta.referring_physician = Some(PersonName::parse("Ref^Doc"));
     meta.institution = Some("City Hospital".into());
     meta.series_description = Some("resting".into());
-    let mut ds = recording_to_dataset(&recording(), &meta).unwrap();
-    // The builder emits a sparse instance; complete the Type 1/2 shape.
-    use vyna_dcm::core::Vr;
-    ds.put_text(tags::STUDY_DATE, Vr::Da, "20261011");
-    ds.put_text(tags::STUDY_TIME, Vr::Tm, "120000");
-    ds.put_text(tags::CONTENT_TIME, Vr::Tm, "120000");
-    ds.put_text(tags::ACQUISITION_DATE_TIME, Vr::Dt, "20261011120000");
-    ds.put_person_name(
-        tags::REFERRING_PHYSICIAN_NAME,
-        vec![PersonName::parse("Ref^Doc")],
-    );
-    ds.put_sequence(tags::ACQUISITION_CONTEXT_SEQUENCE, vec![]);
+    // The builder emits the full Type 1/2 shape directly.
+    let ds = recording_to_dataset(&recording(), &meta).unwrap();
     let class = ds.string(tags::SOP_CLASS_UID).unwrap().to_string();
 
     let pre = validate(&ds, &class, None).unwrap();

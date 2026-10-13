@@ -90,7 +90,7 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   (text, numbers, UIDs, sequences, fragments) and builders; value
   multiplicity preserved.
 - **FR-CORE-04 (M)** Dictionary: ship the full PS3.6 registry
-  (currently 5,217 entries from PS3.6 2026d plus the command group)
+  (currently 5,239 entries from PS3.6 2026d plus the command group)
   mapping tag → (VR, VM, keyword, name, retired flag), sorted for
   binary search, plus `tags` constants; repeating (`xx`) groups stay
   unlisted.
@@ -260,13 +260,15 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   padding via the recorded length, join fragmented storage, and
   return MIME/title/SOP UID metadata. Without a usable recorded
   length the stored bytes are returned unchanged — never guessed at.
-- **FR-PDF-03 (S)** Scope honesty: Encapsulated CDA, PDF/A or magic
-  enforcement, and sequence-item validation stay out of scope.
+- **FR-PDF-03 (S)** Scope honesty: Encapsulated CDA, PDF/A, and
+  sequence-item validation stay out of scope. The builder does
+  enforce the `%PDF-` magic (non-PDF bytes are `Error::NotPdf`,
+  never mislabeled `application/pdf`).
 
 ### 3.8 De-identification (`vyna-dcm-deid`)
 
 - **FR-DEID-01 (M)** PS3.15 Annex E action semantics (dummy, zero,
-  remove, UID remap, date shift) over a curated 191-tag basic
+  remove, UID remap, date shift) over a curated 197-tag basic
   profile: patient/staff/institution/device identity,
   visit/admission/order/trial data, icon/annotation free text, all
   instance UIDs, and clinical dates. Sequences recurse; private

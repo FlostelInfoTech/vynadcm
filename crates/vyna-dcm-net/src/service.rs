@@ -9,6 +9,8 @@
 //! SCU operations are [`Association`] methods in `scu`.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -225,6 +227,92 @@ pub struct MoveInstance {
     pub dataset: DataSet,
 }
 
+/// Outcome of loading one planned retrieve instance.
+#[derive(Clone, Debug)]
+pub enum RetrieveLoad {
+    /// Instance ready to C-STORE.
+    Ready(MoveInstance),
+    /// This instance failed to load: counted as a failed
+    /// sub-operation while the retrieve continues with the rest.
+    Failed,
+}
+
+/// Loads one planned retrieve instance. The framework calls [`RetrieveLoader::load`]
+/// with sequential indices (`0..plan.total`), sending each instance
+/// before loading the next, so a large retrieve holds ~one dataset
+/// in RAM instead of the whole result set.
+pub trait RetrieveLoader: Send + Sync {
+    /// Load instance `index` (out of range → [`RetrieveLoad::Failed`]).
+    fn load(&self, index: usize) -> Pin<Box<dyn Future<Output = RetrieveLoad> + Send + '_>>;
+}
+
+/// Lazy C-MOVE/C-GET match list: cheap upfront metadata plus a
+/// per-instance loader. Handlers serving large archives override
+/// [`Handlers::on_move_plan`]/[`Handlers::on_get_plan`] to build one
+/// without loading any instance data; the framework streams
+/// load-and-send through [`RetrieveLoader::load`].
+pub struct RetrievePlan {
+    /// Total instances (drives the remaining counts).
+    pub total: usize,
+    /// Distinct storage classes (sizes the MOVE outbound proposal).
+    pub storage_classes: Vec<String>,
+    loader: Box<dyn RetrieveLoader>,
+}
+
+impl RetrievePlan {
+    /// Build a plan from parts.
+    pub fn new(
+        total: usize,
+        storage_classes: Vec<String>,
+        loader: impl RetrieveLoader + 'static,
+    ) -> Self {
+        Self {
+            total,
+            storage_classes,
+            loader: Box::new(loader),
+        }
+    }
+
+    /// Buffer an eager instance list (what the default
+    /// [`Handlers::on_move_plan`]/[`Handlers::on_get_plan`] use to
+    /// bridge legacy [`Handlers::on_move`]/[`Handlers::on_get`]).
+    pub fn buffered(instances: Vec<MoveInstance>) -> Self {
+        let mut storage_classes = Vec::new();
+        for inst in &instances {
+            if !storage_classes.contains(&inst.sop_class_uid) {
+                storage_classes.push(inst.sop_class_uid.clone());
+            }
+        }
+        Self {
+            total: instances.len(),
+            storage_classes,
+            loader: Box::new(BufferedLoader { instances }),
+        }
+    }
+
+    /// Load instance `index` for sending.
+    pub async fn load(&self, index: usize) -> RetrieveLoad {
+        self.loader.load(index).await
+    }
+}
+
+/// [`RetrieveLoader`] over an eager [`Vec`].
+struct BufferedLoader {
+    instances: Vec<MoveInstance>,
+}
+
+impl RetrieveLoader for BufferedLoader {
+    fn load(&self, index: usize) -> Pin<Box<dyn Future<Output = RetrieveLoad> + Send + '_>> {
+        let out = self
+            .instances
+            .get(index)
+            .cloned()
+            .map(RetrieveLoad::Ready)
+            .unwrap_or(RetrieveLoad::Failed);
+        Box::pin(async move { out })
+    }
+}
+
 /// DIMSE service handlers (SCP side).
 ///
 /// All methods have defaults: C-ECHO succeeds, everything else fails with a
@@ -253,6 +341,9 @@ pub trait Handlers: Send + Sync {
 
     /// C-MOVE-RQ + query + destination AE → final status plus instances
     /// the framework C-STOREs to the destination.
+    ///
+    /// Prefer [`Handlers::on_move_plan`] for large result sets: this
+    /// eager form holds every instance in RAM before the first send.
     async fn on_move(
         &self,
         _ctx: &RequestContext<'_>,
@@ -262,14 +353,38 @@ pub trait Handlers: Send + Sync {
         (status::SOP_CLASS_NOT_SUPPORTED, Vec::new())
     }
 
+    /// C-MOVE-RQ → final status plus a lazy [`RetrievePlan`] the
+    /// framework streams load-and-send. The default bridges
+    /// [`Handlers::on_move`]; override for large archives.
+    async fn on_move_plan(
+        &self,
+        ctx: &RequestContext<'_>,
+        query: &DataSet,
+        destination: &str,
+    ) -> (u16, RetrievePlan) {
+        let (s, instances) = self.on_move(ctx, query, destination).await;
+        (s, RetrievePlan::buffered(instances))
+    }
+
     /// C-GET-RQ + query → final status plus instances the framework
     /// C-STOREs back over this same association.
+    ///
+    /// Prefer [`Handlers::on_get_plan`] for large result sets: this
+    /// eager form holds every instance in RAM before the first send.
     async fn on_get(
         &self,
         _ctx: &RequestContext<'_>,
         _query: &DataSet,
     ) -> (u16, Vec<MoveInstance>) {
         (status::SOP_CLASS_NOT_SUPPORTED, Vec::new())
+    }
+
+    /// C-GET-RQ → final status plus a lazy [`RetrievePlan`] the
+    /// framework streams load-and-send. The default bridges
+    /// [`Handlers::on_get`]; override for large archives.
+    async fn on_get_plan(&self, ctx: &RequestContext<'_>, query: &DataSet) -> (u16, RetrievePlan) {
+        let (s, instances) = self.on_get(ctx, query).await;
+        (s, RetrievePlan::buffered(instances))
     }
 
     /// N-CREATE-RQ → status + optional response dataset.
@@ -607,20 +722,24 @@ async fn dispatch<H: Handlers>(
         }
         CF::N_SET_RQ => {
             let (s, ds) = handlers.on_n_set(&rctx, msg.dataset).await;
+            // Conformant requests carry Requested UIDs; echo them back as
+            // the response's Affected UIDs.
             let rsp = Command::n_set_rsp(
                 rsp_id,
-                cmd.affected_sop_class_uid.clone(),
-                cmd.affected_sop_instance_uid.clone(),
+                cmd.requested_sop_class_uid.clone(),
+                cmd.requested_sop_instance_uid.clone(),
                 s,
             );
             send_optional(assoc, ctx_id, rsp, ds).await?;
         }
         CF::N_GET_RQ => {
             let (s, ds) = handlers.on_n_get(&rctx).await;
+            // Conformant requests carry Requested UIDs; the response
+            // echoes them as Affected UIDs.
             let rsp = Command::n_get_rsp(
                 rsp_id,
-                cmd.affected_sop_class_uid.clone(),
-                cmd.affected_sop_instance_uid.clone(),
+                cmd.requested_sop_class_uid.clone(),
+                cmd.requested_sop_instance_uid.clone(),
                 s,
                 ds.is_some(),
             );
@@ -628,7 +747,12 @@ async fn dispatch<H: Handlers>(
         }
         CF::N_ACTION_RQ => {
             let (s, ds, follow_ups) = handlers.on_n_action(&rctx, msg.dataset).await;
-            let rsp = Command::n_action_rsp(rsp_id, s);
+            let rsp = Command::n_action_rsp(
+                rsp_id,
+                cmd.requested_sop_class_uid.clone(),
+                cmd.requested_sop_instance_uid.clone(),
+                s,
+            );
             send_optional(assoc, ctx_id, rsp, ds).await?;
             if status::is_success(s) {
                 for f in follow_ups {
@@ -639,16 +763,38 @@ async fn dispatch<H: Handlers>(
         CF::N_DELETE_RQ => {
             let s = handlers.on_n_delete(&rctx).await;
             assoc
-                .send(ctx_id, &Command::n_delete_rsp(rsp_id, s), None)
+                .send(
+                    ctx_id,
+                    &Command::n_delete_rsp(
+                        rsp_id,
+                        cmd.requested_sop_class_uid.clone(),
+                        cmd.requested_sop_instance_uid.clone(),
+                        s,
+                    ),
+                    None,
+                )
                 .await?;
         }
         CF::N_EVENT_REPORT_RQ => {
             let s = handlers.on_n_event_report(&rctx, msg.dataset).await;
+            // Event reports (unlike the other N-services) carry
+            // Affected UIDs in the request itself.
             assoc
-                .send(ctx_id, &Command::n_event_report_rsp(rsp_id, s), None)
+                .send(
+                    ctx_id,
+                    &Command::n_event_report_rsp(
+                        rsp_id,
+                        cmd.affected_sop_class_uid.clone(),
+                        cmd.affected_sop_instance_uid.clone(),
+                        s,
+                    ),
+                    None,
+                )
                 .await?;
         }
         _ => {
+            // No response is addressable for an unknown command, so
+            // fail closed: `run_scp` turns this into an A-ABORT.
             return Err(Error::BadCommand(format!(
                 "unrecognised command field {:#06X}",
                 cmd.field
@@ -728,7 +874,7 @@ async fn handle_move<H: Handlers>(
     let rsp_id = cmd.message_id.unwrap_or(0);
     let dest = cmd.move_destination.clone().unwrap_or_default();
     let query = msg.dataset.clone().unwrap_or_default();
-    let (handler_status, instances) = handlers.on_move(rctx, &query, dest.trim()).await;
+    let (handler_status, plan) = handlers.on_move_plan(rctx, &query, dest.trim()).await;
     let sop = cmd.affected_sop_class_uid.clone();
 
     let fail_final = async |assoc: &mut Association, s: u16| -> Result<()> {
@@ -747,12 +893,7 @@ async fn handle_move<H: Handlers>(
     };
 
     // One outbound association carrying every needed storage class.
-    let mut classes: Vec<&str> = Vec::new();
-    for inst in &instances {
-        if !classes.contains(&inst.sop_class_uid.as_str()) {
-            classes.push(inst.sop_class_uid.as_str());
-        }
-    }
+    let classes: Vec<&str> = plan.storage_classes.iter().map(String::as_str).collect();
     let ts = [
         vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian,
         vyna_dcm_core::TransferSyntax::ImplicitVrLittleEndian,
@@ -779,23 +920,36 @@ async fn handle_move<H: Handlers>(
     };
 
     let (mut done_ok, mut done_fail, mut done_warn) = (0u16, 0u16, 0u16);
-    for (i, inst) in instances.iter().enumerate() {
-        let remaining = (instances.len() - i - 1) as u16;
-        let s = outbound
-            .store(
-                &inst.dataset,
-                &inst.sop_class_uid,
-                &inst.sop_instance_uid,
-                priority::MEDIUM,
-            )
-            .await
-            .unwrap_or(status::PROCESSING_FAILURE);
-        if status::is_success(s) {
-            done_ok += 1;
-        } else if status::is_warning(s) {
-            done_warn += 1;
-        } else {
-            done_fail += 1;
+    // Stream load-and-send: each instance is loaded, stored, and
+    // dropped before the next is touched. Counters saturate: a custom
+    // handler planning >65535 instances must not panic or wrap.
+    for i in 0..plan.total {
+        let remaining = u16::try_from(plan.total.saturating_sub(i + 1)).unwrap_or(u16::MAX);
+        let outcome = match plan.load(i).await {
+            RetrieveLoad::Ready(inst) => Some(
+                outbound
+                    .store(
+                        &inst.dataset,
+                        &inst.sop_class_uid,
+                        &inst.sop_instance_uid,
+                        priority::MEDIUM,
+                    )
+                    .await
+                    .unwrap_or(status::PROCESSING_FAILURE),
+            ),
+            RetrieveLoad::Failed => {
+                done_fail = done_fail.saturating_add(1);
+                None
+            }
+        };
+        if let Some(s) = outcome {
+            if status::is_success(s) {
+                done_ok = done_ok.saturating_add(1);
+            } else if status::is_warning(s) {
+                done_warn = done_warn.saturating_add(1);
+            } else {
+                done_fail = done_fail.saturating_add(1);
+            }
         }
         let rsp = Command::move_get_rsp(
             true,
@@ -856,7 +1010,7 @@ async fn handle_get<H: Handlers>(
     let cmd = msg.command.clone();
     let rsp_id = cmd.message_id.unwrap_or(0);
     let query = msg.dataset.clone().unwrap_or_default();
-    let (handler_status, instances) = handlers.on_get(rctx, &query).await;
+    let (handler_status, plan) = handlers.on_get_plan(rctx, &query).await;
     let sop = cmd.affected_sop_class_uid.clone();
 
     if status::is_failure(handler_status) || status::is_cancel(handler_status) {
@@ -865,10 +1019,29 @@ async fn handle_get<H: Handlers>(
         return Ok(());
     }
     let (mut done_ok, mut done_fail, mut done_warn) = (0u16, 0u16, 0u16);
-    for (i, inst) in instances.iter().enumerate() {
-        let remaining = (instances.len() - i - 1) as u16;
+    // Stream load-and-send (counters saturate past 65535; see handle_move).
+    for i in 0..plan.total {
+        let remaining = u16::try_from(plan.total.saturating_sub(i + 1)).unwrap_or(u16::MAX);
+        let inst = match plan.load(i).await {
+            RetrieveLoad::Ready(inst) => inst,
+            RetrieveLoad::Failed => {
+                done_fail = done_fail.saturating_add(1);
+                let rsp = Command::move_get_rsp(
+                    false,
+                    rsp_id,
+                    sop.clone(),
+                    status::PENDING,
+                    remaining,
+                    done_ok,
+                    done_fail,
+                    done_warn,
+                );
+                assoc.send(ctx_id, &rsp, None).await?;
+                continue;
+            }
+        };
         let Some(st_ctx) = assoc.context_for(&inst.sop_class_uid).cloned() else {
-            done_fail += 1;
+            done_fail = done_fail.saturating_add(1);
             let rsp = Command::move_get_rsp(
                 false,
                 rsp_id,
@@ -927,11 +1100,11 @@ async fn handle_get<H: Handlers>(
             DimseEvent::Released => return Err(Error::Released),
         };
         if status::is_success(store_status) {
-            done_ok += 1;
+            done_ok = done_ok.saturating_add(1);
         } else if status::is_warning(store_status) {
-            done_warn += 1;
+            done_warn = done_warn.saturating_add(1);
         } else {
-            done_fail += 1;
+            done_fail = done_fail.saturating_add(1);
         }
         let rsp = Command::move_get_rsp(
             false,

@@ -14,12 +14,16 @@
 //!   and unknown VRs compare as plain strings.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use vyna_dcm_codec::read_part10;
 use vyna_dcm_core::{DataElement, DataSet, Tag, Value, Vr, tags};
 
 use crate::dimse::status;
-use crate::service::{Handlers, MoveInstance, RequestContext, ScpFollowUp};
+use crate::service::{
+    Handlers, MoveInstance, RequestContext, RetrieveLoad, RetrieveLoader, RetrievePlan, ScpFollowUp,
+};
 use crate::worklist::{COMMITMENT_ACTION_REQUEST, COMMITMENT_EVENT_TYPE, STORAGE_COMMITMENT_PUSH};
 
 /// One indexed file: path plus its header dataset (pixels stripped).
@@ -43,14 +47,15 @@ impl QrIndex {
     /// Scan `dir` recursively for Part-10 files.
     ///
     /// Symlinks are never followed (a looped link would recurse
-    /// forever, and any link escapes the scanned root).
+    /// forever, and any link escapes the scanned root). Depth is
+    /// capped at `MAX_SCAN_DEPTH` (64) levels.
     pub fn scan(dir: &Path) -> crate::Result<Self> {
         let mut index = Self::default();
-        Self::walk(dir, &mut index)?;
+        Self::walk(dir, &mut index, 0)?;
         Ok(index)
     }
 
-    fn walk(dir: &Path, index: &mut Self) -> crate::Result<()> {
+    fn walk(dir: &Path, index: &mut Self, depth: usize) -> crate::Result<()> {
         let entries = std::fs::read_dir(dir).map_err(|e| {
             crate::Error::Io(std::io::Error::new(
                 e.kind(),
@@ -74,7 +79,15 @@ impl QrIndex {
             }
             let path = entry.path();
             if ft.is_dir() {
-                Self::walk(&path, index)?;
+                if depth >= MAX_SCAN_DEPTH {
+                    tracing::warn!(
+                        "qrdb: directory {} past max scan depth, skipped",
+                        path.display()
+                    );
+                    index.skipped += 1;
+                    continue;
+                }
+                Self::walk(&path, index, depth + 1)?;
             } else if ft.is_file() {
                 match Self::read_header(&path) {
                     Some(ds) => index.records.push(QrRecord { path, dataset: ds }),
@@ -114,6 +127,10 @@ impl QrIndex {
 /// into RAM (C-FIND: `A700`; MOVE/GET: `A701`, unable to calculate
 /// the number of matches).
 const MAX_QR_MATCHES: usize = 10_000;
+
+/// Maximum directory depth [`QrIndex::scan`] descends: pathological
+/// local nesting must not overflow the stack.
+const MAX_SCAN_DEPTH: usize = 64;
 
 /// Run a C-FIND query (`mwl` selects worklist matching): status plus
 /// one response dataset per match, capped at `MAX_QR_MATCHES` (10,000).
@@ -526,73 +543,114 @@ impl Handlers for QrScp {
         find_matches(&self.index, query, false)
     }
 
-    async fn on_move(
+    async fn on_move_plan(
         &self,
         ctx: &RequestContext<'_>,
         query: &DataSet,
         _destination: &str,
-    ) -> (u16, Vec<MoveInstance>) {
+    ) -> (u16, RetrievePlan) {
         if !is_qr_move(&ctx.context.abstract_syntax) {
-            return (status::SOP_CLASS_NOT_SUPPORTED, Vec::new());
+            return (
+                status::SOP_CLASS_NOT_SUPPORTED,
+                RetrievePlan::buffered(Vec::new()),
+            );
         }
-        retrieve_matches(&self.index, query).await
+        retrieve_plan(&self.index, query)
     }
 
-    async fn on_get(&self, ctx: &RequestContext<'_>, query: &DataSet) -> (u16, Vec<MoveInstance>) {
+    async fn on_get_plan(&self, ctx: &RequestContext<'_>, query: &DataSet) -> (u16, RetrievePlan) {
         if !is_qr_get(&ctx.context.abstract_syntax) {
-            return (status::SOP_CLASS_NOT_SUPPORTED, Vec::new());
+            return (
+                status::SOP_CLASS_NOT_SUPPORTED,
+                RetrievePlan::buffered(Vec::new()),
+            );
         }
-        retrieve_matches(&self.index, query).await
+        retrieve_plan(&self.index, query)
     }
 }
 
-/// Files matching a MOVE/GET query, each read in full. Level is still
-/// required; matches dedupe by SOP Instance UID.
-async fn retrieve_matches(index: &QrIndex, query: &DataSet) -> (u16, Vec<MoveInstance>) {
+/// Plan a MOVE/GET retrieve from header matches only: no instance
+/// data is loaded here. Level is still required; matches dedupe by
+/// SOP Instance UID. The framework then streams load-and-send through
+/// [`FileLoader`], so a 10k-match retrieve holds ~one dataset in RAM.
+/// A file that fails to load counts one failed sub-operation while
+/// the rest continue (previously the whole retrieve failed).
+fn retrieve_plan(index: &QrIndex, query: &DataSet) -> (u16, RetrievePlan) {
     if query_level(query).is_err() {
-        return (status::DATASET_MISMATCH, Vec::new());
+        return (status::DATASET_MISMATCH, RetrievePlan::buffered(Vec::new()));
     }
     let mut seen = HashSet::new();
-    let mut out = Vec::new();
+    let mut paths = Vec::new();
+    let mut classes: Vec<String> = Vec::new();
     for record in &index.records {
         if !dataset_matches(&record.dataset, query) {
             continue;
         }
-        match level_key(&record.dataset, QrLevel::Image) {
-            Some(key) if !seen.contains(&key) => {
-                seen.insert(key);
-            }
-            _ => continue,
+        let Some(key) = level_key(&record.dataset, QrLevel::Image) else {
+            continue;
+        };
+        if !seen.insert(key) {
+            continue;
         }
-        // Checked before the file read: the (MAX+1)-th match fails
-        // without loading anything more into RAM.
-        if out.len() >= MAX_QR_MATCHES {
-            return (status::UNABLE_TO_CALCULATE_MATCHES, Vec::new());
+        // Checked before queueing: the (MAX+1)-th match fails without
+        // planning anything more.
+        if paths.len() >= MAX_QR_MATCHES {
+            return (
+                status::UNABLE_TO_CALCULATE_MATCHES,
+                RetrievePlan::buffered(Vec::new()),
+            );
         }
-        let bytes = match tokio::fs::read(&record.path).await {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!("qrdb: cannot re-read {}: {e}", record.path.display());
-                return (status::PROCESSING_FAILURE, Vec::new());
+        if let Some(class) = record.dataset.string(tags::SOP_CLASS_UID) {
+            let class = class.to_string();
+            if !classes.contains(&class) {
+                classes.push(class);
             }
-        };
-        let Ok((_, ds)) = read_part10(&bytes) else {
-            tracing::warn!("qrdb: {} changed on disk", record.path.display());
-            return (status::PROCESSING_FAILURE, Vec::new());
-        };
-        let (Some(class), Some(inst)) = (
-            ds.string(tags::SOP_CLASS_UID).map(str::to_string),
-            ds.string(tags::SOP_INSTANCE_UID).map(str::to_string),
-        ) else {
-            return (status::PROCESSING_FAILURE, Vec::new());
-        };
-        out.push(MoveInstance {
-            sop_class_uid: class,
-            sop_instance_uid: inst,
-            dataset: ds,
-        });
+        }
+        paths.push(record.path.clone());
     }
-    (status::SUCCESS, out)
+    let total = paths.len();
+    (
+        status::SUCCESS,
+        RetrievePlan::new(total, classes, FileLoader { paths }),
+    )
+}
+
+/// Loads one planned file just before its C-STORE.
+struct FileLoader {
+    paths: Vec<PathBuf>,
+}
+
+impl RetrieveLoader for FileLoader {
+    fn load(&self, index: usize) -> Pin<Box<dyn Future<Output = RetrieveLoad> + Send + '_>> {
+        let path = self.paths.get(index).cloned();
+        Box::pin(async move {
+            let Some(path) = path else {
+                return RetrieveLoad::Failed;
+            };
+            let bytes = match tokio::fs::read(&path).await {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    tracing::warn!("qrdb: cannot re-read {}: {e}", path.display());
+                    return RetrieveLoad::Failed;
+                }
+            };
+            let Ok((_, ds)) = read_part10(&bytes) else {
+                tracing::warn!("qrdb: {} changed on disk", path.display());
+                return RetrieveLoad::Failed;
+            };
+            let (Some(class), Some(inst)) = (
+                ds.string(tags::SOP_CLASS_UID).map(str::to_string),
+                ds.string(tags::SOP_INSTANCE_UID).map(str::to_string),
+            ) else {
+                return RetrieveLoad::Failed;
+            };
+            RetrieveLoad::Ready(MoveInstance {
+                sop_class_uid: class,
+                sop_instance_uid: inst,
+                dataset: ds,
+            })
+        })
+    }
 }
 
 impl Handlers for MwlScp {
@@ -685,7 +743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retrieve_flood_fails_before_reading() {
+    async fn retrieve_flood_fails_at_plan_time() {
         // One shared file keeps the fixture cheap; distinct index keys
         // still drive the match count past the cap.
         let dir = std::env::temp_dir().join(format!("qrdb-flood-{}", std::process::id()));
@@ -723,10 +781,71 @@ mod tests {
         };
         let mut q = study_query();
         q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "IMAGE");
+        // Plan-time cap: no instance data is touched at all.
+        let (s, plan) = retrieve_plan(&idx, &q);
+        assert_eq!(s, status::UNABLE_TO_CALCULATE_MATCHES);
+        assert_eq!(plan.total, 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn retrieve_plan_streams_one_file_at_a_time() {
+        // Two matches over real files: the plan carries paths only,
+        // and each load() reads exactly one file on demand.
+        let dir = std::env::temp_dir().join(format!("qrdb-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut records = Vec::new();
+        for i in 0..2 {
+            let path = dir.join(format!("img{i}.dcm"));
+            let mut ds = DataSet::new();
+            ds.put_uid(
+                vyna_dcm_core::tags::SOP_CLASS_UID,
+                "1.2.840.10008.5.1.4.1.1.2",
+            );
+            ds.put_uid(vyna_dcm_core::tags::SOP_INSTANCE_UID, format!("1.2.7.{i}"));
+            let meta = vyna_dcm_codec::FileMeta::new(
+                "1.2.840.10008.5.1.4.1.1.2",
+                format!("1.2.7.{i}"),
+                vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian,
+            );
+            std::fs::write(&path, vyna_dcm_codec::write_part10(&meta, &ds).unwrap()).unwrap();
+            let mut r = record("P", "1.2.7", "1.2.7.1", &format!("1.2.7.{i}"), "20240115");
+            // Header carries the class for the plan (as scan would).
+            r.dataset.put_uid(
+                vyna_dcm_core::tags::SOP_CLASS_UID,
+                "1.2.840.10008.5.1.4.1.1.2",
+            );
+            r.path = path;
+            records.push(r);
+        }
+        let idx = QrIndex {
+            records,
+            skipped: 0,
+        };
+        let mut q = study_query();
+        q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "IMAGE");
+        let (s, plan) = retrieve_plan(&idx, &q);
+        assert_eq!(s, status::SUCCESS);
+        assert_eq!(plan.total, 2);
         assert_eq!(
-            retrieve_matches(&idx, &q).await.0,
-            status::UNABLE_TO_CALCULATE_MATCHES
+            plan.storage_classes,
+            vec!["1.2.840.10008.5.1.4.1.1.2".to_string()]
         );
+        for (i, want) in ["1.2.7.0", "1.2.7.1"].iter().enumerate() {
+            match plan.load(i).await {
+                RetrieveLoad::Ready(inst) => {
+                    assert_eq!(&inst.sop_instance_uid, want);
+                    assert_eq!(
+                        inst.dataset.string(vyna_dcm_core::tags::SOP_INSTANCE_UID),
+                        Some(*want)
+                    );
+                }
+                RetrieveLoad::Failed => panic!("load({i}) unexpectedly failed"),
+            }
+        }
+        // Out of range loads fail rather than panic.
+        assert!(matches!(plan.load(2).await, RetrieveLoad::Failed));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

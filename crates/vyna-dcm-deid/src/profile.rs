@@ -116,6 +116,11 @@ pub const BASIC_PROFILE: &[(Tag, Action)] = &[
     (tags::OTHER_PATIENT_NAMES, Action::Remove),
     (tags::OTHER_PATIENT_I_DS, Action::Remove),
     (tags::OTHER_PATIENT_I_DS_SEQUENCE, Action::Remove),
+    // E.1 basic X (all Type 3).
+    (tags::ADDITIONAL_PATIENT_HISTORY, Action::Remove),
+    (tags::REASON_FOR_THE_REQUESTED_PROCEDURE, Action::Remove),
+    (tags::REFERENCED_PATIENT_SEQUENCE, Action::Remove),
+    (tags::ISSUE_DATE_OF_IMAGING_SERVICE_REQUEST, Action::Remove),
     (tags::RESPONSIBLE_PERSON, Action::Remove),
     (tags::RESPONSIBLE_ORGANIZATION, Action::Remove),
     (tags::PATIENT_SPECIES_DESCRIPTION, Action::Remove),
@@ -277,6 +282,12 @@ pub const BASIC_PROFILE: &[(Tag, Action)] = &[
     (tags::TIMEZONE_OFFSET_FROM_UTC, Action::Zero),
     (tags::SMOKING_STATUS, Action::Zero),
     (tags::PREGNANCY_STATUS, Action::Zero),
+    // E.1 basic Z.
+    (tags::PATIENT_SEX, Action::Zero),
+    // E.1 basic X, but Type 2: zeroing removes the content while
+    // keeping the element IOD-valid.
+    (tags::MEDICAL_ALERTS, Action::Zero),
+    (tags::ALLERGIES, Action::Zero),
     (tags::PATIENT_AGE, Action::Zero),
     (tags::PATIENT_SIZE, Action::Zero),
     (tags::PATIENT_WEIGHT, Action::Zero),

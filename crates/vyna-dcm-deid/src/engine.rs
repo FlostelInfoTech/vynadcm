@@ -91,14 +91,7 @@ impl Deidentifier {
     /// must rewrite it through [`uid_map`](Self::uid_map), or the
     /// original UIDs leak into the output meta header.
     pub fn apply(&mut self, ds: &mut DataSet) -> Result<DeidReport> {
-        // Trim NUL padding as well as whitespace ("YES\0" from dirty
-        // writers must refuse, not slip through), and compare
-        // case-insensitively: this is a safety gate, not a parser.
-        let burned_in = ds.string(tags::BURNED_IN_ANNOTATION).is_some_and(|s| {
-            s.trim_matches(|c: char| c.is_whitespace() || c == '\0')
-                .eq_ignore_ascii_case("YES")
-        });
-        if burned_in {
+        if has_burned_in_yes(ds) {
             return Err(Error::BurnedInAnnotation);
         }
         let mut report = DeidReport::default();
@@ -198,6 +191,9 @@ impl Deidentifier {
             return;
         };
         let Value::Text(values) = &mut el.value else {
+            report
+                .warnings
+                .push(format!("UID element kept (not text): {tag:?}"));
             return;
         };
         for value in values.iter_mut().filter(|s| !s.is_empty()) {
@@ -218,6 +214,9 @@ impl Deidentifier {
             return;
         };
         let Value::Text(values) = &mut el.value else {
+            report
+                .warnings
+                .push(format!("date element kept (not text): {tag:?}"));
             return;
         };
         let is_dt = el.vr == Vr::Dt;
@@ -275,6 +274,24 @@ pub struct DeidReport {
 /// Overlay plane groups (`0x6000..=0x60FF`).
 fn is_overlay(tag: Tag) -> bool {
     (0x6000..=0x60FF).contains(&tag.group())
+}
+
+/// Burned-in-PHI gate, top level and sequence items alike (the tag is
+/// top-level-only in practice, but a nested `YES` must refuse too).
+fn has_burned_in_yes(ds: &DataSet) -> bool {
+    // Trim NUL padding as well as whitespace ("YES\0" from dirty
+    // writers must refuse, not slip through), and compare
+    // case-insensitively: this is a safety gate, not a parser.
+    if ds.string(tags::BURNED_IN_ANNOTATION).is_some_and(|s| {
+        s.trim_matches(|c: char| c.is_whitespace() || c == '\0')
+            .eq_ignore_ascii_case("YES")
+    }) {
+        return true;
+    }
+    ds.iter().any(|(_, el)| match &el.value {
+        Value::Sequence(items) => items.iter().any(has_burned_in_yes),
+        _ => false,
+    })
 }
 
 #[cfg(test)]
@@ -388,6 +405,59 @@ mod tests {
     }
 
     #[test]
+    fn e1_stragglers_are_handled() {
+        // The seven E.1 identifying attributes once absent from the
+        // profile: none may survive while the output stamps Basic
+        // Profile conformance.
+        let mut ds = DataSet::new();
+        ds.put_text(tags::PATIENT_SEX, Vr::Cs, "F");
+        ds.put_text(tags::MEDICAL_ALERTS, Vr::Lo, "penicillin");
+        ds.put_text(tags::ALLERGIES, Vr::Lo, "latex");
+        ds.put_text(tags::ADDITIONAL_PATIENT_HISTORY, Vr::Lt, "smoker");
+        ds.put_text(
+            tags::REASON_FOR_THE_REQUESTED_PROCEDURE,
+            Vr::Sh,
+            "rule out MI",
+        );
+        ds.put_sequence(tags::REFERENCED_PATIENT_SEQUENCE, vec![DataSet::new()]);
+        ds.put_text(
+            tags::ISSUE_DATE_OF_IMAGING_SERVICE_REQUEST,
+            Vr::Da,
+            "20240115",
+        );
+        Deidentifier::new().apply(&mut ds).unwrap();
+        for tag in [tags::PATIENT_SEX, tags::MEDICAL_ALERTS, tags::ALLERGIES] {
+            let el = ds.get(tag).expect("Type 2 stays present");
+            assert!(el.value.is_empty(), "{tag} not emptied");
+        }
+        for tag in [
+            tags::ADDITIONAL_PATIENT_HISTORY,
+            tags::REASON_FOR_THE_REQUESTED_PROCEDURE,
+            tags::REFERENCED_PATIENT_SEQUENCE,
+            tags::ISSUE_DATE_OF_IMAGING_SERVICE_REQUEST,
+        ] {
+            assert!(ds.get(tag).is_none(), "{tag} not removed");
+        }
+        assert_eq!(ds.string(tags::PATIENT_IDENTITY_REMOVED), Some("YES"));
+    }
+
+    #[test]
+    fn mistyped_uid_and_date_warn_and_keep() {
+        let mut ds = DataSet::new();
+        ds.put_bytes(tags::STUDY_INSTANCE_UID, Vr::Ob, vec![1, 2, 3]);
+        ds.put_bytes(tags::STUDY_DATE, Vr::Ob, vec![4, 5, 6]);
+        let report = Deidentifier::new()
+            .with_date_offset(7)
+            .apply(&mut ds)
+            .unwrap();
+        assert_eq!(report.warnings.len(), 2);
+        assert!(matches!(
+            ds.get(tags::STUDY_INSTANCE_UID).map(|e| &e.value),
+            Some(Value::Bytes(_))
+        ));
+    }
+
+    #[test]
     fn burned_in_annotation_refuses_before_mutation() {
         let mut ds = DataSet::new();
         ds.put_text(tags::BURNED_IN_ANNOTATION, Vr::Cs, "YES");
@@ -395,6 +465,13 @@ mod tests {
         let err = Deidentifier::new().apply(&mut ds).unwrap_err();
         assert!(matches!(err, Error::BurnedInAnnotation));
         assert_eq!(ds.string(tags::PATIENT_ID), Some("E123"));
+        // A YES nested in a sequence item refuses just the same.
+        let mut ds = DataSet::new();
+        let mut item = DataSet::new();
+        item.put_text(tags::BURNED_IN_ANNOTATION, Vr::Cs, "YES");
+        ds.put_sequence(tags::REQUEST_ATTRIBUTES_SEQUENCE, vec![item]);
+        let err = Deidentifier::new().apply(&mut ds).unwrap_err();
+        assert!(matches!(err, Error::BurnedInAnnotation));
     }
 
     #[test]

@@ -306,12 +306,21 @@ impl Association {
 
     /// Send one DIMSE message (command Implicit VR LE, dataset in the
     /// context's transfer syntax), fragmented to the peer's max PDU.
+    ///
+    /// The caller must keep `command.data_set_type` consistent with
+    /// `dataset` (`None` ⟺ `DATA_SET_NULL`): a mismatch puts a
+    /// dataset-less command on the wire with data (or vice versa).
     pub async fn send(
         &mut self,
         context_id: u8,
         command: &Command,
         dataset: Option<&vyna_dcm_core::DataSet>,
     ) -> Result<()> {
+        debug_assert_eq!(
+            command.has_dataset(),
+            dataset.is_some(),
+            "command data_set_type disagrees with dataset presence"
+        );
         let ctx = self
             .context_by_id(context_id)
             .ok_or(Error::UnknownContext(context_id))?

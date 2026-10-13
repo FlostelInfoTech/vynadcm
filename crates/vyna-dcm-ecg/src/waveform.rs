@@ -40,10 +40,21 @@ pub struct EcgInstanceMeta {
     pub study_id: Option<String>,
     /// Accession number.
     pub accession: Option<String>,
-    /// Content (acquisition) date/time; omit when unknown.
+    /// Study date `YYYYMMDD` (Type 2: empty when unknown).
+    pub study_date: Option<String>,
+    /// Study time `HHMMSS` (Type 2: empty when unknown).
+    pub study_time: Option<String>,
+    /// Content date `YYYYMMDD` (Type 1: required).
     pub content_date: Option<String>,
-    /// Content time `HHMMSS`.
+    /// Content time `HHMMSS` (Type 1: required).
     pub content_time: Option<String>,
+    /// Acquisition date/time `YYYYMMDDHHMMSS[.ffffff][±HHMM]`
+    /// (Type 1: required).
+    pub acquisition_datetime: Option<String>,
+    /// Referring physician's name (Type 2: empty when unknown).
+    pub referring_physician: Option<PersonName>,
+    /// Acquisition Context Sequence items (Type 2: empty when none).
+    pub acquisition_context: Vec<DataSet>,
     /// Institution name.
     pub institution: Option<String>,
     /// Manufacturer; default `Vyna`.
@@ -58,6 +69,9 @@ pub struct EcgInstanceMeta {
 
 impl EcgInstanceMeta {
     /// Minimal metadata; UIDs are generated when left empty.
+    /// [`recording_to_dataset`] still needs the Type 1 datetimes
+    /// ([`EcgInstanceMeta::content_date`], `content_time`,
+    /// `acquisition_datetime`): there is no honest default for them.
     pub fn new(patient_name: PersonName, patient_id: impl Into<String>) -> Self {
         Self {
             sop_class_uid: SOP_12_LEAD_ECG.to_string(),
@@ -70,14 +84,53 @@ impl EcgInstanceMeta {
             sex: None,
             study_id: None,
             accession: None,
+            study_date: None,
+            study_time: None,
             content_date: None,
             content_time: None,
+            acquisition_datetime: None,
+            referring_physician: None,
+            acquisition_context: Vec::new(),
             institution: None,
             manufacturer: "Vyna".into(),
             model: "VynaECG".into(),
             series_description: None,
             instance_number: "1".into(),
         }
+    }
+
+    /// True when any stored text needs non-ASCII (UTF-8) encoding.
+    fn needs_utf8(&self) -> bool {
+        fn pn_non_ascii(pn: &PersonName) -> bool {
+            [&pn.alphabetic]
+                .into_iter()
+                .chain(pn.ideographic.as_ref())
+                .chain(pn.phonetic.as_ref())
+                .flat_map(|g| [&g.family, &g.given, &g.middle, &g.prefix, &g.suffix])
+                .any(|s| !s.is_ascii())
+        }
+        pn_non_ascii(&self.patient_name)
+            || self.referring_physician.as_ref().is_some_and(pn_non_ascii)
+            || !self.patient_id.is_ascii()
+            || [
+                &self.birth_date,
+                &self.sex,
+                &self.study_id,
+                &self.accession,
+                &self.study_date,
+                &self.study_time,
+                &self.content_date,
+                &self.content_time,
+                &self.acquisition_datetime,
+                &self.institution,
+                &self.series_description,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|s| !s.is_ascii())
+            || !self.manufacturer.is_ascii()
+            || !self.model.is_ascii()
+            || !self.instance_number.is_ascii()
     }
 
     fn fill_uids(&mut self) {
@@ -258,17 +311,26 @@ fn ds_format(v: f64) -> Option<String> {
     if v == 0.0 {
         return Some("0".into());
     }
-    let mut s = format!("{v:.9}");
-    while s.contains('.') && s.ends_with('0') {
-        s.pop();
+    // Full precision first, then fewer decimals until the 16-char DS
+    // limit holds. A blind truncate would corrupt the value (or leave
+    // a trailing dot); absurd magnitudes fall back to scientific
+    // notation, which DS permits.
+    for prec in (0..=9).rev() {
+        let mut s = format!("{v:.prec$}");
+        if s.contains('.') {
+            while s.ends_with('0') {
+                s.pop();
+            }
+            if s.ends_with('.') {
+                s.pop();
+            }
+        }
+        if s.len() <= 16 {
+            return Some(s);
+        }
     }
-    if s.ends_with('.') {
-        s.pop();
-    }
-    if s.len() > 16 {
-        s.truncate(16);
-    }
-    Some(s)
+    let s = format!("{v:.6e}");
+    if s.len() <= 16 { Some(s) } else { None }
 }
 
 /// Interleave channel samples (sample-major, little-endian).
@@ -362,10 +424,19 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
     let mut leads = Vec::with_capacity(channels);
     for (c, def) in defs.iter().enumerate() {
         let label = def.string(tags::CHANNEL_LABEL).unwrap_or("?").to_string();
+        // `f64::from_str` accepts "NaN"/"inf", which the encoder
+        // refuses to write: treat non-finite like unparsable (fall
+        // back to the default) so parse/encode agree.
         let num = |tag, default: f64| {
             def.string(tag)
                 .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite())
                 .unwrap_or(default)
+        };
+        let opt_num = |tag| {
+            def.string(tag)
+                .and_then(|s| s.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite())
         };
         let units = def
             .sequence(tags::CHANNEL_SENSITIVITY_UNITS_SEQUENCE)
@@ -404,15 +475,9 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
             correction_factor: num(tags::CHANNEL_SENSITIVITY_CORRECTION_FACTOR, 1.0),
             baseline: num(tags::CHANNEL_BASELINE, 0.0),
             mdc_code,
-            filter_low_hz: def
-                .string(tags::FILTER_LOW_FREQUENCY)
-                .and_then(|s| s.parse().ok()),
-            filter_high_hz: def
-                .string(tags::FILTER_HIGH_FREQUENCY)
-                .and_then(|s| s.parse().ok()),
-            notch_hz: def
-                .string(tags::NOTCH_FILTER_FREQUENCY)
-                .and_then(|s| s.parse().ok()),
+            filter_low_hz: opt_num(tags::FILTER_LOW_FREQUENCY),
+            filter_high_hz: opt_num(tags::FILTER_HIGH_FREQUENCY),
+            notch_hz: opt_num(tags::NOTCH_FILTER_FREQUENCY),
         });
     }
 
@@ -424,7 +489,8 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
     rec.multiplex_label = item.string(tags::MULTIPLEX_GROUP_LABEL).map(str::to_string);
     rec.powerline_hz = item
         .string(tags::POWERLINE_FREQUENCY)
-        .and_then(|s| s.parse().ok());
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .filter(|v| v.is_finite());
     rec.amplifier_type = item
         .string(tags::WAVEFORM_AMPLIFIER_TYPE)
         .map(str::to_string);
@@ -445,10 +511,28 @@ fn waveform_bytes(item: &DataSet) -> Result<Vec<u8>> {
 }
 
 /// Build a complete ECG SOP instance dataset from a recording + metadata.
+///
+/// Every Type 1 attribute is written with a value (missing Type 1
+/// datetimes are [`Error::Missing`], never fabricated) and every
+/// Type 2 attribute is at least present, so the result validates
+/// against the ECG IODs.
 pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Result<DataSet> {
     let mut meta = meta.clone();
     meta.fill_uids();
+    // Type 1 datetimes: required with real values.
+    for (tag, v) in [
+        (tags::CONTENT_DATE, &meta.content_date),
+        (tags::CONTENT_TIME, &meta.content_time),
+        (tags::ACQUISITION_DATE_TIME, &meta.acquisition_datetime),
+    ] {
+        if v.as_ref().is_none_or(|s| s.is_empty()) {
+            return Err(Error::Missing(tag.to_string()));
+        }
+    }
     let mut ds = DataSet::new();
+    if meta.needs_utf8() {
+        ds.put_text(tags::SPECIFIC_CHARACTER_SET, Vr::Cs, "ISO_IR 192");
+    }
     ds.put_uid(tags::SOP_CLASS_UID, meta.sop_class_uid.clone());
     ds.put_uid(tags::SOP_INSTANCE_UID, meta.sop_instance_uid.clone());
     ds.put_uid(tags::STUDY_INSTANCE_UID, meta.study_uid.clone());
@@ -458,24 +542,36 @@ pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Resul
     ds.put_text(tags::MANUFACTURER_MODEL_NAME, Vr::Lo, meta.model.clone());
     ds.put_person_name(tags::PATIENT_NAME, vec![meta.patient_name.clone()]);
     ds.put_text(tags::PATIENT_ID, Vr::Lo, meta.patient_id.clone());
-    if let Some(d) = &meta.birth_date {
-        ds.put_text(tags::PATIENT_BIRTH_DATE, Vr::Da, d.clone());
+    // Type 2: present with a value, else present-but-empty.
+    put_optional_text(&mut ds, tags::PATIENT_BIRTH_DATE, Vr::Da, &meta.birth_date);
+    put_optional_text(&mut ds, tags::PATIENT_SEX, Vr::Cs, &meta.sex);
+    put_optional_text(&mut ds, tags::STUDY_ID, Vr::Sh, &meta.study_id);
+    put_optional_text(&mut ds, tags::ACCESSION_NUMBER, Vr::Sh, &meta.accession);
+    put_optional_text(&mut ds, tags::STUDY_DATE, Vr::Da, &meta.study_date);
+    put_optional_text(&mut ds, tags::STUDY_TIME, Vr::Tm, &meta.study_time);
+    ds.put_text(
+        tags::CONTENT_DATE,
+        Vr::Da,
+        meta.content_date.clone().unwrap_or_default(),
+    );
+    ds.put_text(
+        tags::CONTENT_TIME,
+        Vr::Tm,
+        meta.content_time.clone().unwrap_or_default(),
+    );
+    ds.put_text(
+        tags::ACQUISITION_DATE_TIME,
+        Vr::Dt,
+        meta.acquisition_datetime.clone().unwrap_or_default(),
+    );
+    match &meta.referring_physician {
+        Some(pn) => ds.put_person_name(tags::REFERRING_PHYSICIAN_NAME, vec![pn.clone()]),
+        None => ds.put_null(tags::REFERRING_PHYSICIAN_NAME, Vr::Pn),
     }
-    if let Some(s) = &meta.sex {
-        ds.put_text(tags::PATIENT_SEX, Vr::Cs, s.clone());
-    }
-    if let Some(s) = &meta.study_id {
-        ds.put_text(tags::STUDY_ID, Vr::Sh, s.clone());
-    }
-    if let Some(a) = &meta.accession {
-        ds.put_text(tags::ACCESSION_NUMBER, Vr::Sh, a.clone());
-    }
-    if let Some(d) = &meta.content_date {
-        ds.put_text(tags::CONTENT_DATE, Vr::Da, d.clone());
-    }
-    if let Some(t) = &meta.content_time {
-        ds.put_text(tags::CONTENT_TIME, Vr::Tm, t.clone());
-    }
+    ds.put_sequence(
+        tags::ACQUISITION_CONTEXT_SEQUENCE,
+        meta.acquisition_context.clone(),
+    );
     if let Some(i) = &meta.institution {
         ds.put_text(tags::INSTITUTION_NAME, Vr::Lo, i.clone());
     }
@@ -489,6 +585,13 @@ pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Resul
         vec![recording_to_waveform_item(rec)?],
     );
     Ok(ds)
+}
+
+fn put_optional_text(ds: &mut DataSet, tag: vyna_dcm_core::Tag, vr: Vr, v: &Option<String>) {
+    match v {
+        Some(s) => ds.put_text(tag, vr, s.clone()),
+        None => ds.put_null(tag, vr),
+    }
 }
 
 /// File meta matching an ECG instance dataset.
@@ -583,6 +686,8 @@ mod tests {
         let mut meta = EcgInstanceMeta::new(PersonName::parse("Doe^Jane"), "E123");
         meta.accession = Some("A456".into());
         meta.content_date = Some("20261011".into());
+        meta.content_time = Some("120000".into());
+        meta.acquisition_datetime = Some("20261011120000".into());
         let ds = recording_to_dataset(&rec, &meta).unwrap();
         assert_eq!(ds.string(tags::MODALITY), Some("ECG"));
         assert_eq!(ds.string(tags::SOP_CLASS_UID), Some(SOP_12_LEAD_ECG));
@@ -591,10 +696,50 @@ mod tests {
         assert!(vyna_dcm_core::is_valid_uid(
             ds.string(tags::SOP_INSTANCE_UID).unwrap()
         ));
+        // Type 2 shape is complete: unknown values are present-but-empty.
+        for tag in [
+            tags::STUDY_DATE,
+            tags::STUDY_TIME,
+            tags::PATIENT_BIRTH_DATE,
+            tags::PATIENT_SEX,
+            tags::STUDY_ID,
+            tags::REFERRING_PHYSICIAN_NAME,
+            tags::ACQUISITION_CONTEXT_SEQUENCE,
+        ] {
+            assert!(ds.get(tag).is_some(), "missing {tag}");
+        }
+        assert_eq!(
+            ds.sequence(tags::ACQUISITION_CONTEXT_SEQUENCE)
+                .unwrap()
+                .len(),
+            0
+        );
         // File meta derives cleanly.
         let fm = file_meta_for_dataset(&ds, vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian)
             .unwrap();
         assert_eq!(fm.media_storage_sop_class_uid, SOP_12_LEAD_ECG);
+    }
+
+    #[test]
+    fn instance_dataset_validates_against_its_iod() {
+        let rec = twelve_lead();
+        let mut meta = EcgInstanceMeta::new(PersonName::parse("Doe^Jane"), "E123");
+        meta.content_date = Some("20261011".into());
+        meta.content_time = Some("120000".into());
+        meta.acquisition_datetime = Some("20261011120000".into());
+        let ds = recording_to_dataset(&rec, &meta).unwrap();
+        let report = vyna_dcm_iod::validate(&ds, SOP_12_LEAD_ECG, None).unwrap();
+        assert!(!report.has_errors(), "{report:?}");
+    }
+
+    #[test]
+    fn missing_type1_datetimes_are_an_error() {
+        let rec = twelve_lead();
+        let meta = EcgInstanceMeta::new(PersonName::parse("Doe^Jane"), "E123");
+        assert!(matches!(
+            recording_to_dataset(&rec, &meta),
+            Err(Error::Missing(_))
+        ));
     }
 
     #[test]
@@ -644,6 +789,33 @@ mod tests {
         assert_eq!(ds_format(f64::INFINITY), None);
         assert_eq!(ds_format(0.0).as_deref(), Some("0"));
         assert_eq!(ds_format(1.5).as_deref(), Some("1.5"));
+        // Long values shrink decimals, never truncate mid-number or
+        // leave a trailing dot; absurd magnitudes go scientific.
+        let s = ds_format(123456789012345.6).unwrap();
+        assert!(s.len() <= 16 && !s.ends_with('.'), "{s}");
+        // Rounds to whole units rather than corrupting the magnitude.
+        assert!((s.parse::<f64>().unwrap() - 123456789012345.6).abs() < 1.0);
+        let s = ds_format(1e16).unwrap();
+        assert!(s.len() <= 16, "{s}");
+        assert_eq!(s.parse::<f64>().unwrap(), 1e16);
+    }
+
+    #[test]
+    fn non_finite_wire_floats_parse_as_absent() {
+        let mut item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        let mut defs = item
+            .sequence(tags::CHANNEL_DEFINITION_SEQUENCE)
+            .unwrap()
+            .to_vec();
+        defs[0].put_text(tags::CHANNEL_SENSITIVITY, Vr::Ds, "NaN");
+        defs[0].put_text(tags::FILTER_LOW_FREQUENCY, Vr::Ds, "inf");
+        item.put_sequence(tags::CHANNEL_DEFINITION_SEQUENCE, defs);
+        item.put_text(tags::POWERLINE_FREQUENCY, Vr::Ds, "NaN");
+        let back = recording_from_waveform_item(&item).unwrap();
+        // Defaults/absent, mirroring unparsable strings (never NaN).
+        assert_eq!(back.leads[0].sensitivity, 1.0);
+        assert_eq!(back.leads[0].filter_low_hz, None);
+        assert_eq!(back.powerline_hz, None);
     }
 
     #[test]

@@ -211,14 +211,25 @@ fn build_image(
         )));
     }
     let bytes_per_sample = bits.div_ceil(8) as usize;
-    let count = rows as usize * columns as usize;
-    if raw.len() != count * samples as usize * bytes_per_sample {
+    // Checked: the u16 product can overflow 32-bit usize (and would
+    // panic in debug builds).
+    let expected = (rows as usize)
+        .checked_mul(columns as usize)
+        .and_then(|n| n.checked_mul(samples as usize))
+        .and_then(|n| n.checked_mul(bytes_per_sample))
+        .ok_or_else(|| {
+            PixelCodecError::Geometry(format!(
+                "geometry {rows}x{columns}x{samples} overflows address space"
+            ))
+        })?;
+    if raw.len() != expected {
         return Err(PixelCodecError::Geometry(format!(
-            "raw frame is {} bytes, expected {}",
+            "raw frame is {} bytes, expected {expected}",
             raw.len(),
-            count * samples as usize * bytes_per_sample
         )));
     }
+    // Exact: `expected` is `count * samples * bytes_per_sample`.
+    let count = expected / (samples as usize * bytes_per_sample);
     let parms = vec![
         opj_image_comptparm {
             dx: 1,

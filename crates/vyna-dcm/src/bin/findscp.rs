@@ -18,7 +18,7 @@ use tokio::net::TcpListener;
 use vyna_dcm::net::AeTitle;
 use vyna_dcm::net::qrdb::{QrIndex, QrScp};
 use vyna_dcm::net::service::{
-    AcceptorOptions, Handlers, HashMapDirectory, MoveInstance, RequestContext, ScpMoveConfig,
+    AcceptorOptions, Handlers, HashMapDirectory, RequestContext, RetrievePlan, ScpMoveConfig,
     ScpOptions, accept,
 };
 use vyna_dcm::{DataSet, tags};
@@ -69,18 +69,18 @@ impl Handlers for FindScp {
         (status, matches)
     }
 
-    async fn on_move(
+    async fn on_move_plan(
         &self,
         ctx: &RequestContext<'_>,
         query: &DataSet,
         destination: &str,
-    ) -> (u16, Vec<MoveInstance>) {
+    ) -> (u16, RetrievePlan) {
         // Delivery itself is audited at the receiving storescp.
-        self.inner.on_move(ctx, query, destination).await
+        self.inner.on_move_plan(ctx, query, destination).await
     }
 
-    async fn on_get(&self, ctx: &RequestContext<'_>, query: &DataSet) -> (u16, Vec<MoveInstance>) {
-        self.inner.on_get(ctx, query).await
+    async fn on_get_plan(&self, ctx: &RequestContext<'_>, query: &DataSet) -> (u16, RetrievePlan) {
+        self.inner.on_get_plan(ctx, query).await
     }
 }
 

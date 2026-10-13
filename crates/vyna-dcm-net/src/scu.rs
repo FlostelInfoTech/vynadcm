@@ -40,6 +40,17 @@ impl MoveResult {
     }
 }
 
+/// Maximum pending responses [`Association::find_all`] collects: past
+/// this the SCU drains to the final response and fails with
+/// [`Error::TooManyMatches`](crate::Error::TooManyMatches) instead of
+/// letting a rogue peer OOM it. Mirrors the SCP-side 10,000-match cap.
+pub const MAX_FIND_MATCHES: usize = 10_000;
+
+/// Maximum aggregate encoded bytes [`Association::find_all`] collects
+/// (past it: [`Error::MatchesTooLarge`](crate::Error::MatchesTooLarge)).
+/// C-FIND identifiers are small key sets, so 256 MiB is generous headroom.
+pub const MAX_FIND_BYTES: u64 = 256 * 1024 * 1024;
+
 impl Association {
     /// C-ECHO against the Verification (or any echoable) SOP class.
     pub async fn echo(&mut self, sop_class_uid: &str) -> Result<u16> {
@@ -104,18 +115,63 @@ impl Association {
         }
     }
 
-    /// C-FIND collecting all matches.
+    /// C-FIND collecting all matches (capped: [`MAX_FIND_MATCHES`]
+    /// responses / [`MAX_FIND_BYTES`] bytes; past either cap the SCU
+    /// drains to the final response and errors, keeping the
+    /// association usable). For unbounded streaming use [`Association::find_with`].
     pub async fn find_all(
         &mut self,
         sop_class_uid: &str,
         query: &DataSet,
         priority: u16,
     ) -> Result<(u16, Vec<DataSet>)> {
+        let ctx = self
+            .context_for(sop_class_uid)
+            .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
+            .clone();
+        let id = self.next_message_id();
+        self.send(
+            ctx.id,
+            &Command::find_rq(id, priority, sop_class_uid),
+            Some(query),
+        )
+        .await?;
         let mut matches = Vec::new();
-        let s = self
-            .find_with(sop_class_uid, query, priority, |ds| matches.push(ds))
-            .await?;
-        Ok((s, matches))
+        let mut bytes: u64 = 0;
+        let mut overflow: Option<Error> = None;
+        loop {
+            let msg = self.expect_message(CF::C_FIND_RSP, id).await?;
+            let s = msg.command.status.unwrap_or(status::PROCESSING_FAILURE);
+            if status::is_pending(s) {
+                // Past the cap: drop matches but keep consuming so the
+                // association stays in sync through the final response.
+                if let Some(ds) = msg.dataset.filter(|_| overflow.is_none()) {
+                    if matches.len() >= MAX_FIND_MATCHES {
+                        overflow = Some(Error::TooManyMatches {
+                            limit: MAX_FIND_MATCHES,
+                        });
+                    } else {
+                        let n = vyna_dcm_codec::encode_dataset(
+                            &ds,
+                            TransferSyntax::ImplicitVrLittleEndian,
+                        )?
+                        .len() as u64;
+                        if bytes.saturating_add(n) > MAX_FIND_BYTES {
+                            overflow = Some(Error::MatchesTooLarge {
+                                limit: MAX_FIND_BYTES,
+                            });
+                        } else {
+                            bytes += n;
+                            matches.push(ds);
+                        }
+                    }
+                }
+            } else if let Some(e) = overflow.take() {
+                return Err(e);
+            } else {
+                return Ok((s, matches));
+            }
+        }
     }
 
     /// C-FIND with cancellation support: the callback returns `true` to
@@ -413,7 +469,12 @@ impl Association {
                     Vec::new(),
                     Vec::new(),
                 ));
-                let rsp = Command::n_event_report_rsp(report_id, status::SUCCESS);
+                let rsp = Command::n_event_report_rsp(
+                    report_id,
+                    m.command.affected_sop_class_uid.clone(),
+                    m.command.affected_sop_instance_uid.clone(),
+                    status::SUCCESS,
+                );
                 self.send(m.context_id, &rsp, None).await?;
                 Ok((action_status, Some(result)))
             }
@@ -686,6 +747,72 @@ mod tests {
             .unwrap();
         assert_eq!((seen, s), (5, status::CANCEL));
         // The association stays in sync after a cancelled FIND.
+        assert_eq!(
+            assoc
+                .echo(vyna_dcm_core::sop_class::VERIFICATION)
+                .await
+                .unwrap(),
+            status::SUCCESS
+        );
+        assoc.release().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn loopback_find_all_caps_rogue_peer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // One more pending than the SCU collects.
+        let matches: Vec<DataSet> = (0..=MAX_FIND_MATCHES)
+            .map(|i| test_ds(&format!("1.2.3.{i}")))
+            .collect();
+        let handlers = ArcTestScp::new(TestScp {
+            stored: Mutex::new(vec![]),
+            find_matches: matches,
+            move_instances: vec![],
+        });
+        let h2 = handlers.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let acc = AcceptorOptions {
+                association: short_opts(),
+                ..Default::default()
+            };
+            accept(stream, &acc, &*h2, &ScpOptions::default())
+                .await
+                .unwrap();
+        });
+
+        let mut assoc = Association::request(
+            &short_opts(),
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            &addr.to_string(),
+            propose(
+                &[
+                    vyna_dcm_core::sop_class::VERIFICATION,
+                    vyna_dcm_core::sop_class::STUDY_ROOT_FIND,
+                ],
+                &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let err = assoc
+            .find_all(
+                vyna_dcm_core::sop_class::STUDY_ROOT_FIND,
+                &DataSet::new(),
+                priority::MEDIUM,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::TooManyMatches { .. }),
+            "expected TooManyMatches, got {err:?}"
+        );
+        // Drained to the final response: the association stays usable.
         assert_eq!(
             assoc
                 .echo(vyna_dcm_core::sop_class::VERIFICATION)
@@ -1005,7 +1132,12 @@ mod tests {
             let rq_id = rq.command.message_id.unwrap_or(0);
             scp.send(
                 rq.context_id,
-                &Command::n_action_rsp(rq_id, status::SUCCESS),
+                &Command::n_action_rsp(
+                    rq_id,
+                    rq.command.requested_sop_class_uid.clone(),
+                    rq.command.requested_sop_instance_uid.clone(),
+                    status::SUCCESS,
+                ),
                 None,
             )
             .await
@@ -1076,7 +1208,12 @@ mod tests {
             let rq_id = rq.command.message_id.unwrap_or(0);
             scp.send(
                 rq.context_id,
-                &Command::n_action_rsp(rq_id, status::PROCESSING_FAILURE),
+                &Command::n_action_rsp(
+                    rq_id,
+                    rq.command.requested_sop_class_uid.clone(),
+                    rq.command.requested_sop_instance_uid.clone(),
+                    status::PROCESSING_FAILURE,
+                ),
                 None,
             )
             .await

@@ -116,12 +116,16 @@ file tools need only `cli`.
 | `vyna-dcm-web` | `server` (on) | hyper HTTP/1.1 front end; off = client + dispatch core only |
 | `vyna-dcm` | `net`, `web`, `ecg`, `cli` (all on) | Facade re-exports and CLI availability |
 
+`cli` exists only to build the binaries (clap); the library never
+uses it — library embeds should start from `default-features = false`
+and add only the stacks they need.
+
 Every combination builds; feature-gated tests compile out with
 their features.
 
 ```toml
 # Minimal embed: model + codec only
-vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.4", default-features = false }
+vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.5", default-features = false }
 # VynaECG: features = ["ecg", "net"]. VynaLink: features = ["net", "web"].
 ```
 

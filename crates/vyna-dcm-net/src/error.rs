@@ -81,6 +81,24 @@ pub enum Error {
         limit: u64,
     },
 
+    /// A collecting C-FIND exceeded the match-count cap: the peer sent
+    /// more pending responses than [`MAX_FIND_MATCHES`](crate::MAX_FIND_MATCHES).
+    /// The SCU drained to the final response, so the association stays usable.
+    #[error("C-FIND matches exceeded {limit}")]
+    TooManyMatches {
+        /// Match-count cap.
+        limit: usize,
+    },
+
+    /// A collecting C-FIND exceeded the aggregate byte budget: responses
+    /// past [`MAX_FIND_BYTES`](crate::MAX_FIND_BYTES) were dropped.
+    /// The SCU drained to the final response, so the association stays usable.
+    #[error("C-FIND collected responses exceeded {limit} bytes")]
+    MatchesTooLarge {
+        /// Aggregate byte budget.
+        limit: u64,
+    },
+
     /// Invalid AE title.
     #[error("invalid AE title `{0}`: {1}")]
     BadAeTitle(String, &'static str),

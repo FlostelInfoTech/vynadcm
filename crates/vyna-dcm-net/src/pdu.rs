@@ -291,16 +291,24 @@ fn decode_data(p: &[u8]) -> Result<Vec<Pdv>> {
         }
         let len = u32::from_be_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]) as usize;
         let (ctx, ctrl) = (p[pos + 4], p[pos + 5]);
-        if len < 2 || pos + 4 + len > p.len() {
+        // Checked: a u32 wire length can wrap the end offset on 32-bit.
+        let end = pos
+            .checked_add(4)
+            .and_then(|e| e.checked_add(len))
+            .filter(|&e| e <= p.len());
+        let Some(end) = end else {
+            return Err(Error::BadPdu("PDV length out of range".into()));
+        };
+        if len < 2 {
             return Err(Error::BadPdu("PDV length out of range".into()));
         }
         pdvs.push(Pdv {
             context_id: ctx,
             is_command: ctrl & 0x01 == 0x01,
             is_last: ctrl & 0x02 == 0x02,
-            data: p[pos + 6..pos + 4 + len].to_vec(),
+            data: p[pos + 6..end].to_vec(),
         });
-        pos += 4 + len;
+        pos = end;
     }
     if pdvs.is_empty() {
         return Err(Error::BadPdu("P-DATA-TF without PDVs".into()));

@@ -372,7 +372,9 @@ fn check_attr(
     }
 }
 
-/// True when any text or person-name value holds non-ASCII characters.
+/// True when any text or person-name value holds non-ASCII characters,
+/// recursing into sequences (Specific Character Set governs the whole
+/// dataset, not just top-level elements).
 fn has_non_ascii_text(ds: &DataSet) -> bool {
     ds.iter().any(|(_, el)| match &el.value {
         Value::Text(v) => v.iter().any(|s| !s.is_ascii()),
@@ -384,6 +386,7 @@ fn has_non_ascii_text(ds: &DataSet) -> bool {
                 .flat_map(|g| [&g.family, &g.given, &g.middle, &g.prefix, &g.suffix])
                 .any(|s| !s.is_ascii())
         }),
+        Value::Sequence(items) => items.iter().any(has_non_ascii_text),
         _ => false,
     })
 }
@@ -699,6 +702,18 @@ mod tests {
         let iod = find_iod(sop_class::CT_IMAGE).unwrap();
         let mut ds = valid_fixture(iod);
         ds.insert(DataElement::text(tags::PATIENT_NAME, Vr::Pn, "Müller"));
+        let report = validate(&ds, sop_class::CT_IMAGE, native).unwrap();
+        assert!(
+            has(&report, CondRule::SpecificCharacterSet),
+            "{:?}",
+            report.findings
+        );
+        // Non-ASCII nested inside a sequence counts too.
+        let iod = find_iod(sop_class::CT_IMAGE).unwrap();
+        let mut ds = valid_fixture(iod);
+        let mut item = DataSet::new();
+        item.put_text(tags::SERIES_DESCRIPTION, Vr::Lo, "Tête");
+        ds.put_sequence(tags::REFERENCED_SERIES_SEQUENCE, vec![item]);
         let report = validate(&ds, sop_class::CT_IMAGE, native).unwrap();
         assert!(
             has(&report, CondRule::SpecificCharacterSet),

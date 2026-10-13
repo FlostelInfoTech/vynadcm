@@ -59,7 +59,7 @@ spec adds component contracts, algorithms, sequences, and invariants.
 | `Vr` | 35 variants (34 standard + retired `SI`); `is_text()`, fixed byte width where applicable |
 | `Value` | Sum type: text/numbers (per VR width) / bytes / sequences / fragments / tags / person names; `is_empty()` for QIDO pruning |
 | `DataSet` | Insertion-ordered map; typed getters return `Option` (never panic); `put_*` builders; `PartialEq` for round-trip asserts |
-| `ENTRIES` / `tags` | 5,217 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
+| `ENTRIES` / `tags` | 5,239 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
 | Private dict | 424 creators / 8,898 entries via `lookup_private(creator, group, suffix)` with block + group-wildcard fallbacks; `Tag::{private_block, private_creator_element, private_suffix}` mechanics |
 | `TransferSyntax` | 16 UIDs; `is_encapsulated()`, `is_deflated()`, endianness/VR-explicitness; `Default` = Explicit VR LE |
 | `PersonName`, `Da`, `Tm` | `PersonName::parse` is infallible; `Da`/`Tm` validate (`Tm`: `HH[MM[SS[.FFFFFF]]]`, colons optional) |
@@ -145,10 +145,14 @@ spec adds component contracts, algorithms, sequences, and invariants.
 - `Handlers` has a default for every method (echo succeeds; everything
   else `SOP_CLASS_NOT_SUPPORTED`, store `PROCESSING_FAILURE`), so SCPs
   implement only what they serve.
-- C-MOVE: `on_move` returns instances; the framework opens one outbound
+- C-MOVE: `on_move_plan` returns a lazy `RetrievePlan` (total +
+  storage classes up front); the framework opens one outbound
   association (via `ScpMoveConfig`: `AeDirectory` + options + calling
-  AE) proposing every needed storage class, C-STOREs each instance,
-  and emits pending/final responses with sub-operation counts. Without
+  AE) proposing every needed storage class, then streams
+  load-and-send one instance at a time, emitting pending/final
+  responses with sub-operation counts (a failed load counts one
+  failed sub-operation while the rest continue). The eager
+  `on_move` still works via a default bridge. Without
   `move_config`, C-MOVE fails with Move Destination Unknown.
 - C-GET: same instance flow over the *same* association; a C-CANCEL
   for the GET aborts delivery and answers CANCEL. `get_with` hands the
@@ -243,7 +247,7 @@ spec adds component contracts, algorithms, sequences, and invariants.
 ### 2.8 `vyna-dcm-deid` — de-identification
 
 - `Action::{Dummy, Zero, Remove, RemapUid, ShiftDate}` per-element
-  actions; `BASIC_PROFILE` is a 191-tag curated table (6/91/54/20/20
+  actions; `BASIC_PROFILE` is a 197-tag curated table (6/93/58/20/20
   split). Unlisted tags keep; sequences recurse; odd groups
   (private) and `0x6000..=0x60FF` (overlays) remove by rule.
 - `Deidentifier`: dummies (`ANONYMIZED` defaults, PN-aware), one UID

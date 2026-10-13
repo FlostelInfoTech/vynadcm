@@ -562,8 +562,10 @@ impl Command {
     ) -> Self {
         let mut c = Self::base(command_field::N_SET_RQ);
         c.message_id = Some(message_id);
-        c.affected_sop_class_uid = Some(sop_class_uid.into());
-        c.affected_sop_instance_uid = Some(sop_instance_uid.into());
+        // PS3.7 Table 10.3-5: N-SET-RQ carries *Requested* UIDs, like the
+        // other N-service requests (Affected UIDs are response-side).
+        c.requested_sop_class_uid = Some(sop_class_uid.into());
+        c.requested_sop_instance_uid = Some(sop_instance_uid.into());
         c.data_set_type = DATA_SET_PRESENT;
         c
     }
@@ -640,10 +642,17 @@ impl Command {
         c
     }
 
-    /// N-ACTION-RSP.
-    pub fn n_action_rsp(message_id_rsp: u16, status: u16) -> Self {
+    /// N-ACTION-RSP (echoes the request's UIDs as Affected UIDs).
+    pub fn n_action_rsp(
+        message_id_rsp: u16,
+        sop_class_uid: Option<String>,
+        sop_instance_uid: Option<String>,
+        status: u16,
+    ) -> Self {
         let mut c = Self::base(command_field::N_ACTION_RSP);
         c.message_id_rsp = Some(message_id_rsp);
+        c.affected_sop_class_uid = sop_class_uid;
+        c.affected_sop_instance_uid = sop_instance_uid;
         c.status = Some(status);
         c
     }
@@ -661,10 +670,17 @@ impl Command {
         c
     }
 
-    /// N-DELETE-RSP.
-    pub fn n_delete_rsp(message_id_rsp: u16, status: u16) -> Self {
+    /// N-DELETE-RSP (echoes the request's UIDs as Affected UIDs).
+    pub fn n_delete_rsp(
+        message_id_rsp: u16,
+        sop_class_uid: Option<String>,
+        sop_instance_uid: Option<String>,
+        status: u16,
+    ) -> Self {
         let mut c = Self::base(command_field::N_DELETE_RSP);
         c.message_id_rsp = Some(message_id_rsp);
+        c.affected_sop_class_uid = sop_class_uid;
+        c.affected_sop_instance_uid = sop_instance_uid;
         c.status = Some(status);
         c
     }
@@ -690,10 +706,17 @@ impl Command {
         c
     }
 
-    /// N-EVENT-REPORT-RSP.
-    pub fn n_event_report_rsp(message_id_rsp: u16, status: u16) -> Self {
+    /// N-EVENT-REPORT-RSP (echoes the request's UIDs as Affected UIDs).
+    pub fn n_event_report_rsp(
+        message_id_rsp: u16,
+        sop_class_uid: Option<String>,
+        sop_instance_uid: Option<String>,
+        status: u16,
+    ) -> Self {
         let mut c = Self::base(command_field::N_EVENT_REPORT_RSP);
         c.message_id_rsp = Some(message_id_rsp);
+        c.affected_sop_class_uid = sop_class_uid;
+        c.affected_sop_instance_uid = sop_instance_uid;
         c.status = Some(status);
         c
     }
@@ -747,6 +770,20 @@ mod tests {
             let back = decode_command(&bytes).unwrap();
             assert_eq!(back, cmd);
         }
+    }
+
+    #[test]
+    fn n_set_rq_carries_requested_uids() {
+        // PS3.7 Table 10.3-5: N-SET-RQ must use Requested (0000,0003 /
+        // 0000,1001), never Affected UIDs.
+        let cmd = Command::n_set_rq(9, "1.2.3", "1.2.3.9");
+        let ds = cmd.to_dataset();
+        assert_eq!(ds.string(tags::REQUESTED_SOP_CLASS_UID), Some("1.2.3"));
+        assert_eq!(ds.string(tags::REQUESTED_SOP_INSTANCE_UID), Some("1.2.3.9"));
+        assert!(ds.get(tags::AFFECTED_SOP_CLASS_UID).is_none());
+        assert!(ds.get(tags::AFFECTED_SOP_INSTANCE_UID).is_none());
+        let back = Command::from_dataset(&ds).unwrap();
+        assert_eq!(back, cmd);
     }
 
     #[test]

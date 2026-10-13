@@ -38,7 +38,12 @@ pub fn shift_dt(value: &str, offset: i64) -> Option<String> {
 }
 
 fn shift_ymd(year: i64, month: i64, day: i64, offset: i64) -> Option<String> {
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    // Real month length, not `<= 31`: civil math would otherwise
+    // normalize "20240230" into March instead of returning `None`.
+    if day < 1 || day > days_in_month(year, month) {
         return None;
     }
     let days = days_from_civil(year, month, day);
@@ -48,6 +53,17 @@ fn shift_ymd(year: i64, month: i64, day: i64, offset: i64) -> Option<String> {
         return None;
     }
     Some(format!("{y:04}{m:02}{d:02}"))
+}
+
+/// Month length via civil math: day 0 of next month is the last day
+/// of this month (proleptic Gregorian, matching the shifters).
+fn days_in_month(year: i64, month: i64) -> i64 {
+    let (y, m) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    civil_from_days(days_from_civil(y, m, 1) - 1).2
 }
 
 #[cfg(test)]
@@ -77,6 +93,10 @@ mod tests {
     fn bad_dates_and_overflow_return_none() {
         assert_eq!(shift_da("not-a-date", 7), None);
         assert_eq!(shift_da("20241301", 7), None);
+        // Impossible days are invalid, not normalized into March.
+        assert_eq!(shift_da("20240230", 0), None);
+        assert_eq!(shift_da("20230229", 0), None);
+        assert_eq!(shift_dt("20240230120000", 0), None);
         assert_eq!(shift_da("00010101", -1), None);
         assert_eq!(shift_da("99991231", 1), None);
         // day-count arithmetic must not overflow on extreme offsets.

@@ -144,6 +144,14 @@ impl EcgRecording {
         if leads.is_empty() {
             return Err(crate::Error::Waveform("recording without leads".into()));
         }
+        // `!is_finite` first: NaN compares false against `<= 0.0`
+        // and would otherwise slip through (then poison
+        // `duration_secs` and the encoder).
+        if !sampling_frequency_hz.is_finite() || sampling_frequency_hz <= 0.0 {
+            return Err(crate::Error::Waveform(format!(
+                "bad sampling frequency {sampling_frequency_hz}"
+            )));
+        }
         let n = leads[0].len();
         if leads.iter().any(|l| l.len() != n) {
             return Err(crate::Error::Waveform(
@@ -232,6 +240,12 @@ mod tests {
             EcgRecording::new(vec![], 500.0),
             Err(crate::Error::Waveform(_))
         ));
+        for bad in [0.0, -500.0, f64::NAN, f64::INFINITY] {
+            assert!(
+                EcgRecording::new(vec![EcgLead::new("I", vec![0; 10], 0.001)], bad).is_err(),
+                "rate {bad} accepted"
+            );
+        }
         let r = EcgRecording::new(vec![EcgLead::new("I", vec![0; 5000], 0.001)], 500.0).unwrap();
         assert_eq!(r.duration_secs(), 10.0);
     }

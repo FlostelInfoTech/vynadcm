@@ -107,6 +107,15 @@ fn encode_element(
 ) -> Result<()> {
     put_tag(out, tag, little);
     let unencodable = |message: String| Error::Unencodable { tag, vr, message };
+    // Wire lengths are 32-bit: values past 4 GiB must error, never
+    // truncate through `as u32`.
+    let u32_len = |len: usize, what: &str| {
+        u32::try_from(len).map_err(|_| Error::Unencodable {
+            tag,
+            vr,
+            message: format!("{what} length {len} exceeds 32-bit value length"),
+        })
+    };
 
     // Undefined-length framing applies only to encapsulated fragments.
     if let Value::Fragments(f) = value {
@@ -122,7 +131,7 @@ fn encode_element(
         encode_bot(out, f, little);
         for frag in &f.fragments {
             put_tag(out, delimiter::ITEM, little);
-            put_u32(out, frag.len() as u32, little);
+            put_u32(out, u32_len(frag.len(), "fragment")?, little);
             out.extend_from_slice(frag);
         }
         put_tag(out, delimiter::SEQUENCE_DELIMITATION, little);
@@ -165,10 +174,10 @@ fn encode_element(
             }
             put_tag(&mut body, delimiter::ITEM, little);
             let bytes = encode_dataset_in(item, little, true, capture, charset)?;
-            put_u32(&mut body, bytes.len() as u32, little);
+            put_u32(&mut body, u32_len(bytes.len(), "sequence item")?, little);
             body.extend_from_slice(&bytes);
         }
-        put_vr_len(out, vr, true, little, body.len() as u32);
+        put_vr_len(out, vr, true, little, u32_len(body.len(), "sequence")?);
         let base = out.len();
         for r in rel {
             capture.record(tag, base + r);
@@ -182,16 +191,13 @@ fn encode_element(
     }
 
     let bytes = encode_primitive(tag, vr, value, little, charset)?;
-    if !explicit && bytes.len() > u32::MAX as usize {
-        return Err(unencodable("value exceeds 32-bit length".into()));
-    }
     if explicit && !vr.uses_long_form() && bytes.len() > u16::MAX as usize {
         return Err(unencodable(format!(
             "value length {} exceeds 16-bit short form for {vr}",
             bytes.len()
         )));
     }
-    put_vr_len(out, vr, explicit, little, bytes.len() as u32);
+    put_vr_len(out, vr, explicit, little, u32_len(bytes.len(), "value")?);
     out.extend_from_slice(&bytes);
     Ok(())
 }

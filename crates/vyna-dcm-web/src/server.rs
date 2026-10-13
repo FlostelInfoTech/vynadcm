@@ -6,13 +6,13 @@
 //! own HTTP stack (as VynaLink does).
 
 use bytes::Bytes;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use vyna_dcm_codec::{FileMeta, dataset_to_json, decode_pixels, read_part10, write_part10};
-use vyna_dcm_core::{DataSet, Tag, TransferSyntax, Value, Vr, lookup_keyword, tags};
+use vyna_dcm_core::{DataSet, Tag, TransferSyntax, Value, Vr, lookup, lookup_keyword, tags};
 
 use crate::multipart::{
-    Part, decode_multipart, encode_multipart, new_boundary, parse_content_type,
+    Part, decode_multipart, encode_multipart, is_dicom_media_type, new_boundary, parse_content_type,
 };
 
 /// Tags treated as bulk data (stripped from QIDO, `BulkDataURI` in metadata).
@@ -476,6 +476,43 @@ pub fn strip_bulk(ds: &mut DataSet) {
     }
 }
 
+/// PS3.4 wildcard match: `*` spans any run (empty included),
+/// `?` matches exactly one character. Matching runs on `char`s so
+/// multibyte values stay on character boundaries.
+fn wildcard_match(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    let fold = |c: char| {
+        if case_insensitive {
+            c.to_ascii_lowercase()
+        } else {
+            c
+        }
+    };
+    let v: Vec<char> = value.chars().map(fold).collect();
+    let p: Vec<char> = pattern.chars().map(fold).collect();
+    let (mut vi, mut pi) = (0usize, 0usize);
+    let (mut star, mut mark) = (None::<usize>, 0usize);
+    while vi < v.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == v[vi]) {
+            vi += 1;
+            pi += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = vi;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            vi = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 /// Case-insensitive keyword/tag matching for one QIDO filter.
 fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
     if pattern.is_empty() {
@@ -489,13 +526,21 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
         Value::U32(v) => v.iter().map(ToString::to_string).collect(),
         Value::I16(v) => v.iter().map(ToString::to_string).collect(),
         Value::I32(v) => v.iter().map(ToString::to_string).collect(),
+        Value::U64(v) => v.iter().map(ToString::to_string).collect(),
+        Value::I64(v) => v.iter().map(ToString::to_string).collect(),
+        Value::F32(v) => v.iter().map(ToString::to_string).collect(),
+        Value::F64(v) => v.iter().map(ToString::to_string).collect(),
+        Value::Tags(v) => v
+            .iter()
+            .map(|t| format!("{:04X}{:04X}", t.group(), t.element()))
+            .collect(),
         _ => return false,
     };
     // Comma-separated list = OR; for DA/TM/DT/DS/IS, `a-b` is an
     // inclusive range (numeric for DS/IS, lexicographic for the
-    // fixed-width datetimes); trailing `*` = prefix; otherwise exact
-    // (case-insensitive for PN). A `-` in any other VR is a literal
-    // character, not a range (mirrors C-FIND matching).
+    // fixed-width datetimes); `*`/`?` anywhere = wildcard match;
+    // otherwise exact (case-insensitive for PN). A `-` in any other
+    // VR is a literal character, not a range (mirrors C-FIND matching).
     let range_vr = matches!(el.vr, Vr::Da | Vr::Tm | Vr::Dt | Vr::Ds | Vr::Is);
     for alt in pattern.split(',') {
         let alt = alt.trim();
@@ -540,18 +585,12 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
             // Lone leading '-' (a negative literal): fall through to
             // prefix/exact below.
         }
-        if let Some(prefix) = alt.strip_suffix('*') {
-            // PN matching is case-insensitive (as for exact matches);
-            // byte-prefix slicing must respect UTF-8 boundaries.
-            let hit = if el.vr == Vr::Pn {
-                values.iter().any(|v| {
-                    v.get(..prefix.len())
-                        .is_some_and(|h| h.eq_ignore_ascii_case(prefix))
-                })
-            } else {
-                values.iter().any(|v| v.starts_with(prefix))
-            };
-            if hit {
+        // PS3.4 wildcards: `*` matches any run (empty included) and
+        // `?` any single character, anywhere in the pattern — not just
+        // a trailing `*`. PN matching stays case-insensitive.
+        if alt.contains(['*', '?']) {
+            let ci = el.vr == Vr::Pn;
+            if values.iter().any(|v| wildcard_match(v, alt, ci)) {
                 return true;
             }
             continue;
@@ -569,6 +608,11 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
 
 /// Route one request against a store. `public_base` is the externally
 /// visible base URL used for `BulkDataURI`s and RetrieveURLs.
+///
+/// QIDO matching is exact/prefix (ranges, wildcards, OR lists
+/// supported): `includefield` and `fuzzymatching` parameters are
+/// accepted but ignored — responses always carry full key sets and
+/// matching never fuzzes.
 pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpRequest) -> HttpResponse {
     let base = public_base.trim_end_matches('/');
     let segs: Vec<&str> = req.path.split('/').filter(|s| !s.is_empty()).collect();
@@ -687,15 +731,24 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
         ) => {
             // Every addressed frame must be a positive integer: bad
             // entries are a 400 (not silently dropped, and frame 0 is
-            // invalid — frames are 1-based).
+            // invalid — frames are 1-based). Duplicates are also a 400:
+            // each entry embeds a full frame, so `1,1,...` would turn a
+            // KB URL into a GB response (direct `dispatch` embedders
+            // have no URI cap of their own).
             let mut frames = Vec::new();
+            let mut seen = HashSet::new();
             for f in list.split(',') {
                 match f.parse::<u32>() {
-                    Ok(n) if n >= 1 => frames.push(n),
+                    Ok(n) if n >= 1 => {
+                        if !seen.insert(n) {
+                            return HttpResponse::text(400, "duplicate frame number");
+                        }
+                        frames.push(n);
+                    }
                     _ => return HttpResponse::text(400, "bad frame list"),
                 }
             }
-            if frames.is_empty() {
+            if frames.is_empty() || frames.len() > MAX_WADO_FRAMES {
                 return HttpResponse::text(400, "bad frame list");
             }
             match store.instance_frames(study, series, instance, &frames) {
@@ -723,6 +776,11 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
 /// Maximum QIDO query parameters: each unknown key scans the whole
 /// tag dictionary, so an unbounded list is a CPU DoS.
 const MAX_QIDO_PARAMS: usize = 100;
+
+/// Maximum frames per WADO-RS `/frames/` request. Duplicates are
+/// rejected outright (see above); this caps the parse/lookup work of
+/// distinct entries. 10,000 covers any real multiframe object.
+const MAX_WADO_FRAMES: usize = 10_000;
 
 fn qido<S: DicomWebStore>(store: &S, scope: QidoScope, query: &str) -> HttpResponse {
     let params = parse_query(query);
@@ -760,12 +818,26 @@ fn qido_key_to_tag(key: &str) -> Option<Tag> {
     {
         return Some(e.tag);
     }
-    // 8-hex-digit tag, with optional comma/space separators.
-    let hex: String = key.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    // 8-hex-digit tag in canonical dressings only (`GGGGEEEE`,
+    // `GGGG,EEEE`, `(GGGG,EEEE)`): stripping all non-hex first would
+    // fabricate tags from arbitrary unknown keys. The tag must also
+    // be in the dictionary — unknown spellings are ignored, not
+    // treated as filters.
+    let t = key.trim().trim_matches(['(', ')']).trim();
+    if !t
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() || c == ',' || c == ' ')
+    {
+        return None;
+    }
+    let hex: String = t.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if hex.len() == 8 {
         let g = u16::from_str_radix(&hex[0..4], 16).ok()?;
         let e = u16::from_str_radix(&hex[4..8], 16).ok()?;
-        return Some(Tag::new(g, e));
+        let tag = Tag::new(g, e);
+        if lookup(tag).is_some() {
+            return Some(tag);
+        }
     }
     None
 }
@@ -828,15 +900,20 @@ fn stow<S: DicomWebStore>(
     let Some(boundary) = params.get("boundary") else {
         return HttpResponse::text(400, "STOW multipart without boundary");
     };
+    if boundary.is_empty() {
+        return HttpResponse::text(400, "STOW multipart with empty boundary");
+    }
     let parts = match decode_multipart(&req.body, boundary) {
         Ok(p) => p,
         Err(e) => return HttpResponse::text(400, e.to_string()),
     };
     let mut stored: Vec<StoredIds> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
+    // Media-type match, not string equality: compliant senders add
+    // parameters such as `transfer-syntax` (PS3.18 §8.6).
     for part in parts
         .iter()
-        .filter(|p| p.content_type.eq_ignore_ascii_case("application/dicom"))
+        .filter(|p| is_dicom_media_type(&p.content_type))
     {
         match store.store_instance(&part.body, study_hint) {
             Ok(ids) => stored.push(ids),
@@ -1137,6 +1214,66 @@ mod tests {
     }
 
     #[test]
+    fn qido_wildcards_match_anywhere() {
+        let store = stored();
+        let count = |q: &str| {
+            let r = dispatch(&store, "http://x/wado", &get(q));
+            assert_eq!(r.status, 200);
+            serde_json::from_slice::<serde_json::Value>(&r.body)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        // PatientID is W123 in both instances (one study).
+        assert_eq!(count("/studies?PatientID=*123"), 1); // leading *
+        assert_eq!(count("/studies?PatientID=W*3"), 1); // infix *
+        assert_eq!(count("/studies?PatientID=W12?"), 1); // ? wildcard
+        assert_eq!(count("/studies?PatientID=*2*"), 1);
+        assert_eq!(count("/studies?PatientID=W12??"), 0); // too long
+        assert_eq!(count("/studies?PatientID=*999*"), 0);
+        // PN stays case-insensitive under wildcards.
+        assert_eq!(count("/studies?PatientName=web^*"), 1);
+    }
+
+    #[test]
+    fn qido_matches_wide_numerics_and_tags() {
+        let mut ds = DataSet::new();
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "W1");
+        ds.insert(vyna_dcm_core::DataElement::new(
+            Tag::new(0x0020, 0x4000),
+            Vr::Lt,
+            Value::U64(vec![123456789012345]),
+        ));
+        ds.insert(vyna_dcm_core::DataElement::new(
+            tags::SELECTOR_AT_VALUE,
+            Vr::At,
+            Value::Tags(vec![Tag::new(0x0010, 0x0010)]),
+        ));
+        assert!(match_attribute(
+            &ds,
+            Tag::new(0x0020, 0x4000),
+            "123456789012345"
+        ));
+        assert!(!match_attribute(&ds, Tag::new(0x0020, 0x4000), "123"));
+        assert!(match_attribute(&ds, tags::SELECTOR_AT_VALUE, "00100010"));
+        assert!(!match_attribute(&ds, tags::SELECTOR_AT_VALUE, "00100020"));
+    }
+
+    #[test]
+    fn qido_ignores_unknown_spelled_keys() {
+        assert_eq!(qido_key_to_tag("00100010"), Some(Tag::new(0x0010, 0x0010)));
+        assert_eq!(
+            qido_key_to_tag("(0010,0010)"),
+            Some(Tag::new(0x0010, 0x0010))
+        );
+        // Unknown keys are ignored, never fabricated into tags.
+        assert_eq!(qido_key_to_tag("deadbeef"), None);
+        assert_eq!(qido_key_to_tag("StudyDate2024"), None);
+        assert_eq!(qido_key_to_tag("not-a-key!"), None);
+    }
+
+    #[test]
     fn qido_rejects_param_flood() {
         let store = stored();
         let query = (0..=MAX_QIDO_PARAMS)
@@ -1175,6 +1312,26 @@ mod tests {
             &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/2"),
         );
         assert_eq!(r.status, 404);
+        // Duplicates are 400 (each entry embeds a full frame).
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/1,1"),
+        );
+        assert_eq!(r.status, 400);
+        // Past the frame-count cap is 400 even for well-formed entries.
+        let flood = (1..=MAX_WADO_FRAMES + 1)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get(&format!(
+                "/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/{flood}"
+            )),
+        );
+        assert_eq!(r.status, 400);
 
         let file = test_file("9.9.9", "9.9.9.1", "9.9.9.1.1", 2, 2);
         let (ct, body) = encode_multipart(
@@ -1209,6 +1366,27 @@ mod tests {
             body: Bytes::from(body),
         };
         assert_eq!(dispatch(&store, "http://x/wado", &req).status, 400);
+
+        // Parameterized parts (transfer-syntax suffix) are stored, not
+        // dropped into "nothing stored".
+        let file = test_file("6.6.6", "6.6.6.1", "6.6.6.1.1", 2, 2);
+        let (ct, body) = encode_multipart(
+            &[Part::new(
+                "application/dicom; transfer-syntax=\"1.2.840.10008.1.2.1\"",
+                file,
+            )],
+            "b3",
+            "application/dicom",
+        );
+        let req = HttpRequest {
+            method: "POST".into(),
+            path: "/studies".into(),
+            query: String::new(),
+            headers: [("content-type".into(), ct)].into(),
+            body: Bytes::from(body),
+        };
+        let r = dispatch(&store, "http://x/wado", &req);
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
     }
 
     #[test]

@@ -6,10 +6,11 @@
 /// A DICOM transfer syntax.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum TransferSyntax {
-    /// Implicit VR Little Endian (`1.2.840.10008.1.2`): the DICOM default.
+    /// Implicit VR Little Endian (`1.2.840.10008.1.2`): the DICOM
+    /// default transfer syntax, hence this enum's [`Default`].
+    #[default]
     ImplicitVrLittleEndian,
     /// Explicit VR Little Endian (`1.2.840.10008.1.2.1`).
-    #[default]
     ExplicitVrLittleEndian,
     /// Deflated Explicit VR Little Endian (`1.2.840.10008.1.2.1.99`).
     DeflatedExplicitVrLittleEndian,

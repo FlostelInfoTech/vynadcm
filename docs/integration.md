@@ -36,7 +36,7 @@ Operators should start with `docs/user-guide.md`.
 
 ```toml
 [dependencies]
-vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.4" }
+vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.5" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 ```
 
@@ -318,8 +318,12 @@ use vyna_dcm::PersonName;
 let leads = vec![EcgLead::new("II", vec![0, 5, -3], 0.001)];
 let rec = EcgRecording::new(leads, 500.0).unwrap();
 
-// 2. Wrap in a SOP instance (UIDs generated when left empty)
-let meta = EcgInstanceMeta::new(PersonName::parse("Doe^Jane"), "E123");
+// 2. Wrap in a SOP instance (UIDs generated when left empty; the
+// Type 1 datetimes have no honest default, so set them explicitly)
+let mut meta = EcgInstanceMeta::new(PersonName::parse("Doe^Jane"), "E123");
+meta.content_date = Some("20261011".into());
+meta.content_time = Some("120000".into());
+meta.acquisition_datetime = Some("20261011120000".into());
 let ds = recording_to_dataset(&rec, &meta).unwrap();
 
 // 3. Persist and/or C-STORE it like any other dataset (§2, §4)

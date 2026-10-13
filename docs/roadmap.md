@@ -49,7 +49,7 @@ Items move to the SRS (`docs/requirements.md`) when scheduled.
 ### P0.1 Full PS3.6 dictionary + private creators — DONE
 
 Replaced the 266-entry curated table with the complete public registry
-(5,217 entries, PS3.6 2026d) plus private-creator mechanics (424
+(5,239 entries, PS3.6 2026d) plus private-creator mechanics (424
 creators / 8,898 entries) and the missing `SV` VR (35 variants).
 Accepted: registry/private spot tests, 96/96 green, clippy clean.
 
@@ -83,7 +83,8 @@ document length for exact padding removal, UTF-8 charset only when
 needed — plus the `pdf2dcm` (IOD self-check) and `dcm2pdf` CLIs.
 Accepted: built instances validate clean in all native syntaxes,
 odd-length PDFs round-trip byte-exactly, 137/137 tests, clippy
-clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
+clean. Out of scope (documented): CDA, PDF/A. The builder
+rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
 
 ## 4. Priority 1: interface-engine depth
 
@@ -139,7 +140,7 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
 ## 5. Priority 2: deployment and robustness
 
 - **De-identification profiles** (PS3.15 E, dcm4che `deidentify`)
-  — DONE: shipped `vyna-dcm-deid` (`Deidentifier` + 191-tag
+  — DONE: shipped `vyna-dcm-deid` (`Deidentifier` + 197-tag
   `BASIC_PROFILE` with dummy/zero/remove/UID-remap/date-shift
   actions, sequence recursion, private/overlay rules, burned-in
   refusal) plus the batch `deidentify` CLI. Accepted: 14 engine

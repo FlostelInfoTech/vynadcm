@@ -44,6 +44,7 @@ fn main() -> Result<(), String> {
     meta.accession = Some("A789".into());
     meta.content_date = Some("20261011".into());
     meta.content_time = Some("120000".into());
+    meta.acquisition_datetime = Some("20261011120000".into());
     let ds = recording_to_dataset(&rec, &meta).map_err(|e| e.to_string())?;
     let ts = TransferSyntax::ExplicitVrLittleEndian;
     let file_meta = FileMeta::new(

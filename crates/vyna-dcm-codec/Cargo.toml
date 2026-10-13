@@ -1,6 +1,6 @@
 [package]
 name = "vyna-dcm-codec"
-version = "0.4.0"
+version = "0.5.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -11,7 +11,7 @@ keywords = ["dicom", "codec", "part10", "rle", "json"]
 categories = ["multimedia", "parser-implementations"]
 
 [dependencies]
-vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.4" }
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.5" }
 thiserror.workspace = true
 base64.workspace = true
 bytes.workspace = true

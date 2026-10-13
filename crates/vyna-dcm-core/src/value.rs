@@ -151,7 +151,8 @@ impl Value {
         }
     }
 
-    /// Interpret raw `OW/OB` bytes as big-endian `u16` words.
+    /// Interpret raw `OW/OB` bytes as big-endian `u16` words
+    /// (already-decoded [`Value::U16`] passes through, like `_le`).
     #[must_use]
     pub fn bytes_as_u16_be(&self) -> Option<Vec<u16>> {
         match self {
@@ -162,6 +163,7 @@ impl Value {
                     .map(|c| u16::from_be_bytes(*c))
                     .collect(),
             ),
+            Value::U16(v) => Some(v.clone()),
             _ => None,
         }
     }

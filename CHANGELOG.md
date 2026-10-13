@@ -7,8 +7,8 @@ the workspace crate version (`Cargo.toml`).
 
 ### Fixed
 
-- Documentation/code tally pass: corrected table counts (5,217
-  dictionary entries, 8,898 private entries, 191-tag de-id profile,
+- Documentation/code tally pass: corrected table counts (5,239
+  dictionary entries, 8,898 private entries, 197-tag de-id profile,
   84 IOD modules), fixed the stale out-of-scope list, the
   `propose()` integration snippet (now `Result`), the `get_with`
   callback arity, bulk-UUID/server-auth design notes, the error
@@ -17,6 +17,31 @@ the workspace crate version (`Cargo.toml`).
   names a nonexistent `--study` flag.
 - `vyna-dcm-iod` enables `#![warn(missing_docs)]` like every other
   first-party crate (zero warnings).
+- Publish-readiness review batch (11 major + minors): DICOMDIR
+  FIRST/LAST now stamp the root records (were first/last items);
+  baseline JPEG pre-validates the SOF header under a dataset-sized
+  buffer cap (a tiny frame claiming gigapixel dims fails fast);
+  N-SET-RQ carries Requested UIDs with SCP echo fixed, and
+  N-GET/ACTION/DELETE/EVENT-REPORT responses echo Affected UIDs;
+  SCU `find_all` is capped (`MAX_FIND_MATCHES`/`MAX_FIND_BYTES`,
+  drains to final then errors); MOVE/GET stream load-and-send via a
+  lazy `RetrievePlan` (`QrScp` holds ~one dataset; a failed file
+  counts one failed sub-operation); STOW-RS and `wado_file` match
+  `application/dicom` by media type (transfer-syntax parameters
+  accepted); WADO-RS `/frames/` rejects duplicates and caps the
+  list; the ECG builder emits the full Type 1/2 shape (new meta
+  fields, missing Type 1 datetimes are `Missing`, UTF-8 charset);
+  `pdf::Error` is `#[non_exhaustive]` and the PDF builder rejects
+  non-PDF bytes (`NotPdf`); the de-id profile gains the seven
+  missing E.1 attributes (197 tags, 6/93/58/20/20); QIDO supports
+  `*`/`?` anywhere, wide numerics/AT values, and ignores unknown
+  spelled keys; encode lengths/PDV/BOT/geometry math is 32-bit
+  checked; burned-in gate and charset detection recurse into
+  sequences; syslog frames sanitize every header field and accept
+  uppercase schemes; `deidentify` writes all outputs atomically;
+  DICOMweb client validates base URLs, rejects empty
+  frames/store lists, caps response bodies, compares Bearer tokens
+  in fixed time, and backs off on accept errors.
 - Publish-readiness hardening batch (1 critical, 32 major):
   pixel decode/encode now validates geometry with checked math and
   a 1 GiB cap before allocating (zero dims rejected); RLE segment
@@ -43,6 +68,19 @@ the workspace crate version (`Cargo.toml`).
   functions return `vyna_dcm_web::Error` instead of `String`.
   Downstream matches on `Auth`, `Kind`, and `CondRule` need a
   wildcard arm.
+- **Breaking (pre-1.0):** review-batch API changes:
+  `recording_to_dataset` fails `Missing` without the Type 1
+  datetimes (set `content_date`/`content_time`/
+  `acquisition_datetime`); `EcgInstanceMeta` gains
+  `study_date`/`study_time`/`acquisition_datetime`/
+  `referring_physician`/`acquisition_context` (struct literals must
+  add them); `TransferSyntax::default()` is now Implicit LE (the
+  DICOM default); `n_action_rsp`/`n_delete_rsp`/
+  `n_event_report_rsp` take the echoed UIDs; `pdf::Error` needs a
+  wildcard arm. New additive API: `RetrievePlan`/`RetrieveLoader`
+  + `Handlers::{on_move_plan, on_get_plan}`, `MAX_FIND_MATCHES`/
+  `MAX_FIND_BYTES`, `Error::{TooManyMatches, MatchesTooLarge}`,
+  `Error::NotPdf`.
 
 ### Changed
 

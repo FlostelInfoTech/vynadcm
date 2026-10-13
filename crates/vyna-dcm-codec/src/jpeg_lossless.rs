@@ -95,7 +95,16 @@ pub(crate) fn check_raw_len(
     columns: u16,
     bits_allocated: u16,
 ) -> std::result::Result<(), PixelCodecError> {
-    let expected = rows as usize * columns as usize * bits_allocated.div_ceil(8) as usize;
+    // Checked: the u16 product can overflow 32-bit usize (and would
+    // panic in debug builds).
+    let expected = (rows as usize)
+        .checked_mul(columns as usize)
+        .and_then(|n| n.checked_mul(bits_allocated.div_ceil(8) as usize))
+        .ok_or_else(|| {
+            PixelCodecError::Geometry(format!(
+                "geometry {rows}x{columns}x{bits_allocated} overflows address space"
+            ))
+        })?;
     if raw.len() != expected {
         return Err(PixelCodecError::Geometry(format!(
             "raw frame is {} bytes, expected {expected}",

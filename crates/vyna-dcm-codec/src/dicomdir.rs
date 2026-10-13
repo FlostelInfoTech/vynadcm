@@ -560,8 +560,13 @@ pub fn build_dicomdir(entries: &[DirEntry], file_set_id: Option<&str>) -> Result
     }
     let mut ds = DataSet::new();
     ds.put_text(FILESET, Vr::Cs, file_set_id.unwrap_or(DEFAULT_FILE_SET_ID));
-    ds.put_u32_single(FIRST, abs[0]);
-    ds.put_u32_single(LAST, abs[items.len() - 1]);
+    // PS3.11 (0004,1200/1202): FIRST/LAST are the offsets of the first and
+    // last *root* directory records, not the first/last sequence items
+    // (trailing leaves live below the roots in traversal order).
+    let first_root = roots.first().copied().unwrap_or(0);
+    let last_root = roots.last().copied().unwrap_or(0);
+    ds.put_u32_single(FIRST, abs[first_root]);
+    ds.put_u32_single(LAST, abs[last_root]);
     ds.put_u16_single(CONSISTENCY, 0);
     ds.put_sequence(SEQ, items);
     let bytes2 = crate::encode_dataset(&ds, ts)?;
@@ -765,15 +770,15 @@ fn validate_entry(entry: &DirEntry) -> Result<()> {
             });
         }
     }
-    for tag in [
-        tags::PATIENT_ID,
-        tags::STUDY_INSTANCE_UID,
-        tags::SERIES_INSTANCE_UID,
+    for (tag, vr) in [
+        (tags::PATIENT_ID, Vr::Lo),
+        (tags::STUDY_INSTANCE_UID, Vr::Ui),
+        (tags::SERIES_INSTANCE_UID, Vr::Ui),
     ] {
         if ds.string(tag).is_none_or(|s| s.is_empty()) {
             return Err(Error::BadValue {
                 tag,
-                vr: Vr::Ui,
+                vr,
                 message: format!("entry for {:?} needs {tag} for grouping", entry.file_id),
             });
         }
@@ -947,6 +952,40 @@ mod tests {
         let bytes = build_dicomdir(&entries, None).unwrap();
         let dir = read_dicomdir(&bytes).unwrap();
         assert_eq!(dir.file_set_id.as_deref(), Some(DEFAULT_FILE_SET_ID));
+    }
+
+    #[test]
+    fn first_last_point_at_root_records() {
+        // Two patients: LAST must be the second PATIENT root, not the
+        // final leaf item (PS3.11 0004,1200/1202 are *root* offsets).
+        let dss = ct_sets();
+        let entries = vec![
+            entry(&dss[0], &["DICOM", "IM1"], "1.2.840.10008.1.2.1", None),
+            entry(&dss[1], &["DICOM", "IM2"], "1.2.840.10008.1.2.1", None),
+            entry(&dss[2], &["DICOM", "RD1"], "1.2.840.10008.1.2", None),
+            entry(&dss[3], &["DICOM", "SR1"], "1.2.840.10008.1.2.1", None),
+        ];
+        let bytes = build_dicomdir(&entries, Some("ROOTS")).unwrap();
+        let (_, ds) = read_part10(&bytes).unwrap();
+        let ts = TransferSyntax::ExplicitVrLittleEndian;
+        // Item layouts are offset-independent (fixed-size UL links), so the
+        // stamped dataset re-captures the exact item start positions.
+        let enc = crate::encode_dataset(&ds, ts).unwrap();
+        let start = bytes.len() - enc.len();
+        let (_, rels) = crate::encode_dataset_capture_items(&ds, ts, SEQ).unwrap();
+        let items = ds.sequence(SEQ).unwrap();
+        assert_eq!(rels.len(), items.len());
+        let abs: Vec<usize> = rels.iter().map(|r| start + r).collect();
+        let roots: Vec<usize> = items
+            .iter()
+            .enumerate()
+            .filter(|(_, it)| record_type_of(it) == Some("PATIENT"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(ds.uint32(FIRST).unwrap() as usize, abs[roots[0]]);
+        assert_eq!(ds.uint32(LAST).unwrap() as usize, abs[roots[1]]);
+        assert_ne!(ds.uint32(LAST).unwrap() as usize, abs[items.len() - 1]);
     }
 
     #[test]

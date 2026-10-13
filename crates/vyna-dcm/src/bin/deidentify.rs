@@ -80,19 +80,16 @@ fn plan_outputs(
         .collect()
 }
 
-/// In-place replacement goes through a temporary file + rename so a
-/// failed run keeps the original.
+/// Every output goes through a temporary file + rename so a failed
+/// run never leaves a truncated destination (in-place or not).
 ///
 /// The temp name carries the pid plus an attempt counter and is
 /// created with create-new semantics: concurrent runs on the same
 /// file must not share one fixed temp name (and a planted symlink
 /// must not redirect the write elsewhere).
-fn write_output(dest: &Path, input: &Path, bytes: &[u8]) -> Result<(), String> {
-    if dest != input {
-        return std::fs::write(dest, bytes).map_err(|e| format!("{}: {e}", dest.display()));
-    }
+fn write_output(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     for attempt in 0..100u32 {
-        let tmp = input.with_extension(format!("vyna-tmp-{}-{attempt}", std::process::id()));
+        let tmp = dest.with_extension(format!("vyna-tmp-{}-{attempt}", std::process::id()));
         let mut opts = std::fs::OpenOptions::new();
         match opts.write(true).create_new(true).open(&tmp) {
             Ok(mut f) => {
@@ -102,9 +99,9 @@ fn write_output(dest: &Path, input: &Path, bytes: &[u8]) -> Result<(), String> {
                     return Err(format!("{}: {e}", tmp.display()));
                 }
                 drop(f);
-                if let Err(e) = std::fs::rename(&tmp, input) {
+                if let Err(e) = std::fs::rename(&tmp, dest) {
                     let _ = std::fs::remove_file(&tmp);
-                    return Err(format!("{}: {e}", input.display()));
+                    return Err(format!("{}: {e}", dest.display()));
                 }
                 return Ok(());
             }
@@ -112,7 +109,7 @@ fn write_output(dest: &Path, input: &Path, bytes: &[u8]) -> Result<(), String> {
             Err(e) => return Err(format!("{}: {e}", tmp.display())),
         }
     }
-    Err(format!("{}: cannot pick a temporary name", input.display()))
+    Err(format!("{}: cannot pick a temporary name", dest.display()))
 }
 
 fn process_file(deid: &mut Deidentifier, input: &Path, dest: &Path) -> Result<String, String> {
@@ -137,7 +134,7 @@ fn process_file(deid: &mut Deidentifier, input: &Path, dest: &Path) -> Result<St
     meta.media_storage_sop_class_uid = class.to_string();
     meta.media_storage_sop_instance_uid = inst.to_string();
     let out = write_part10(&meta, &ds).map_err(|e| format!("{}: {e}", input.display()))?;
-    write_output(dest, input, &out)?;
+    write_output(dest, &out)?;
     Ok(format!(
         "{} -> {}: {} removed, {} zeroed, {} dummied, {} UIDs remapped, {} dates shifted",
         input.display(),
@@ -294,9 +291,27 @@ mod tests {
         // refuse it (not follow it into the victim).
         let tmp0 = file.with_extension(format!("vyna-tmp-{}-0", std::process::id()));
         std::os::unix::fs::symlink(&victim, &tmp0).unwrap();
-        write_output(&file, &file, b"edited").unwrap();
+        write_output(&file, b"edited").unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"edited");
         assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        // Non-in-place writes are atomic too, with no temp leftovers.
+        let dest = dir.join("copy.dcm");
+        write_output(&dest, b"copy").unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"copy");
+        let mut names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let planted = tmp0.file_name().unwrap().to_string_lossy().into_owned();
+        let mut expected = vec![
+            "anon.dcm".to_string(),
+            "copy.dcm".to_string(),
+            "victim.txt".to_string(),
+            planted,
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

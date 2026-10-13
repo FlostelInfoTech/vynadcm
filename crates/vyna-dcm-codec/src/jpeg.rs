@@ -52,9 +52,23 @@ impl PixelCodec for JpegCodec {
         }
         let data = fragments.joined();
         let mut decoder = Decoder::new(Cursor::new(&data));
-        let pixels = decoder
-            .decode()
-            .map_err(|e| PixelCodecError::Codec(format!("jpeg decode failed: {e}")))?;
+        // Cap the decode buffer at the dataset geometry (checked: u16
+        // triples can overflow 32-bit usize) and pre-validate the SOF
+        // header before any pixel allocation, so a tiny frame claiming
+        // huge dimensions fails fast instead of triggering a multi-GB
+        // alloc.
+        let expected_len = (rows as usize)
+            .checked_mul(columns as usize)
+            .and_then(|n| n.checked_mul(samples_per_pixel as usize))
+            .ok_or_else(|| {
+                PixelCodecError::Geometry(format!(
+                    "jpeg geometry {rows}x{columns}x{samples_per_pixel} overflows address space"
+                ))
+            })?;
+        decoder.set_max_decoding_buffer_size(expected_len);
+        decoder
+            .read_info()
+            .map_err(|e| PixelCodecError::Codec(format!("jpeg header parse failed: {e}")))?;
         let info = decoder
             .info()
             .ok_or_else(|| PixelCodecError::Codec("jpeg decoder produced no image info".into()))?;
@@ -83,7 +97,10 @@ impl PixelCodec for JpegCodec {
                 "jpeg frame has {expected_samples} component(s), dataset says {samples_per_pixel}"
             )));
         }
-        let expected_len = rows as usize * columns as usize * samples_per_pixel as usize;
+        // Header matches the dataset geometry; decode within the cap set above.
+        let pixels = decoder
+            .decode()
+            .map_err(|e| PixelCodecError::Codec(format!("jpeg decode failed: {e}")))?;
         if pixels.len() != expected_len {
             return Err(PixelCodecError::Geometry(format!(
                 "jpeg decoded {} bytes, expected {expected_len}",
@@ -295,5 +312,27 @@ mod tests {
             .decode_frame(TransferSyntax::JpegBaseline8Bit, &garbage, 8, 8, 1, 8)
             .unwrap_err();
         assert!(matches!(err, PixelCodecError::Codec(_)), "{err:?}");
+    }
+
+    #[test]
+    fn huge_sof_dims_rejected_before_decode_alloc() {
+        // A 15-byte frame claiming 60000x60000 mono (~3.6 GB decoded)
+        // must fail fast on the SOF header, not attempt the allocation.
+        let sof = [
+            0xFF, 0xD8, // SOI
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, // SOF0, len 11, 8-bit
+            0xEA, 0x60, 0xEA, 0x60, // 60000 x 60000
+            0x01, // one component
+            0x01, 0x11, 0x00, // id 1, H1V1, table 0
+        ];
+        let frags = FragmentSequence {
+            basic_offset_table: vec![],
+            fragments: vec![sof.to_vec()],
+        };
+        let codec = JpegCodec::default();
+        let err = codec
+            .decode_frame(TransferSyntax::JpegBaseline8Bit, &frags, 8, 8, 1, 8)
+            .unwrap_err();
+        assert!(matches!(err, PixelCodecError::Geometry(_)), "{err:?}");
     }
 }

@@ -203,6 +203,9 @@ pub fn pdf_to_dataset(pdf: &[u8], meta: &PdfInstanceMeta) -> Result<DataSet> {
     if pdf.is_empty() {
         return Err(Error::EmptyDocument);
     }
+    if !pdf.starts_with(b"%PDF-") {
+        return Err(Error::NotPdf);
+    }
     let len_u32 =
         u32::try_from(pdf.len()).map_err(|_| Error::DocumentTooLarge(pdf.len() as u64))?;
     let mut meta = meta.clone();
@@ -562,6 +565,14 @@ mod tests {
         assert!(matches!(
             pdf_to_dataset(&[], &sample_meta()),
             Err(Error::EmptyDocument)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_pdf_bytes() {
+        assert!(matches!(
+            pdf_to_dataset(b"\x89PNG\r\n\x1a\nxxxx", &sample_meta()),
+            Err(Error::NotPdf)
         ));
     }
 

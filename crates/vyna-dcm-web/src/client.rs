@@ -5,7 +5,10 @@ use vyna_dcm_core::DataSet;
 
 use crate::{
     Error, Result,
-    multipart::{Part, decode_multipart, encode_multipart, new_boundary, parse_content_type},
+    multipart::{
+        Part, decode_multipart, encode_multipart, is_dicom_media_type, new_boundary,
+        parse_content_type,
+    },
 };
 
 /// Client authentication.
@@ -66,6 +69,11 @@ fn same_origin(url: &str, base: &str) -> bool {
     }
 }
 
+/// Maximum response body the client buffers (1 GiB, matching the
+/// server-side request cap): a hostile QIDO/metadata JSON cannot
+/// OOM the client.
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024 * 1024;
+
 /// DICOMweb client over a service base URL like
 /// `https://pacs.example/dicom-web`.
 #[derive(Clone, Debug)]
@@ -80,7 +88,21 @@ impl DicomWebClient {
     ///
     /// HTTPS uses the OS certificate store; the ring crypto provider
     /// (shared with `vyna-dcm-net`) is installed as the rustls default.
+    /// Empty or unparseable base URLs are [`Error::BadRequest`] now,
+    /// not confusing transport errors at first use.
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
+        let base = base_url.into();
+        let base = base.trim_end_matches('/').to_string();
+        if base.is_empty() {
+            return Err(Error::BadRequest("empty base URL".into()));
+        }
+        let parsed = reqwest::Url::parse(&base)
+            .map_err(|e| Error::BadRequest(format!("bad base URL {base:?}: {e}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(Error::BadRequest(format!(
+                "bad base URL {base:?}: want http(s)"
+            )));
+        }
         // reqwest 0.13 `rustls-no-provider` needs the app to install a
         // provider; ignore failure (another ring install already done).
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -92,7 +114,7 @@ impl DicomWebClient {
             .map_err(|e| Error::Http(e.to_string()))?;
         Ok(Self {
             http,
-            base_url: base_url.into().trim_end_matches('/').to_string(),
+            base_url: base,
             auth: None,
         })
     }
@@ -119,8 +141,9 @@ impl DicomWebClient {
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
         // `reqwest` clients are immutable once built; rebuild with
         // the same settings plus the new timeout.
-        if let Ok(http) = reqwest::Client::builder().timeout(timeout).build() {
-            self.http = http;
+        match reqwest::Client::builder().timeout(timeout).build() {
+            Ok(http) => self.http = http,
+            Err(e) => tracing::warn!("client rebuild for timeout failed ({e}); keeping old client"),
         }
         self
     }
@@ -228,9 +251,16 @@ impl DicomWebClient {
         let parts = self
             .wado_parts(study_uid, series_uid, instance_uid, None)
             .await?;
+        Self::dicom_part_body(parts)
+    }
+
+    /// First `application/dicom` part body. Media-type match, not
+    /// string equality: compliant servers add parameters such as
+    /// `transfer-syntax` (PS3.18 §8.6).
+    fn dicom_part_body(parts: Vec<Part>) -> Result<Vec<u8>> {
         parts
             .into_iter()
-            .find(|p| p.content_type.eq_ignore_ascii_case("application/dicom"))
+            .find(|p| is_dicom_media_type(&p.content_type))
             .map(|p| p.body)
             .ok_or_else(|| Error::Multipart("no application/dicom part".into()))
     }
@@ -298,6 +328,9 @@ impl DicomWebClient {
         frames: &[u32],
         accept: &str,
     ) -> Result<Vec<Part>> {
+        if frames.is_empty() {
+            return Err(Error::BadRequest("no frames requested".into()));
+        }
         let list = frames
             .iter()
             .map(u32::to_string)
@@ -439,6 +472,9 @@ impl DicomWebClient {
     /// Each file must be a Part-10 byte buffer. Returns the parsed
     /// RetrieveURL plus the raw response.
     pub async fn stow(&self, study_uid: Option<&str>, files: &[Vec<u8>]) -> Result<StowResponse> {
+        if files.is_empty() {
+            return Err(Error::BadRequest("nothing to store".into()));
+        }
         let url = match study_uid {
             Some(u) => format!("{}/studies/{u}", self.base_url),
             None => format!("{}/studies", self.base_url),
@@ -457,18 +493,7 @@ impl DicomWebClient {
             .send()
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
-        let status = resp.status().as_u16();
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let raw = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?
-            .to_vec();
+        let (status, ct, raw) = Self::read_body_capped(resp).await?;
         if !(200..300).contains(&status) {
             return Err(Error::Status {
                 status,
@@ -503,7 +528,10 @@ impl DicomWebClient {
 
     // -- response helpers --------------------------------------------------
 
-    async fn expect_ok(resp: reqwest::Response) -> Result<(String, Vec<u8>)> {
+    /// Status + content type + body, with the body streamed under a
+    /// cap (a lying `Content-Length` cannot bypass the streaming
+    /// budget below it).
+    async fn read_body_capped(mut resp: reqwest::Response) -> Result<(u16, String, Vec<u8>)> {
         let status = resp.status().as_u16();
         let ct = resp
             .headers()
@@ -511,11 +539,28 @@ impl DicomWebClient {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?
-            .to_vec();
+        if resp
+            .content_length()
+            .is_some_and(|n| n > MAX_RESPONSE_BYTES as u64)
+        {
+            return Err(Error::Http(format!(
+                "response exceeds {MAX_RESPONSE_BYTES} bytes"
+            )));
+        }
+        let mut body = Vec::new();
+        while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
+            if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
+                return Err(Error::Http(format!(
+                    "response exceeds {MAX_RESPONSE_BYTES} bytes"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok((status, ct, body))
+    }
+
+    async fn expect_ok(resp: reqwest::Response) -> Result<(String, Vec<u8>)> {
+        let (status, ct, body) = Self::read_body_capped(resp).await?;
         if !(200..300).contains(&status) {
             return Err(Error::Status {
                 status,
@@ -542,18 +587,7 @@ impl DicomWebClient {
     }
 
     async fn expect_multipart(resp: reqwest::Response) -> Result<Vec<Part>> {
-        let status = resp.status().as_u16();
-        let ct = resp
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let body = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Http(e.to_string()))?
-            .to_vec();
+        let (status, ct, body) = Self::read_body_capped(resp).await?;
         if !(200..300).contains(&status) {
             return Err(Error::Status {
                 status,
@@ -762,6 +796,46 @@ mod tests {
             };
             assert!(DicomWebClient::wado_uri_params(&req).is_err());
         }
+    }
+
+    #[test]
+    fn dicom_part_body_accepts_parameters() {
+        // A compliant server's transfer-syntax suffix must not hide
+        // the part from wado_file.
+        let parts = vec![
+            Part::new("application/octet-stream", vec![9]),
+            Part::new(
+                "application/dicom; transfer-syntax=1.2.840.10008.1.2.1",
+                vec![1, 2, 3],
+            ),
+        ];
+        assert_eq!(
+            DicomWebClient::dicom_part_body(parts).unwrap(),
+            vec![1, 2, 3]
+        );
+        let none = vec![Part::new("application/octet-stream", vec![9])];
+        assert!(DicomWebClient::dicom_part_body(none).is_err());
+    }
+
+    #[test]
+    fn new_rejects_bad_base_urls() {
+        assert!(DicomWebClient::new("http://localhost:8080").is_ok());
+        for bad in ["", "   ", "not a url", "ftp://x/y", "gopher://x"] {
+            let err = DicomWebClient::new(bad).unwrap_err();
+            assert!(matches!(err, Error::BadRequest(_)), "{bad}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_retrieves_fail_client_side() {
+        let client = DicomWebClient::new("http://127.0.0.1:1").unwrap();
+        let err = client
+            .wado_frames("1", "1", "1", &[], "application/octet-stream")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
+        let err = client.stow(None, &[]).await.unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
     }
 
     #[test]

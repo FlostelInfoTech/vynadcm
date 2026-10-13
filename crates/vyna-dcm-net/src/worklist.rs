@@ -431,8 +431,8 @@ impl Handlers for MppsScp {
         ctx: &RequestContext<'_>,
         dataset: Option<DataSet>,
     ) -> (u16, Option<DataSet>) {
-        let class = ctx.command.affected_sop_class_uid.as_deref().unwrap_or("");
-        let Some(uid) = ctx.command.affected_sop_instance_uid.as_deref() else {
+        let class = ctx.command.requested_sop_class_uid.as_deref().unwrap_or("");
+        let Some(uid) = ctx.command.requested_sop_instance_uid.as_deref() else {
             return (status::MISTYPED_ARGUMENT, None);
         };
         self.set(uid, class, dataset)

@@ -65,7 +65,19 @@ fn authorized(headers: &std::collections::HashMap<String, String>, auth: &Server
     let Some(token) = got.strip_prefix("Bearer ") else {
         return false;
     };
-    token == expected
+    constant_time_eq(token, expected)
+}
+
+/// Fixed-time string equality: every byte pair is always compared
+/// (length still leaks, which is fine for fixed-shape tokens).
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.bytes()
+        .zip(b.bytes())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
 }
 
 /// Serve one TCP connection (HTTP/1.1, keep-alive) to completion.
@@ -149,6 +161,9 @@ pub async fn serve_forever_with_auth<S: DicomWebStore + 'static>(
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
+            // Back off: a persistent accept failure (e.g. EMFILE)
+            // must not spin the loop at full speed.
+            tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
         };
         let Ok(permit) = slots.clone().try_acquire_owned() else {
@@ -264,6 +279,11 @@ mod tests {
         let mut basic = HashMap::new();
         basic.insert("authorization".to_string(), "Basic c2NyZXQ=".to_string());
         assert!(!authorized(&basic, &gated));
+        // Fixed-time comparison semantics.
+        assert!(constant_time_eq("abc123", "abc123"));
+        assert!(!constant_time_eq("abc123", "abc124"));
+        assert!(!constant_time_eq("abc123", "abc123!"));
+        assert!(!constant_time_eq("abc123", "short"));
         let mut good = HashMap::new();
         good.insert("authorization".to_string(), "Bearer s3cret".to_string());
         assert!(authorized(&good, &gated));

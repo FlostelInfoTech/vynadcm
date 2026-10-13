@@ -407,8 +407,11 @@ fn ybr_to_rgb(raw: &[u8], geo: &Geometry) -> Result<Vec<u8>> {
             ),
         });
     }
-    let pixels = geo.rows as usize * geo.columns as usize;
-    let mut out = Vec::with_capacity(pixels * 3);
+    // Capacity follows the input (YBR_FULL emits 1 byte per input
+    // byte, 4:2:2 emits 1.5×), never the dataset geometry: a lying
+    // Rows/Columns must not drive a giant reservation (or wrap it on
+    // 32-bit).
+    let mut out = Vec::with_capacity(raw.len().saturating_add(raw.len() / 2));
     match geo.photometric {
         Photometric::YbrFull => {
             for triplet in raw.as_chunks::<3>().0 {
@@ -480,7 +483,7 @@ fn encode_target(
         seq.fragments
     };
     let compressed_len: usize = frames.iter().map(Vec::len).sum();
-    let fragments = refragment(frames);
+    let fragments = refragment(frames)?;
     Ok(EncodedTarget {
         element: DataElement::new(tags::PIXEL_DATA, Vr::Ob, Value::Fragments(fragments)),
         compressed_len,
@@ -489,14 +492,16 @@ fn encode_target(
 
 /// Re-fragment per-frame bytes: one fragment per frame when everything
 /// fits, else ≤64 KiB fragments with a basic offset table (multi
-/// fragments per frame without a table would be ambiguous).
-fn refragment(frames: Vec<Vec<u8>>) -> vyna_dcm_core::FragmentSequence {
+/// fragments per frame without a table would be ambiguous). BOT
+/// offsets are 32-bit by format: past 4 GiB the table is
+/// unrepresentable and this errors rather than wrapping it.
+fn refragment(frames: Vec<Vec<u8>>) -> Result<vyna_dcm_core::FragmentSequence> {
     use vyna_dcm_core::FragmentSequence;
     if frames.iter().all(|f| f.len() <= MAX_FRAGMENT) {
-        return FragmentSequence {
+        return Ok(FragmentSequence {
             basic_offset_table: vec![],
             fragments: frames,
-        };
+        });
     }
     let mut offsets = Vec::with_capacity(frames.len());
     let mut fragments = Vec::new();
@@ -504,14 +509,20 @@ fn refragment(frames: Vec<Vec<u8>>) -> vyna_dcm_core::FragmentSequence {
     for frame in &frames {
         offsets.push(pos);
         for chunk in frame.chunks(MAX_FRAGMENT) {
-            pos += chunk.len() as u32;
+            pos = pos
+                .checked_add(chunk.len() as u32)
+                .ok_or_else(|| Error::BadValue {
+                    tag: tags::PIXEL_DATA,
+                    vr: Vr::Ob,
+                    message: "fragment stream exceeds 32-bit basic offset table".into(),
+                })?;
             fragments.push(chunk.to_vec());
         }
     }
-    FragmentSequence {
+    Ok(FragmentSequence {
         basic_offset_table: offsets,
         fragments,
-    }
+    })
 }
 
 /// Lossy bookkeeping: the flag stays `01` once data has ever been
@@ -1024,12 +1035,12 @@ mod tests {
     #[test]
     fn refragment_rules() {
         // Small frames: one fragment each, no table.
-        let seq = refragment(vec![vec![1u8; 100], vec![2u8; 200]]);
+        let seq = refragment(vec![vec![1u8; 100], vec![2u8; 200]]).unwrap();
         assert!(seq.basic_offset_table.is_empty());
         assert_eq!(seq.fragments.len(), 2);
         // A large frame forces splits plus offsets.
         let big = vec![7u8; MAX_FRAGMENT + 1000];
-        let seq = refragment(vec![vec![1u8; 10], big.clone()]);
+        let seq = refragment(vec![vec![1u8; 10], big.clone()]).unwrap();
         assert_eq!(seq.basic_offset_table, vec![0, 10]);
         assert!(seq.fragments.iter().all(|f| f.len() <= MAX_FRAGMENT));
         assert_eq!(seq.fragments.concat().len(), 10 + big.len());

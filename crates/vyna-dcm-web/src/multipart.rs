@@ -171,6 +171,11 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Maximum headers per part: real MIME parts carry a handful; an
+/// unbounded count lets a header-dense body inflate past its wire
+/// size by multiples in `Vec<String>` overhead.
+const MAX_PART_HEADERS: usize = 100;
+
 fn parse_headers(head: &[u8]) -> Result<Vec<(String, String)>> {
     if head.is_empty() {
         return Ok(Vec::new());
@@ -182,6 +187,11 @@ fn parse_headers(head: &[u8]) -> Result<Vec<(String, String)>> {
         let line = line.trim();
         if line.is_empty() {
             continue;
+        }
+        if out.len() >= MAX_PART_HEADERS {
+            return Err(Error::Multipart(format!(
+                "too many part headers (>{MAX_PART_HEADERS})"
+            )));
         }
         let (name, value) = line
             .split_once(':')
@@ -223,6 +233,13 @@ pub fn parse_content_type(header: &str) -> (String, HashMap<String, String>) {
         }
     }
     (mime, params)
+}
+
+/// Whether a part Content-Type names `application/dicom`, ignoring
+/// parameters (PS3.18 permits e.g. `transfer-syntax=...`) and case.
+#[must_use]
+pub fn is_dicom_media_type(header: &str) -> bool {
+    parse_content_type(header).0 == "application/dicom"
 }
 
 #[cfg(test)]
@@ -286,5 +303,33 @@ mod tests {
         body.extend_from_slice(b"--B--\r\n");
         let err = decode_multipart(&body, "B").unwrap_err();
         assert!(format!("{err:?}").contains("too many parts"), "{err:?}");
+    }
+
+    #[test]
+    fn rejects_header_flood() {
+        let mut body = b"--B\r\n".to_vec();
+        for i in 0..=MAX_PART_HEADERS {
+            body.extend_from_slice(format!("X-H{i}: v\r\n").as_bytes());
+        }
+        body.extend_from_slice(b"\r\nx\r\n--B--\r\n");
+        let err = decode_multipart(&body, "B").unwrap_err();
+        assert!(
+            format!("{err:?}").contains("too many part headers"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn dicom_media_type_ignores_params_and_case() {
+        assert!(is_dicom_media_type("application/dicom"));
+        assert!(is_dicom_media_type(
+            "application/dicom; transfer-syntax=1.2.840.10008.1.2.1"
+        ));
+        assert!(is_dicom_media_type(
+            "Application/DICOM; TRANSFER-SYNTAX=\"1.2.840.10008.1.2.4.50\""
+        ));
+        assert!(!is_dicom_media_type("application/octet-stream"));
+        assert!(!is_dicom_media_type("application/dicom+json"));
+        assert!(!is_dicom_media_type(""));
     }
 }

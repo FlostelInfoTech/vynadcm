@@ -33,7 +33,7 @@ hyper. There are no DICOM dependencies outside this workspace.
   (`string`, `uint16`, `sequence`, …) and builders (`put_text`,
   `put_sequence`, …).
 - `dictionary.rs` + `dictionary_generated.rs` — full PS3.6 registry:
-  5,217 `DictEntry`s (tag, VR, VM, keyword, name, retired flag) sorted
+  5,239 `DictEntry`s (tag, VR, VM, keyword, name, retired flag) sorted
   for binary search, plus hand-written and generated `tags` constants.
   Regenerate with `docs/generate-dictionary.py`.
 - `private_generated.rs` — private dictionary: 424 creators, 8,898
@@ -160,7 +160,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## vyna-dcm-deid — de-identification
 
-- `profile.rs` — `Action` enum + 191-tag `BASIC_PROFILE` (PS3.15 E
+- `profile.rs` — `Action` enum + 197-tag `BASIC_PROFILE` (PS3.15 E
   semantics; curated subset, Type-disciplined).
 - `engine.rs` — `Deidentifier` (dummies, UID map, date offset,
   private retention) + `DeidReport`; `dates.rs` holds the

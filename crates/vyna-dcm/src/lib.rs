@@ -13,6 +13,15 @@
 //! - [`atna`] — ATNA audit-trail emission over syslog
 //!
 //! Common types are re-exported at the root for convenience.
+//!
+//! # Features
+//!
+//! Default: `net`, `web`, `ecg`, `cli` (everything, including the
+//! binaries). Library embeds should start from
+//! `default-features = false` and add only the stacks they need
+//! (`net` pulls tokio-rustls, `web` pulls reqwest/hyper); `cli`
+//! exists only to build the binaries and changes nothing in the
+//! library.
 
 #![warn(missing_docs)]
 

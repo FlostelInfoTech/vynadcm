@@ -38,10 +38,17 @@ impl FromStr for SyslogTarget {
     type Err = Error;
 
     fn from_str(url: &str) -> Result<Self> {
+        // Schemes are case-insensitive (RFC 3986 §3.1).
         let (transport, rest, default_port) = match url.split_once("://") {
-            Some(("udp", rest)) => (Transport::Udp, rest, 514),
-            Some(("tcp", rest)) => (Transport::Tcp, rest, 514),
-            Some(("tls", rest)) => (Transport::Tls, rest, 6514),
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("udp") => {
+                (Transport::Udp, rest, 514)
+            }
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("tcp") => {
+                (Transport::Tcp, rest, 514)
+            }
+            Some((scheme, rest)) if scheme.eq_ignore_ascii_case("tls") => {
+                (Transport::Tls, rest, 6514)
+            }
             _ => return Err(Error::BadUrl(url.to_string())),
         };
         if rest.is_empty() || rest.contains('/') || rest.contains('?') {
@@ -100,8 +107,9 @@ pub const fn pri_value(severity: u8) -> u32 {
 
 /// Render an RFC 5424 frame (without transport framing).
 ///
-/// `hostname`/`app_name` are sanitized: spaces and control characters
-/// would corrupt the header fields (log injection via `--hostname`).
+/// Every header field is sanitized: spaces and control characters
+/// would corrupt the framing (log injection via `--hostname` or a
+/// hostile direct caller).
 #[must_use]
 pub fn syslog_frame(
     severity: u8,
@@ -114,8 +122,10 @@ pub fn syslog_frame(
     format!(
         "<{}>1 {timestamp} {hostname} {app_name} - {msgid} - {message}",
         pri_value(severity),
+        timestamp = sanitize_field(timestamp),
         hostname = sanitize_field(hostname),
         app_name = sanitize_field(app_name),
+        msgid = sanitize_field(msgid),
     )
 }
 
@@ -196,6 +206,11 @@ impl SyslogSender {
     }
 
     /// Send one audit message (severity follows its outcome).
+    ///
+    /// Connect/read/write run under the 10 s timeout, but DNS
+    /// resolution does not (`std` offers no resolution timeout): a
+    /// broken resolver can stall past it. Prefer IP literals for the
+    /// audit server when that matters.
     pub fn emit(&self, message: &AuditMessage) -> Result<()> {
         let frame = syslog_frame(
             severity_for(message.outcome),
@@ -354,6 +369,11 @@ mod tests {
         assert!("udp://h:1/path".parse::<SyslogTarget>().is_err());
         assert!("udp://h:notaport".parse::<SyslogTarget>().is_err());
         assert!("udp://[::1".parse::<SyslogTarget>().is_err());
+        // Schemes are case-insensitive.
+        let t: SyslogTarget = "UDP://10.0.0.1:514".parse().unwrap();
+        assert_eq!(t.transport, Transport::Udp);
+        let t: SyslogTarget = "TLS://arr.example".parse().unwrap();
+        assert_eq!((t.transport, t.port), (Transport::Tls, 6514));
     }
 
     #[test]
@@ -365,6 +385,10 @@ mod tests {
         assert!(frame.starts_with("<109>1 2026-10-12T00:00:00.000Z h a - ATNA - <m/>"));
         let octets = octet_frame(&frame);
         assert!(octets.starts_with(&format!("{} ", frame.len())));
+        // Every header field is injection-proofed, not just host/app.
+        let evil = syslog_frame(5, "t\n20", "h h", "a\ta", "M\nX", "<m/>");
+        assert!(!evil.contains(['\n', '\t']), "{evil}");
+        assert!(evil.contains("h_h") && evil.contains("M_X"), "{evil}");
     }
 
     #[test]
