@@ -5,6 +5,19 @@ the workspace crate version (`Cargo.toml`).
 
 ## [Unreleased]
 
+### Fixed
+
+- Documentation/code tally pass: corrected table counts (5,217
+  dictionary entries, 8,898 private entries, 191-tag de-id profile,
+  84 IOD modules), fixed the stale out-of-scope list, the
+  `propose()` integration snippet (now `Result`), the `get_with`
+  callback arity, bulk-UUID/server-auth design notes, the error
+  taxonomy (added `Xml`/`Image`/`MessageTooLarge`/pdf/deid/atna),
+  and per-tool flag references; `wadors --series` help no longer
+  names a nonexistent `--study` flag.
+- `vyna-dcm-iod` enables `#![warn(missing_docs)]` like every other
+  first-party crate (zero warnings).
+
 ### Changed
 
 - The vendored `openjp2` patch is now a `vyna-openjp2` 0.6.1 fork
@@ -123,10 +136,10 @@ the workspace crate version (`Cargo.toml`).
 
 ### Added
 
-- Full PS3.6 2026d dictionary (5,239 entries, retired flags,
+- Full PS3.6 2026d dictionary (5,217 entries, retired flags,
   generated `tags` constants) replacing the 266-entry curated table;
   regenerate with `docs/generate-dictionary.py`.
-- Private dictionary (424 creators / 8,860 entries) with
+- Private dictionary (424 creators / 8,898 entries) with
   `lookup_private` and `Tag` reservation mechanics.
 - `Vr::Sv` (signed 64-bit) with decode/encode/JSON support;
   35 VR variants including retired `SI`.
@@ -178,7 +191,7 @@ the workspace crate version (`Cargo.toml`).
   192 tests green.
 - New `vyna-dcm-deid` crate: basic-profile de-identification
   (`Deidentifier` with dummy/zero/remove/UID-remap/date-shift
-  actions over a curated 174-tag table, sequence recursion,
+  actions over a curated 191-tag table, sequence recursion,
   private/overlay rules, burned-in refusal, factual
   longitudinal-temporal flag) plus the batch `deidentify` CLI
   (`--output-dir`/`--output`/`--in-place`, `--date-offset`, dummy

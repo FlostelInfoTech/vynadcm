@@ -49,15 +49,15 @@ Items move to the SRS (`docs/requirements.md`) when scheduled.
 ### P0.1 Full PS3.6 dictionary + private creators — DONE
 
 Replaced the 266-entry curated table with the complete public registry
-(5,239 entries, PS3.6 2026d) plus private-creator mechanics (424
-creators / 8,860 entries) and the missing `SV` VR (35 variants).
+(5,217 entries, PS3.6 2026d) plus private-creator mechanics (424
+creators / 8,898 entries) and the missing `SV` VR (35 variants).
 Accepted: registry/private spot tests, 96/96 green, clippy clean.
 
 ### P0.2 Bundled JPEG / JPEG-LS / JPEG 2000 backend — DONE
 
 Shipped `BundledCodec` (`.50` via `jpeg-decoder`/`jpeg-encoder`,
 `.70` via `jpegli`, `.80`/`.81` via `jpegls`, `.90`/`.91` via
-vendored `openjp2` with a null-`dealloc` patch) plus `encode_pixels`
+the `vyna-openjp2` fork with a null-`dealloc` patch) plus `encode_pixels`
 and multi-frame decode; `decode_pixels` works without an explicit
 codec. Accepted: exact lossless round-trips, NEAR-bound and
 lossy-error tests, independent-encoder cross-checks, truncated-input
@@ -67,7 +67,7 @@ HTJ2K stay out of scope.
 ### P0.3 IOD validator (`dciodvfy` / `dcmvalidate`-like) — DONE
 
 Shipped `vyna-dcm-iod` (`validate` + `Report`/`Finding`) with 18
-generated IOD tables (89 macro-expanded modules, strictest-type
+generated IOD tables (84 macro-expanded modules, strictest-type
 merge, 7 conditional rules) plus the `dcmvalidate` CLI with
 file-meta consistency checks. Accepted: per-IOD valid fixtures
 validate clean, negatives/conditions flag correctly,
@@ -139,7 +139,7 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
 ## 5. Priority 2: deployment and robustness
 
 - **De-identification profiles** (PS3.15 E, dcm4che `deidentify`)
-  — DONE: shipped `vyna-dcm-deid` (`Deidentifier` + 174-tag
+  — DONE: shipped `vyna-dcm-deid` (`Deidentifier` + 191-tag
   `BASIC_PROFILE` with dummy/zero/remove/UID-remap/date-shift
   actions, sequence recursion, private/overlay rules, burned-in
   refusal) plus the batch `deidentify` CLI. Accepted: 14 engine
@@ -196,7 +196,8 @@ clean. Out of scope (documented): CDA, PDF/A or magic enforcement.
   (`codec::img` over the `image` crate plus `dcm2img`/`img2dcm`
   CLIs; MONO 8/16-bit and RGB 8-bit, no windowing), and a
   real-file regression corpus (crate `tests/data/` dirs, 5 MIT
-  pydicom-data files + README) with `codec::corpus` tests. The
+  pydicom-data files + READMEs, with 2 files also copied for the
+  web crate) with `codec::corpus` tests. The
   corpus immediately paid off: RLE MSB-first component-major
   segment order (was little-endian), even-length segment padding
   tolerated/emitted, bogus basic offset tables validated with

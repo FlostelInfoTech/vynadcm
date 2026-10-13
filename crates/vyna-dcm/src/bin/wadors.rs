@@ -17,7 +17,7 @@ struct Args {
     web: WebArgs,
     /// Study Instance UID (ignored with --bulkdata).
     study: Option<String>,
-    /// Series Instance UID (needs --study for retrieve/metadata/frames).
+    /// Series Instance UID (needs STUDY for retrieve/metadata/frames).
     #[arg(long)]
     series: Option<String>,
     /// SOP Instance UID.

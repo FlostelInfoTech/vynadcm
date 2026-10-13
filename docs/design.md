@@ -33,8 +33,10 @@ spec adds component contracts, algorithms, sequences, and invariants.
 
 ## 1. Design principles
 
-1. **Layered, acyclic**: `core ← codec ← {net, web, ecg, iod, pdf} ← facade`.
-   A lower layer never names an upper one; each crate builds standalone.
+1. **Layered, acyclic**: `core ← codec ← {net, web, ecg, iod, pdf,
+   deid, atna} ← facade`, with `codec ← vyna-openjp2` (JPEG 2000
+   fork) below the codec. A lower layer never names an upper one;
+   each crate builds standalone.
 2. **Parse, don't validate**: wire bytes become typed values
    (`Tag`, `Vr`, `Command`, PDU structs) at the boundary; downstream
    code works with types, not offsets.
@@ -42,8 +44,8 @@ spec adds component contracts, algorithms, sequences, and invariants.
    `#[cfg(test)]` suites assert `Err` (not panic) on truncated,
    over-long, and contradictory input.
 4. **Explicit async**: only `net`/`web` are async (tokio); `core`,
-   `codec`, `ecg`, `iod`, `pdf` are sync and runtime-free so VynaECG
-   can call them from any executor.
+   `codec`, `ecg`, `iod`, `pdf`, `deid`, `atna` are sync and
+   runtime-free so VynaECG can call them from any executor.
 5. **One TLS stack**: rustls 0.23 + `ring` everywhere; reqwest 0.13
    runs provider-less and shares the same install (see §7).
 
@@ -57,8 +59,8 @@ spec adds component contracts, algorithms, sequences, and invariants.
 | `Vr` | 35 variants (34 standard + retired `SI`); `is_text()`, fixed byte width where applicable |
 | `Value` | Sum type: text/numbers (per VR width) / bytes / sequences / fragments / tags / person names; `is_empty()` for QIDO pruning |
 | `DataSet` | Insertion-ordered map; typed getters return `Option` (never panic); `put_*` builders; `PartialEq` for round-trip asserts |
-| `ENTRIES` / `tags` | 5,239 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
-| Private dict | 424 creators / 8,860 entries via `lookup_private(creator, group, suffix)` with block + group-wildcard fallbacks; `Tag::{private_block, private_creator_element, private_suffix}` mechanics |
+| `ENTRIES` / `tags` | 5,217 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
+| Private dict | 424 creators / 8,898 entries via `lookup_private(creator, group, suffix)` with block + group-wildcard fallbacks; `Tag::{private_block, private_creator_element, private_suffix}` mechanics |
 | `TransferSyntax` | 16 UIDs; `is_encapsulated()`, `is_deflated()`, endianness/VR-explicitness; `Default` = Explicit VR LE |
 | `PersonName`, `Da`, `Tm` | `PersonName::parse` is infallible; `Da`/`Tm` validate (`Tm`: `HH[MM[SS[.FFFFFF]]]`, colons optional) |
 
@@ -193,15 +195,19 @@ spec adds component contracts, algorithms, sequences, and invariants.
   `instance_frames` (1-based), `store_instance` (Part-10 in, IDs out),
   `put_bulk` / `bulk_data` (opaque blob ids for `BulkDataURI`).
 - `MemoryStore`: `Mutex`-guarded vectors; replace-on-re-store by SOP
-  Instance UID; bulk ids are hex sequence numbers.
+  Instance UID; bulk ids are unpredictable UUIDs with oldest-first
+  eviction past 10k blobs / 1 GiB.
 - `hyper_server::serve_connection`: adapts one TCP stream to
-  `dispatch`; bodies capped at 1 GiB (`MAX_BODY_LEN`).
+  `dispatch`; bodies capped at 1 GiB (`MAX_BODY_LEN`). The
+  `*_with_auth` variants take a `ServerAuth` (optional bearer
+  token) guarding every request.
 
 ### 2.5 `vyna-dcm-ecg` — ECG mapping
 
 - `EcgLead { samples: Vec<i32>, sensitivity, units, correction_factor,
-  baseline, … }`; `EcgRecording { leads, sampling_frequency_hz }`
-  validates rectangular shape (all leads equal length, rate > 0).
+  baseline, … }`; `EcgRecording::new` validates rectangular shape
+  (non-empty, all leads equal length); conversion rejects
+  non-positive or non-finite sampling rates.
 - Physics: `physical = sample × sensitivity × correction + baseline`
   (PS3.3 C.10.9); VynaECG default sensitivity `0.001` (mV units).
 - `recording_to_waveform_item`: one multiplex group (all channels;
@@ -237,7 +243,7 @@ spec adds component contracts, algorithms, sequences, and invariants.
 ### 2.8 `vyna-dcm-deid` — de-identification
 
 - `Action::{Dummy, Zero, Remove, RemapUid, ShiftDate}` per-element
-  actions; `BASIC_PROFILE` is a 174-tag curated table (6/19/49/20/80
+  actions; `BASIC_PROFILE` is a 191-tag curated table (6/91/54/20/20
   split). Unlisted tags keep; sequences recurse; odd groups
   (private) and `0x6000..=0x60FF` (overlays) remove by rule.
 - `Deidentifier`: dummies (`ANONYMIZED` defaults, PN-aware), one UID
@@ -310,7 +316,7 @@ bytes inside bodies); per-part headers + bytes preserved verbatim.
 ### 4.1 SCU C-STORE
 
 ```text
-app → Association::request(opts, calling, called, addr, propose([sop…], [ts…]))
+app → Association::request(opts, calling, called, addr, propose([sop…], [ts…])?)   // propose: Result, errs past 128 SOP classes
 app → assoc.store(&ds, class, inst, MEDIUM) → status: u16
 app → assoc.release()
 ```
@@ -327,14 +333,16 @@ listener.accept() → TlsAcceptor.accept()? → service::accept(stream, acc, h, 
 
 ### 4.3 VynaLink store-and-forward (`examples/link_route`)
 
-Inbound SCP `on_store` persists the dataset, then acts as SCU:
-opens an association to the downstream PACS and re-STOREs the same
-bytes (receive → store → forward, one downstream association per
-inbound instance in the example; production code should pool).
+Inbound SCP `on_store` acts as SCU: opens an association to the
+downstream PACS and re-STOREs the same bytes (receive → forward,
+one downstream association per inbound instance in the example;
+production code should pool).
 
 ## 5. Error taxonomy
 
-Each crate has `error.rs` (`thiserror::Error` + `Result<T>` alias):
+Each crate except `iod` has `error.rs` (`thiserror::Error` +
+`Result<T>` alias); `iod::validate` returns `Option<Report>` instead
+(unknown SOP Classes yield `None`):
 
 - `core`: `UnknownVr`, `InvalidTag`, `InvalidUid`, `Value`,
   `MissingAttribute`, `Parse`; dictionary misses surface as `Option`,
@@ -342,17 +350,21 @@ Each crate has `error.rs` (`thiserror::Error` + `Result<T>` alias):
 - `codec`: `Truncated`, `UnknownVr`, `MissingDictionaryVr`,
   `BadUndefinedLength`, `BadSequence`, `BadFragments`, `BadValue`,
   `Unencodable`, `NotPart10`, `BadFileMeta`,
-  `UnsupportedTransferSyntax`, `Rle`, `Deflate`, `Json`, `Base64`
-  (plus a `Core` passthrough).
+  `UnsupportedTransferSyntax`, `Rle`, `Deflate`, `Json`, `Base64`,
+  `Xml`, `Image` (plus a `Core` passthrough).
 - `net`: `Io`, `BadPdu`, `UnexpectedPdu { expected, got }`,
   `Rejected`, `Aborted`, `Released`, `NoPresentationContext`,
   `UnknownContext`, `BadCommand`, `DimseStatus`, `Timeout`,
-  `BadAeTitle`, `Tls`, `UnknownMoveDestination` (plus `Codec`/`Core`
-  passthroughs).
+  `MessageTooLarge { limit }`, `BadAeTitle`, `Tls`,
+  `UnknownMoveDestination` (plus `Codec`/`Core` passthroughs).
 - `web`: `Http`, `Status`, `Multipart`, `Json`, `BadRequest` (plus
   `Codec`/`Core` passthroughs).
 - `ecg`: `Waveform`, `Samples` (ragged leads / bad rate), `Missing`
   (plus `Codec`/`Core` passthroughs).
+- `pdf`: `EmptyDocument`, `DocumentTooLarge`, `Missing`,
+  `NoDocumentBytes`.
+- `deid`: `BurnedInAnnotation`.
+- `atna`: `BadUrl`, `TlsDisabled`, `Transport`, `Tls`.
 
 Errors carry human-readable context (offsets, tags, UIDs) and never
 expose internal buffers.
@@ -366,7 +378,7 @@ expose internal buffers.
 - `codec`/`core`/`ecg` are sync with no I/O: safe to call from
   `spawn_blocking` or any executor.
 - Timeouts: per-read `read_timeout` (SCU default 30 s in tools,
-  300 s SCP-side); no global association timer in v0.1.
+  300 s SCP-side); no global association timer in v0.4.
 
 ## 7. TLS design (PS3.15 + HTTPS)
 
@@ -382,8 +394,8 @@ expose internal buffers.
   provider (`install_default`; repeat installs are ignored);
   certificate roots come from the OS store via
   `rustls-platform-verifier`.
-- Minimum TLS 1.2 everywhere (`tls12` features on rustls,
-  tokio-rustls, hyper-rustls).
+- Minimum TLS 1.2 everywhere (`tls12` features on rustls and
+  tokio-rustls; reqwest inherits it from rustls).
 
 ## 8. Feature gating
 
@@ -395,8 +407,10 @@ expose internal buffers.
 | facade `cli` | bins absent (`required-features` skips them) |
 
 Gated tests compile out with their features. The supported matrix
-(default / each off / `--all-features` / `--no-default-features`)
-must all build; see `README.md`.
+(default, `--all-features`, `--no-default-features`, and each
+facade feature off in turn) must all build; CI checks the default
+workspace plus the `--no-default-features` ladder
+(bare / `cli` / `cli,net` / `cli,web`).
 
 ## 9. Invariants and limits
 

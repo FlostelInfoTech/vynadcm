@@ -1,3 +1,4 @@
+#![warn(missing_docs)]
 //! IOD validation: Type 1/2/3 presence plus VR and VM checking.
 //!
 //! [`validate`] checks a dataset against one of the supported Information

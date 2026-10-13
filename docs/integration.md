@@ -107,7 +107,8 @@ let mut assoc = Association::request(
     propose(
         &[sop_class::VERIFICATION, sop_class::CT_IMAGE],
         &[TransferSyntax::ExplicitVrLittleEndian],
-    ),
+    )
+    .unwrap(), // propose errs past 128 SOP classes
 )
 .await
 .unwrap();
@@ -138,7 +139,9 @@ let (st, matches) = assoc
 
 C-MOVE / C-GET return `MoveResult { status, remaining, completed,
 failed, warning }`; `get_with` takes an `on_store(class, inst,
-dataset) -> u16` callback for incoming objects. N-services
+dataset, transfer_syntax) -> u16` callback for incoming objects
+(the syntax lets receivers transcode encapsulated arrivals).
+N-services
 (`n_create`, `n_set`, `n_get`, `n_action`, `n_delete`,
 `n_event_report`) return `(status, Option<DataSet>)`.
 
@@ -301,6 +304,9 @@ loop {
 
 To embed in another HTTP framework, call
 `dispatch(&store, public_base, &HttpRequest) -> HttpResponse` directly.
+To require a bearer token on every request, use
+`serve_connection_with_auth` / `serve_forever_with_auth` with a
+`ServerAuth` instead.
 
 ## 10. ECG end-to-end (VynaECG recipe)
 
@@ -405,7 +411,7 @@ JPEG-family syntaxes with `UnsupportedTransferSyntax`.
   task; `Handlers`/`DicomWebStore` are `Send + Sync` and shared by
   reference; `core`/`codec`/`ecg` are sync and executor-agnostic.
 - **Limits**: tune `AssociationOptions::{max_pdu_len, read_timeout,
-  max_incoming_pdu}`; STOW bodies cap at 1 GiB.
+  max_incoming_pdu, max_message_bytes}`; STOW bodies cap at 1 GiB.
 - **Snippet verification**: every snippet in §§2–11 is mirrored in a
   temporary example and `cargo check`ed on each doc release; the
   runnable `ecg_write`, `wado_fetch`, and `link_route` examples cover

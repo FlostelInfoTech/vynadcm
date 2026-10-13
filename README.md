@@ -6,7 +6,8 @@ DICOM dependencies.
 
 No DICOM code is borrowed: the data model, codecs, DIMSE networking,
 DICOMweb, and ECG mapping are all implemented in this workspace
-(~17k lines). External crates are used only for generic infrastructure
+(~24k lines, excluding generated tables and the openjp2 fork).
+External crates are used only for generic infrastructure
 (async runtime, HTTP, TLS, crypto, CLI parsing).
 
 | Crate | Purpose |
@@ -20,6 +21,7 @@ DICOMweb, and ECG mapping are all implemented in this workspace
 | `vyna-dcm-pdf` | Encapsulated PDF SOP-instance builders and extractors |
 | `vyna-dcm-deid` | Basic-profile de-identification for research exports |
 | `vyna-dcm-atna` | ATNA audit-trail emission over syslog |
+| `vyna-openjp2` | BSD-2-Clause `openjp2` fork (JPEG 2000 backend), published separately |
 | `vyna-dcm` | Facade re-exporting the above, plus 32 CLI tools and 3 examples |
 
 ## Documentation

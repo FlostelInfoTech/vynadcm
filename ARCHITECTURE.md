@@ -11,10 +11,14 @@ vyna-dcm (facade: re-exports + bins + examples)
 ├── vyna-dcm-deid ─┤
 ├── vyna-dcm-atna ─┤
 └── vyna-dcm-net ──┴──> vyna-dcm-codec ──> vyna-dcm-core
+                                  │
+                                  └──> vyna-openjp2 (JPEG 2000 fork)
 ```
 
 `core` is dependency-light (thiserror + uuid, plus std). `codec` adds
-serde_json/flate2/base64. `net`/`web` add tokio; TLS adds
+serde_json/flate2/base64 plus the pixel stack (jpeg-decoder,
+jpeg-encoder, jpegli, jpegls, image, quick-xml, encoding_rs) and the
+`vyna-openjp2` fork. `net`/`web` add tokio; TLS adds
 tokio-rustls/rustls; the web client adds reqwest; the web server adds
 hyper. There are no DICOM dependencies outside this workspace.
 
@@ -29,10 +33,10 @@ hyper. There are no DICOM dependencies outside this workspace.
   (`string`, `uint16`, `sequence`, …) and builders (`put_text`,
   `put_sequence`, …).
 - `dictionary.rs` + `dictionary_generated.rs` — full PS3.6 registry:
-  5,239 `DictEntry`s (tag, VR, VM, keyword, name, retired flag) sorted
+  5,217 `DictEntry`s (tag, VR, VM, keyword, name, retired flag) sorted
   for binary search, plus hand-written and generated `tags` constants.
   Regenerate with `docs/generate-dictionary.py`.
-- `private_generated.rs` — private dictionary: 424 creators, 8,860
+- `private_generated.rs` — private dictionary: 424 creators, 8,898
   entries keyed by creator/group/suffix with wildcard fallbacks;
   `lookup_private` + `Tag` reservation mechanics.
 - `transfer_syntax.rs` — `TransferSyntax`: 16 UIDs with wire properties
@@ -141,9 +145,10 @@ The physics convention follows PS3.3 C.10.9:
 
 ## vyna-dcm-iod — IOD validation
 
-- `iod_generated.rs` — 18 IOD tables (CR/CT/MR/MG/DX/US/SC/PT/NM/XA/
-  VL/KO/PDF/ECG) from NEMA PS3.3 via `docs/generate-iod.py` (89
-  modules, macro-expanded, strictest-type merge).
+- `iod_generated.rs` — 18 IOD tables across CR/CT/MR/MG/DX/US/SC/
+  PT/NM/XA/VL/KO/PDF/ECG (DX, MG, US, ECG doubled) from NEMA PS3.3
+  via `docs/generate-iod.py` (84 modules, macro-expanded,
+  strictest-type merge).
 - `lib.rs` — `validate(ds, sop_uid, ts)`: Type 1/2 presence, VR/VM
   checks, 7 conditional rules; `Finding`/`Report` in tag order.
 
@@ -155,7 +160,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## vyna-dcm-deid — de-identification
 
-- `profile.rs` — `Action` enum + 174-tag `BASIC_PROFILE` (PS3.15 E
+- `profile.rs` — `Action` enum + 191-tag `BASIC_PROFILE` (PS3.15 E
   semantics; curated subset, Type-disciplined).
 - `engine.rs` — `Deidentifier` (dummies, UID map, date offset,
   private retention) + `DeidReport`; `dates.rs` holds the
@@ -196,8 +201,7 @@ The physics convention follows PS3.3 C.10.9:
   (`round_trips_json_model`) round-trips are covered by tests, as is a
   live C-STORE loopback (`loopback_echo_store_find`).
 - **Wire interop**: beyond loopback tests, the SCU has been exercised
-  live against a third-party DICOM endpoint (C-ECHO `0x0000`, well-formed
-  C-FIND responses).
+  live against a third-party DICOM endpoint (C-ECHO `0x0000`).
 
 ## Test layout
 

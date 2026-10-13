@@ -25,7 +25,7 @@ library should read `docs/integration.md`.
 - [3. Connectivity: echoscu / echoscp](#3-connectivity-echoscu--echoscp)
 - [4. Storage: storescu / storescp](#4-storage-storescu--storescp)
 - [5. Query: findscu](#5-query-findscu)
-- [6. Files: dcmdump, dcm2json, json2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify](#6-files-dcmdump-dcm2json-json2dcm-dcmvalidate-pdf2dcm-dcm2pdf-dcmodify)
+- [6. Files: dcmdump, dcm2json, json2dcm, dcm2xml, xml2dcm, dcm2img, img2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify, dcm2dcm, dcmdir, deidentify](#6-files-dcmdump-dcm2json-json2dcm-dcm2xml-xml2dcm-dcm2img-img2dcm-dcmvalidate-pdf2dcm-dcm2pdf-dcmodify-dcm2dcm-dcmdir-deidentify)
 - [7. TLS walkthrough](#7-tls-walkthrough)
 - [8. Worked examples](#8-worked-examples)
 - [9. Troubleshooting](#9-troubleshooting)
@@ -99,7 +99,7 @@ storescu --connect 127.0.0.1:11113 study1.dcm study2.dcm
 
 - `storescp` writes each instance as `<SOPInstanceUID>.dcm`
   (re-encoded with the negotiated transfer syntax) and prints the
-  patient name per file.
+  stored path per file (patient names only with `--verbose`).
 - `storescu` accepts `--priority <0|1|2>` (0 = medium, 1 = high,
   2 = low; default 0).
 - Statuses: `0x0000` stored; `0xA700` out of resources (disk write
@@ -215,12 +215,14 @@ stowrs --url http://127.0.0.1:8080 a.dcm b.dcm
 ```
 
 - Client tools take `--bearer TOKEN` or `--basic user:pass`.
+- `qidors` also takes `--instances STUDY SERIES` (instance scope),
+  `--limit` / `--offset` (paging), and `--json` (DICOM JSON output).
 - `wadorsd` takes `--bearer-token` to require `Authorization:
   Bearer` on every request; without it, keep the loopback bind (PHI
   travels over plain HTTP otherwise).
 - `--frames` writes one file as given, or `STEM_N.EXT` per frame.
 
-## 6. Files: dcmdump, dcm2json, json2dcm, dcm2xml, xml2dcm, dcm2img, img2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify
+## 6. Files: dcmdump, dcm2json, json2dcm, dcm2xml, xml2dcm, dcm2img, img2dcm, dcmvalidate, pdf2dcm, dcm2pdf, dcmodify, dcm2dcm, dcmdir, deidentify
 
 ```sh
 dcmdump file.dcm                        # text dump to stdout
@@ -240,10 +242,11 @@ pdf2dcm report.pdf report.dcm --patient-name "Doe^Jane" --patient-id P123
 dcm2pdf report.dcm report.out.pdf       # extract (byte-exact)
 ```
 
-`dcmvalidate` checks 18 SOP Classes (CR/CT/MR/MG/DX/US/SC/PT/NM/XA/
-VL/KO/PDF/ECG) for Type 1/2 presence, VR/VM conformance, and
-conditional rules (multi-frame, color, lossy syntax, charset); it
-also verifies file-meta SOP UIDs match the dataset. Exit 0 means
+`dcmvalidate` checks 18 SOP Classes across CR/CT/MR/MG/DX/US/SC/
+PT/NM/XA/VL/KO/PDF/ECG (DX, MG, US, and ECG cover two classes
+each) for Type 1/2 presence, VR/VM conformance, and conditional
+rules (multi-frame, color, lossy syntax, charset); it also
+verifies file-meta SOP UIDs match the dataset. Exit 0 means
 no errors (warnings allowed), 1 means errors, 2 means the SOP
 Class is not supported.
 
@@ -422,8 +425,11 @@ auditsend --server tls://arr.example --ca hospital-ca.pem --dry-run \
   query --source-ae QRY --dest-ae PACS --patient E123
 ```
 
-- `--audit-source` overrides the Audit Source ID (default: our AE);
-  TLS verifies hostnames against WebPKI plus `--audit-ca`.
+- `--audit-source` / `--audit-ca` on the DIMSE tools override the
+  Audit Source ID (default: our AE) and add a private CA;
+  `auditsend` uses `--source-id` / `--ca` (plus `--hostname` and
+  `--timeout-secs`) instead. TLS verifies hostnames against WebPKI
+  plus the extra CA.
 - Events: `start`, `stop`, `transferred`, `begin-transfer`,
   `query`, `deleted`, `export`, `import`, `custom`;
   `--outcome success|minor|serious|major` (default success).
