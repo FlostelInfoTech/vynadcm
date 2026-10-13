@@ -46,6 +46,7 @@ pub enum Req {
 
 /// Evaluable Type-1C conditions (see `docs/generate-iod.py`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum CondRule {
     /// Pixel Data: always required in file/C-STORE context.
     PixelData,
@@ -149,6 +150,7 @@ impl fmt::Display for Severity {
 
 /// Machine-readable finding category.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Kind {
     /// Type 1 attribute absent.
     MissingType1,

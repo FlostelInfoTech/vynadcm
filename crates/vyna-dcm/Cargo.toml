@@ -194,4 +194,16 @@ name = "auditsend"
 path = "src/bin/auditsend.rs"
 required-features = ["cli"]
 
+[[example]]
+name = "ecg_write"
+required-features = ["ecg"]
+
+[[example]]
+name = "wado_fetch"
+required-features = ["web"]
+
+[[example]]
+name = "link_route"
+required-features = ["net"]
+
 [dev-dependencies]

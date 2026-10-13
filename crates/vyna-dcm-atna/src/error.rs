@@ -2,6 +2,7 @@
 
 /// Audit emission failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// The audit server URL is malformed.
     #[error("bad audit server URL {0:?}: want udp://host:port, tcp://host:port or tls://host:port")]

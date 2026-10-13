@@ -109,14 +109,27 @@ impl QrIndex {
 /// C-FIND over the index: final status plus one response per match
 /// group at the query's level. `mwl` selects the worklist model (no
 /// level key, no grouping).
+/// Maximum matches collected for one C-FIND/C-MOVE/C-GET: past this
+/// the SCP fails out-of-resources instead of loading the archive
+/// into RAM (C-FIND: `A700`; MOVE/GET: `A701`, unable to calculate
+/// the number of matches).
+const MAX_QR_MATCHES: usize = 10_000;
+
+/// Run a C-FIND query (`mwl` selects worklist matching): status plus
+/// one response dataset per match, capped at `MAX_QR_MATCHES` (10,000).
 pub fn find_matches(index: &QrIndex, query: &DataSet, mwl: bool) -> (u16, Vec<DataSet>) {
     if mwl {
-        let out = index
+        let mut out = Vec::new();
+        for r in index
             .records
             .iter()
             .filter(|r| dataset_matches(&r.dataset, query))
-            .map(|r| build_response(&r.dataset, query))
-            .collect();
+        {
+            if out.len() >= MAX_QR_MATCHES {
+                return (status::OUT_OF_RESOURCES, Vec::new());
+            }
+            out.push(build_response(&r.dataset, query));
+        }
         return (status::SUCCESS, out);
     }
     let level = match query_level(query) {
@@ -133,6 +146,9 @@ pub fn find_matches(index: &QrIndex, query: &DataSet, mwl: bool) -> (u16, Vec<Da
             continue;
         };
         if seen.insert(key) {
+            if out.len() >= MAX_QR_MATCHES {
+                return (status::OUT_OF_RESOURCES, Vec::new());
+            }
             out.push(build_response(&record.dataset, query));
         }
     }
@@ -548,6 +564,11 @@ async fn retrieve_matches(index: &QrIndex, query: &DataSet) -> (u16, Vec<MoveIns
             }
             _ => continue,
         }
+        // Checked before the file read: the (MAX+1)-th match fails
+        // without loading anything more into RAM.
+        if out.len() >= MAX_QR_MATCHES {
+            return (status::UNABLE_TO_CALCULATE_MATCHES, Vec::new());
+        }
         let bytes = match tokio::fs::read(&record.path).await {
             Ok(bytes) => bytes,
             Err(e) => {
@@ -634,6 +655,79 @@ mod tests {
         q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "STUDY");
         q.put_null(tags::STUDY_INSTANCE_UID, Vr::Ui);
         q
+    }
+
+    #[test]
+    fn match_flood_fails_out_of_resources() {
+        let mut records = Vec::new();
+        for i in 0..=MAX_QR_MATCHES {
+            records.push(record(
+                "P",
+                &format!("1.2.{i}"),
+                &format!("1.2.{i}.1"),
+                &format!("1.2.{i}.1.1"),
+                "20240115",
+            ));
+        }
+        let idx = QrIndex {
+            records,
+            skipped: 0,
+        };
+        // C-FIND refuses with A700 instead of building 10k responses.
+        assert_eq!(
+            find_matches(&idx, &study_query(), false).0,
+            status::OUT_OF_RESOURCES
+        );
+        assert_eq!(
+            find_matches(&idx, &study_query(), true).0,
+            status::OUT_OF_RESOURCES
+        );
+    }
+
+    #[tokio::test]
+    async fn retrieve_flood_fails_before_reading() {
+        // One shared file keeps the fixture cheap; distinct index keys
+        // still drive the match count past the cap.
+        let dir = std::env::temp_dir().join(format!("qrdb-flood-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.dcm");
+        let mut ds = DataSet::new();
+        ds.put_text(
+            vyna_dcm_core::tags::SOP_CLASS_UID,
+            Vr::Ui,
+            "1.2.840.10008.5.1.4.1.1.2",
+        );
+        ds.put_text(vyna_dcm_core::tags::SOP_INSTANCE_UID, Vr::Ui, "1.2.9");
+        let meta = vyna_dcm_codec::FileMeta::new(
+            "1.2.840.10008.5.1.4.1.1.2",
+            "1.2.9",
+            vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian,
+        );
+        std::fs::write(&path, vyna_dcm_codec::write_part10(&meta, &ds).unwrap()).unwrap();
+        let mut records = Vec::new();
+        for i in 0..=MAX_QR_MATCHES {
+            let mut r = record(
+                "P",
+                &format!("1.2.{i}"),
+                &format!("1.2.{i}.1"),
+                &format!("1.2.{i}.1.1"),
+                "20240115",
+            );
+            r.path = path.clone();
+            records.push(r);
+        }
+        let idx = QrIndex {
+            records,
+            skipped: 0,
+        };
+        let mut q = study_query();
+        q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "IMAGE");
+        assert_eq!(
+            retrieve_matches(&idx, &q).await.0,
+            status::UNABLE_TO_CALCULATE_MATCHES
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

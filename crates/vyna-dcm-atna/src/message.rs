@@ -462,6 +462,9 @@ fn code_xml(element: &str, code: &Code) -> String {
 }
 
 /// Escape XML text/attribute content.
+///
+/// Control characters illegal in XML 1.0 become U+FFFD (AE titles
+/// and hostnames arrive from the wire and may carry anything).
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -471,7 +474,11 @@ fn escape(s: &str) -> String {
             '>' => out.push_str("&gt;"),
             '"' => out.push_str("&quot;"),
             '\'' => out.push_str("&apos;"),
-            _ => out.push(c),
+            '\u{09}' | '\u{0A}' | '\u{0D}' => out.push(c),
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => {
+                out.push(c);
+            }
+            _ => out.push('\u{FFFD}'),
         }
     }
     out
@@ -568,10 +575,42 @@ mod tests {
     }
 
     #[test]
+    fn nul_and_controls_become_replacement_char() {
+        // AE titles arrive from the wire and may carry NUL/controls,
+        // which are illegal in XML 1.0 and must not reach the payload.
+        let msg = AuditMessage::instances_transferred(
+            Some("ID\0\x01\x08\x0B\x0C\x0E\x1F"),
+            "1.2.3",
+            &[],
+            "AE\0TITLE",
+            None,
+            "B",
+            None,
+            "SRC",
+        );
+        let xml = msg.to_xml();
+        assert!(!xml.contains('\0'), "{xml}");
+        for c in ['\x01', '\x08', '\x0B', '\x0C', '\x0E', '\x1F'] {
+            assert!(!xml.contains(c), "{xml}");
+        }
+        assert!(xml.contains('\u{FFFD}'), "{xml}");
+        // Tab/LF/CR are legal XML and survive.
+        assert_eq!(escape("a\tb\nc\rd"), "a\tb\nc\rd");
+    }
+
+    #[test]
     fn network_types_classify() {
         assert_eq!(Participant::network_type_code("10.1.2.3"), 2);
         assert_eq!(Participant::network_type_code("::1"), 2);
         assert_eq!(Participant::network_type_code("pacs.example"), 1);
         assert_eq!(Participant::network_type_code("CALLING_AE"), 1);
+    }
+
+    #[test]
+    fn escape_replaces_illegal_controls() {
+        assert_eq!(escape("a\x00b\x07c\x1Fd"), "a\u{FFFD}b\u{FFFD}c\u{FFFD}d");
+        assert_eq!(escape("tab\there\nnl\rok"), "tab\there\nnl\rok");
+        assert_eq!(escape("王伟"), "王伟");
+        assert_eq!(escape("<&>\"'"), "&lt;&amp;&gt;&quot;&apos;");
     }
 }

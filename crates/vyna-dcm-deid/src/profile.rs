@@ -271,7 +271,9 @@ pub const BASIC_PROFILE: &[(Tag, Action)] = &[
     (tags::ORDER_ENTERED_BY, Action::Zero),
     (tags::ORDER_ENTERER_LOCATION, Action::Zero),
     (tags::ORDER_CALLBACK_PHONE_NUMBER, Action::Zero),
-    (tags::BURNED_IN_ANNOTATION, Action::Zero),
+    // NOTE: no BURNED_IN_ANNOTATION row: the engine refuses YES
+    // inputs outright and stamps NO on the rest (emptying the
+    // marker would destroy the safety signal).
     (tags::TIMEZONE_OFFSET_FROM_UTC, Action::Zero),
     (tags::SMOKING_STATUS, Action::Zero),
     (tags::PREGNANCY_STATUS, Action::Zero),

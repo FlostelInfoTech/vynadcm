@@ -5,9 +5,9 @@
 //! - [`Tag`] — `(GGGG,EEEE)` attribute identifiers
 //! - [`Vr`] — the 35 Value Representations (incl. retired `SI`)
 //! - [`DataElement`] / [`Value`] / [`DataSet`] — the in-memory dataset
-//! - [`dictionary`] — curated PS3.6 public dictionary + [`tags`] constants
+//! - PS3.6 public dictionary ([`lookup`], [`ENTRIES`]) + [`tags`] constants
 //! - [`TransferSyntax`] — transfer syntax UIDs and wire properties
-//! - [`uid`] — SOP Class UIDs, validation, UID generation
+//! - SOP Class UIDs ([`sop_class`]), validation ([`is_valid_uid`]), UID generation ([`new_uid`])
 //! - [`PersonName`], [`Da`], [`Tm`] — structured text values
 //!
 //! # Example

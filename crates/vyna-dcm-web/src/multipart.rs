@@ -76,6 +76,11 @@ pub fn encode_multipart(parts: &[Part], boundary: &str, root_type: &str) -> (Str
     (content_type, body)
 }
 
+/// Maximum parts accepted by [`decode_multipart`]: delimiter marks
+/// and part headers are attacker-controlled, so an unbounded scan
+/// turns a 1 GiB body into gigabytes of bookkeeping.
+const MAX_PARTS: usize = 100_000;
+
 /// Decode a multipart body framed by `boundary` (without quotes/dashes).
 pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
     let needle = format!("--{boundary}").into_bytes();
@@ -87,6 +92,10 @@ pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
             && (i == 0 || body[..i].ends_with(b"\r\n") || body[..i].ends_with(b"\n"))
         {
             marks.push(i);
+            // +1: the closing delimiter is a mark but not a part.
+            if marks.len() > MAX_PARTS + 1 {
+                return Err(Error::Multipart(format!("too many parts (>{MAX_PARTS})")));
+            }
             i += needle.len();
         } else {
             i += 1;
@@ -266,5 +275,16 @@ mod tests {
         // Epilogue past the closing delimiter stays ignored.
         let ok = b"--B\r\nContent-Type: text/plain\r\n\r\nxx\r\n--B--\r\ntrailing junk";
         assert_eq!(decode_multipart(ok, "B").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn rejects_part_flood() {
+        let mut body = Vec::new();
+        for _ in 0..=MAX_PARTS + 1 {
+            body.extend_from_slice(b"--B\r\n\r\nx\r\n");
+        }
+        body.extend_from_slice(b"--B--\r\n");
+        let err = decode_multipart(&body, "B").unwrap_err();
+        assert!(format!("{err:?}").contains("too many parts"), "{err:?}");
     }
 }

@@ -184,7 +184,11 @@ fn write_person_name(out: &mut String, name: &PersonName, number: usize, pad: &s
     let _ = writeln!(out, "{pad}</PersonName>");
 }
 
-/// Escape text/attribute content (`&`, `<`, `>`).
+/// Escape text content.
+///
+/// Control characters illegal in XML 1.0 (NUL, form feed, and the
+/// rest of C0 outside tab/LF/CR) become U+FFFD: stored text values
+/// arrive from the wire and may carry anything.
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -192,7 +196,13 @@ fn escape(s: &str) -> String {
             '&' => out.push_str("&amp;"),
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
-            _ => out.push(c),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            '\u{09}' | '\u{0A}' | '\u{0D}' => out.push(c),
+            '\u{20}'..='\u{D7FF}' | '\u{E000}'..='\u{FFFD}' | '\u{10000}'..='\u{10FFFF}' => {
+                out.push(c);
+            }
+            _ => out.push('\u{FFFD}'),
         }
     }
     out
@@ -736,6 +746,25 @@ mod tests {
         assert!(xml.contains("<DicomAttribute tag=\"00080060\" vr=\"CS\" keyword=\"Modality\"/>"));
         let back = dataset_from_xml(&xml).unwrap();
         assert_eq!(back, ds);
+    }
+
+    #[test]
+    fn control_chars_become_replacement_char() {
+        // NUL, form feed and other C0 controls are illegal in XML 1.0
+        // and must not reach the document, even when stored text
+        // values carry them.
+        let ds = DataSet::new().with(DataElement::text(tags::PATIENT_ID, Vr::Lo, "A\0B\x0C\x01"));
+        let xml = dataset_to_xml(&ds);
+        assert!(!xml.contains('\0'), "{xml}");
+        assert!(!xml.contains('\x0C'), "{xml}");
+        assert!(!xml.contains('\x01'), "{xml}");
+        assert!(xml.contains('\u{FFFD}'), "{xml}");
+        // The replacement output still parses.
+        let back = dataset_from_xml(&xml).unwrap();
+        assert_eq!(
+            back.string(tags::PATIENT_ID),
+            Some("A\u{FFFD}B\u{FFFD}\u{FFFD}")
+        );
     }
 
     #[test]

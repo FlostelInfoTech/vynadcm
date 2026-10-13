@@ -9,7 +9,8 @@ use crate::{
 };
 
 /// Client authentication.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
+#[non_exhaustive]
 pub enum Auth {
     /// `Authorization: Bearer <token>`.
     Bearer(String),
@@ -20,6 +21,20 @@ pub enum Auth {
         /// Password.
         password: String,
     },
+}
+
+// Manual `Debug`: tokens and passwords must never reach logs.
+impl std::fmt::Debug for Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Auth::Bearer(_) => write!(f, "Bearer(<redacted>)"),
+            Auth::Basic { username, .. } => f
+                .debug_struct("Basic")
+                .field("username", username)
+                .field("password", &"<redacted>")
+                .finish(),
+        }
+    }
 }
 
 /// Lowercased `scheme://authority` of an absolute HTTP(S) URL, or
@@ -747,5 +762,20 @@ mod tests {
             };
             assert!(DicomWebClient::wado_uri_params(&req).is_err());
         }
+    }
+
+    #[test]
+    fn debug_redacts_credentials() {
+        let bearer = format!("{:?}", Auth::Bearer("s3cret-token".into()));
+        assert!(!bearer.contains("s3cret"), "{bearer}");
+        let basic = format!(
+            "{:?}",
+            Auth::Basic {
+                username: "ann".into(),
+                password: "hunter2".into(),
+            }
+        );
+        assert!(basic.contains("ann"), "{basic}");
+        assert!(!basic.contains("hunter2"), "{basic}");
     }
 }

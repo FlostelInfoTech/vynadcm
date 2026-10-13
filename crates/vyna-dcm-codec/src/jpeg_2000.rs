@@ -6,7 +6,7 @@
 //! unsigned components; decoding honours each component's own signedness, so
 //! signed lossless data (e.g. CT) round-trips as bit patterns.
 //!
-//! Memory I/O goes through the fork's stream callbacks ([`MemStream`]); the
+//! Memory I/O goes through the fork's stream callbacks (`MemStream`); the
 //! `unsafe` there is confined to that wrapper (see its safety notes).
 
 use std::cell::RefCell;

@@ -93,6 +93,9 @@ pub mod status {
     pub const RESOURCE_LIMITATION: u16 = 0x0213;
     /// Failure: refused, out of resources.
     pub const OUT_OF_RESOURCES: u16 = 0xA700;
+    /// Failure (C-MOVE/C-GET): out of resources, unable to calculate
+    /// the number of matches.
+    pub const UNABLE_TO_CALCULATE_MATCHES: u16 = 0xA701;
     /// Failure: dataset does not match SOP class.
     pub const DATASET_MISMATCH: u16 = 0xA900;
     /// Failure: move destination unknown.

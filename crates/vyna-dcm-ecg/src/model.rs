@@ -140,13 +140,15 @@ pub struct EcgRecording {
 impl EcgRecording {
     /// Build a recording; all leads must share the sample count.
     /// Defaults: signed 16-bit samples.
-    pub fn new(leads: Vec<EcgLead>, sampling_frequency_hz: f64) -> Result<Self, String> {
+    pub fn new(leads: Vec<EcgLead>, sampling_frequency_hz: f64) -> crate::Result<Self> {
         if leads.is_empty() {
-            return Err("recording without leads".into());
+            return Err(crate::Error::Waveform("recording without leads".into()));
         }
         let n = leads[0].len();
         if leads.iter().any(|l| l.len() != n) {
-            return Err("leads have unequal sample counts".into());
+            return Err(crate::Error::Waveform(
+                "leads have unequal sample counts".into(),
+            ));
         }
         Ok(Self {
             leads,
@@ -222,8 +224,14 @@ mod tests {
         let a = EcgLead::new("I", vec![0; 10], 0.001);
         let b = EcgLead::new("II", vec![0; 9], 0.001);
         assert!(EcgRecording::new(vec![a.clone()], 500.0).is_ok());
-        assert!(EcgRecording::new(vec![a, b], 500.0).is_err());
-        assert!(EcgRecording::new(vec![], 500.0).is_err());
+        assert!(matches!(
+            EcgRecording::new(vec![a, b], 500.0),
+            Err(crate::Error::Waveform(_))
+        ));
+        assert!(matches!(
+            EcgRecording::new(vec![], 500.0),
+            Err(crate::Error::Waveform(_))
+        ));
         let r = EcgRecording::new(vec![EcgLead::new("I", vec![0; 5000], 0.001)], 500.0).unwrap();
         assert_eq!(r.duration_secs(), 10.0);
     }

@@ -2,6 +2,7 @@
 
 /// De-identification failure.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum Error {
     /// Burned-in annotation is present: pixel data may embed PHI and this
     /// crate never alters pixels, so de-identification is refused.

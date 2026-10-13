@@ -86,8 +86,19 @@ impl Deidentifier {
     /// Refuses with [`Error::BurnedInAnnotation`] when Burned In
     /// Annotation is `YES` (pixels are never altered). UID remaps stay
     /// consistent across every `apply` call on this `Deidentifier`.
+    ///
+    /// Only the dataset is touched: callers that persist file meta
+    /// must rewrite it through [`uid_map`](Self::uid_map), or the
+    /// original UIDs leak into the output meta header.
     pub fn apply(&mut self, ds: &mut DataSet) -> Result<DeidReport> {
-        if ds.string(tags::BURNED_IN_ANNOTATION).map(str::trim) == Some("YES") {
+        // Trim NUL padding as well as whitespace ("YES\0" from dirty
+        // writers must refuse, not slip through), and compare
+        // case-insensitively: this is a safety gate, not a parser.
+        let burned_in = ds.string(tags::BURNED_IN_ANNOTATION).is_some_and(|s| {
+            s.trim_matches(|c: char| c.is_whitespace() || c == '\0')
+                .eq_ignore_ascii_case("YES")
+        });
+        if burned_in {
             return Err(Error::BurnedInAnnotation);
         }
         let mut report = DeidReport::default();
@@ -104,7 +115,31 @@ impl Deidentifier {
                 flag,
             );
         }
+        // PS3.15 E.1 conformance markers (the profile strips any
+        // pre-existing values; the de-identified instance declares
+        // fresh ones).
+        ds.put_text(tags::PATIENT_IDENTITY_REMOVED, Vr::Cs, "YES");
+        let mut method = DataSet::new();
+        method.put_text(tags::CODE_VALUE, Vr::Sh, "113100");
+        method.put_text(tags::CODING_SCHEME_DESIGNATOR, Vr::Sh, "DCM");
+        method.put_text(
+            tags::CODE_MEANING,
+            Vr::Lo,
+            "Basic Application Confidentiality Profile",
+        );
+        ds.put_sequence(tags::DEIDENTIFICATION_METHOD_CODE_SEQUENCE, vec![method]);
+        // The gate above passed, so no burned-in PHI remains: declare
+        // NO instead of leaving the marker empty.
+        if ds.get(tags::BURNED_IN_ANNOTATION).is_some() {
+            ds.put_text(tags::BURNED_IN_ANNOTATION, Vr::Cs, "NO");
+        }
         Ok(report)
+    }
+
+    /// The consistent original→replacement UID map built by [`apply`](Self::apply).
+    #[must_use]
+    pub fn uid_map(&self) -> &HashMap<String, String> {
+        &self.uid_map
     }
 
     fn apply_to(&mut self, ds: &mut DataSet, report: &mut DeidReport) {
@@ -360,6 +395,48 @@ mod tests {
         let err = Deidentifier::new().apply(&mut ds).unwrap_err();
         assert!(matches!(err, Error::BurnedInAnnotation));
         assert_eq!(ds.string(tags::PATIENT_ID), Some("E123"));
+    }
+
+    #[test]
+    fn burned_in_gate_ignores_padding_and_case() {
+        // NUL-padded or lowercase YES from dirty writers must refuse,
+        // not slip through and get the marker zeroed.
+        for yes in ["YES\0", "YES ", " yes", "Yes", "yes"] {
+            let mut ds = DataSet::new();
+            ds.put_text(tags::BURNED_IN_ANNOTATION, Vr::Cs, yes);
+            let err = Deidentifier::new().apply(&mut ds).unwrap_err();
+            assert!(matches!(err, Error::BurnedInAnnotation), "{yes:?}");
+        }
+        // NO passes and is restamped (never emptied).
+        let mut ds = DataSet::new();
+        ds.put_text(tags::BURNED_IN_ANNOTATION, Vr::Cs, "NO");
+        Deidentifier::new().apply(&mut ds).unwrap();
+        assert_eq!(ds.string(tags::BURNED_IN_ANNOTATION), Some("NO"));
+    }
+
+    #[test]
+    fn conformance_markers_are_declared() {
+        let mut ds = DataSet::new();
+        ds.put_text(tags::PATIENT_IDENTITY_REMOVED, Vr::Cs, "NO");
+        Deidentifier::new().apply(&mut ds).unwrap();
+        assert_eq!(ds.string(tags::PATIENT_IDENTITY_REMOVED), Some("YES"));
+        let seq = ds
+            .sequence(tags::DEIDENTIFICATION_METHOD_CODE_SEQUENCE)
+            .unwrap();
+        assert_eq!(seq.len(), 1);
+        assert_eq!(seq[0].string(tags::CODE_VALUE), Some("113100"));
+        assert_eq!(seq[0].string(tags::CODING_SCHEME_DESIGNATOR), Some("DCM"));
+    }
+
+    #[test]
+    fn uid_map_is_visible_to_callers() {
+        let mut deid = Deidentifier::new();
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::STUDY_INSTANCE_UID, "1.2.3");
+        deid.apply(&mut ds).unwrap();
+        let mapped = deid.uid_map().get("1.2.3").unwrap().clone();
+        assert_eq!(ds.string(tags::STUDY_INSTANCE_UID), Some(mapped.as_str()));
+        assert_ne!(mapped, "1.2.3");
     }
 
     #[test]

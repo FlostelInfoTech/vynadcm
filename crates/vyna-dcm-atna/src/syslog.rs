@@ -99,6 +99,9 @@ pub const fn pri_value(severity: u8) -> u32 {
 }
 
 /// Render an RFC 5424 frame (without transport framing).
+///
+/// `hostname`/`app_name` are sanitized: spaces and control characters
+/// would corrupt the header fields (log injection via `--hostname`).
 #[must_use]
 pub fn syslog_frame(
     severity: u8,
@@ -110,8 +113,24 @@ pub fn syslog_frame(
 ) -> String {
     format!(
         "<{}>1 {timestamp} {hostname} {app_name} - {msgid} - {message}",
-        pri_value(severity)
+        pri_value(severity),
+        hostname = sanitize_field(hostname),
+        app_name = sanitize_field(app_name),
     )
+}
+
+/// Replace header-hostile characters (whitespace, controls, DEL)
+/// with `_` (RFC 5424 fields admit no spaces).
+fn sanitize_field(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_whitespace() || c.is_control() {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Octet-counting frame for TCP/TLS (RFC 6587).
@@ -198,12 +217,29 @@ impl SyslogSender {
     }
 
     fn send_udp(&self, frame: &str) -> Result<()> {
-        let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| Error::Transport(e.to_string()))?;
-        let addr = (self.target.host.as_str(), self.target.port);
-        socket
-            .send_to(frame.as_bytes(), addr)
-            .map_err(|e| Error::Transport(e.to_string()))?;
-        Ok(())
+        // Resolve first and bind a matching family: an IPv4 socket
+        // cannot send to an IPv6 server.
+        let mut last_err = None;
+        for addr in (self.target.host.as_str(), self.target.port)
+            .to_socket_addrs()
+            .map_err(|e| Error::Transport(e.to_string()))?
+        {
+            let bind = if addr.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
+            match UdpSocket::bind(bind).and_then(|s| s.send_to(frame.as_bytes(), addr).map(|_| ()))
+            {
+                Ok(()) => return Ok(()),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(Error::Transport(
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| format!("{}: no addresses", self.target.host)),
+        ))
     }
 
     fn send_tcp(&self, frame: &str) -> Result<()> {
@@ -269,6 +305,10 @@ impl SyslogSender {
             match TcpStream::connect_timeout(&addr, self.timeout) {
                 Ok(mut sock) => {
                     sock.set_write_timeout(Some(self.timeout))
+                        .map_err(|e| Error::Transport(e.to_string()))?;
+                    // The TLS handshake reads: without a read timeout a
+                    // silent peer hangs emit() forever.
+                    sock.set_read_timeout(Some(self.timeout))
                         .map_err(|e| Error::Transport(e.to_string()))?;
                     let mut tls = rustls::Stream::new(&mut conn, &mut sock);
                     tls.write_all(octet_frame(frame).as_bytes())
@@ -471,5 +511,56 @@ mod tests {
         // No private CA: WebPKI roots cannot validate the loopback cert.
         assert!(matches!(sender.emit(&msg), Err(Error::Tls(_))));
         drop(server);
+    }
+
+    #[test]
+    fn frame_sanitizes_header_fields() {
+        let f = syslog_frame(5, "t", "evil\nhost x", "a\tb", "ATNA", "<m/>");
+        assert!(f.contains("evil_host_x"), "{f}");
+        assert!(f.contains("a_b"), "{f}");
+        assert!(!f.contains('\n'), "{f}");
+    }
+
+    #[test]
+    fn udp_reaches_ipv6_loopback() {
+        let listener = match UdpSocket::bind("[::1]:0") {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("skipping IPv6 test: no v6 stack ({e})");
+                return;
+            }
+        };
+        let port = listener.local_addr().unwrap().port();
+        listener
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let target: SyslogTarget = format!("udp://[::1]:{port}").parse().unwrap();
+        let sender = SyslogSender::new(target, "h");
+        let msg = crate::AuditMessage::actor_activity("APP", None, "SRC", true);
+        sender.emit(&msg).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, _) = listener.recv_from(&mut buf).unwrap();
+        assert!(
+            String::from_utf8_lossy(&buf[..n]).contains("ATNA"),
+            "no datagram arrived"
+        );
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn tls_emit_times_out_on_silent_peer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (sock, _) = listener.accept().unwrap();
+            std::thread::sleep(Duration::from_secs(30));
+            drop(sock);
+        });
+        let target: SyslogTarget = format!("tls://127.0.0.1:{port}").parse().unwrap();
+        let sender = SyslogSender::new(target, "h").with_timeout(Duration::from_millis(200));
+        let msg = crate::AuditMessage::actor_activity("APP", None, "SRC", true);
+        let start = std::time::Instant::now();
+        assert!(sender.emit(&msg).is_err());
+        assert!(start.elapsed() < Duration::from_secs(10), "emit hung");
     }
 }

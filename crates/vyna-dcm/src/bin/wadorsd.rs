@@ -77,5 +77,7 @@ async fn run(args: &Args) -> Result<(), String> {
     let auth = ServerAuth {
         bearer_token: args.bearer_token.clone(),
     };
-    serve_forever_with_auth(store, base, addr, auth).await
+    serve_forever_with_auth(store, base, addr, auth)
+        .await
+        .map_err(|e| e.to_string())
 }

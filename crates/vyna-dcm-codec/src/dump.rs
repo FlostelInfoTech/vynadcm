@@ -82,7 +82,13 @@ fn short_value(v: &Value) -> String {
         Value::Empty | Value::Bytes(_) | Value::Sequence(_) | Value::Fragments(_) => String::new(),
     };
     if s.len() > MAX {
-        s.truncate(MAX);
+        // Floor to a char boundary: byte truncation would panic on
+        // multi-byte text (CJK patient names).
+        let mut end = MAX;
+        while !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        s.truncate(end);
         s.push_str("...");
     }
     s.replace('\n', " ")
@@ -110,5 +116,16 @@ mod tests {
         assert!(text.contains("(0010,0010)"), "{text}");
         assert!(text.contains("PatientName"), "{text}");
         assert!(text.contains("512"), "{text}");
+    }
+
+    #[test]
+    fn dump_truncates_multibyte_text_without_panic() {
+        // Leading ASCII byte pushes the 120-byte cut mid-character:
+        // must floor to a boundary instead of panicking.
+        let mut ds = DataSet::new();
+        ds.put_text(tags::PATIENT_NAME, Vr::Pn, format!("x{}", "山".repeat(100)));
+        let text = dump_dataset(&ds);
+        assert!(text.contains("..."), "{text}");
+        assert!(text.is_ascii() || text.contains('山'), "{text}");
     }
 }

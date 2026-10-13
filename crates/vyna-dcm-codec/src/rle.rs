@@ -38,9 +38,16 @@ pub fn decode_frame(
             "samples and bytes-per-sample must be nonzero".into(),
         ));
     }
-    if count == 0 || count > MAX_SEGMENTS || count != samples * bytes_per_sample {
+    let want_segments = samples.checked_mul(bytes_per_sample);
+    if count == 0 || count > MAX_SEGMENTS || Some(count) != want_segments {
         return Err(Error::Rle(format!(
             "bad segment count {count} for {samples}×{bytes_per_sample} pixels"
+        )));
+    }
+    if expected_len > crate::MAX_PIXEL_BYTES {
+        return Err(Error::Rle(format!(
+            "frame {expected_len} bytes exceeds {}-byte cap",
+            crate::MAX_PIXEL_BYTES
         )));
     }
     let mut offsets = Vec::with_capacity(count + 1);
@@ -97,6 +104,11 @@ pub(crate) fn bot_usable(joined: &[u8], bot: &[u32], frames: usize) -> bool {
     if bot.len() != frames || frames == 0 || bot[0] != 0 {
         return false;
     }
+    // Entries are u32 offsets; past 4 GiB the table cannot address
+    // the stream, so callers fall back to fragment-per-frame.
+    if joined.len() > u32::MAX as usize {
+        return false;
+    }
     for w in bot.windows(2) {
         if w[1] <= w[0] {
             return false;
@@ -104,7 +116,10 @@ pub(crate) fn bot_usable(joined: &[u8], bot: &[u32], frames: usize) -> bool {
     }
     for o in bot {
         let o = *o as usize;
-        if o + HEADER_LEN > joined.len() {
+        let Some(end) = o.checked_add(HEADER_LEN) else {
+            return false;
+        };
+        if end > joined.len() {
             return false;
         }
         let count = u32::from_le_bytes(joined[o..o + 4].try_into().unwrap()) as usize;
@@ -129,7 +144,9 @@ pub fn encode_frame(raw: &[u8], samples: usize, bytes_per_sample: usize) -> Resu
             "samples and bytes-per-sample must be nonzero".into(),
         ));
     }
-    let count = samples * bytes_per_sample;
+    let count = samples
+        .checked_mul(bytes_per_sample)
+        .ok_or_else(|| Error::Rle("segment count overflows".into()))?;
     if count > MAX_SEGMENTS {
         return Err(Error::Rle(format!("bad segment count {count}")));
     }
@@ -158,11 +175,13 @@ pub fn encode_frame(raw: &[u8], samples: usize, bytes_per_sample: usize) -> Resu
 
     let mut out = Vec::new();
     out.extend_from_slice(&(count as u32).to_le_bytes());
-    let mut offset = HEADER_LEN as u32;
+    let mut offset = HEADER_LEN as u64;
     for k in 0..MAX_SEGMENTS {
         if k < encoded.len() {
-            out.extend_from_slice(&offset.to_le_bytes());
-            offset += encoded[k].len() as u32;
+            let o =
+                u32::try_from(offset).map_err(|_| Error::Rle("segments exceed 4 GiB".into()))?;
+            out.extend_from_slice(&o.to_le_bytes());
+            offset += encoded[k].len() as u64;
         } else {
             out.extend_from_slice(&0u32.to_le_bytes());
         }
@@ -338,5 +357,25 @@ mod tests {
         assert!(!bot_usable(&joined, &[8, f0.len() as u32], 2));
         assert!(!bot_usable(&joined, &[0], 2));
         assert!(!bot_usable(&joined, &[0, 0], 2));
+    }
+
+    #[test]
+    fn segment_math_overflow_is_an_error() {
+        // samples * bytes_per_sample overflows usize: must error,
+        // never panic (debug) or wrap-compare (release).
+        let mut frame = vec![0u8; 64];
+        frame[0] = 1; // segment count 1
+        assert!(decode_frame(&frame, usize::MAX, 2, 0).is_err());
+        assert!(encode_frame(&[], usize::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn decode_frame_rejects_huge_expected_len() {
+        // Cap checked before any plane-sized allocation.
+        let mut frame = vec![0u8; 64];
+        frame[0] = 1;
+        frame[4] = 64; // first offset == HEADER_LEN
+        let err = decode_frame(&frame, 1, 1, crate::MAX_PIXEL_BYTES + 1).unwrap_err();
+        assert!(format!("{err:?}").contains("exceeds"), "{err:?}");
     }
 }

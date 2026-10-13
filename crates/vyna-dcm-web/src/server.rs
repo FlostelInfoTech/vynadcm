@@ -183,7 +183,9 @@ pub struct MemoryStore {
 
 #[derive(Debug, Default)]
 struct MemoryInner {
-    instances: Vec<StoredInstance>,
+    instances: VecDeque<StoredInstance>,
+    /// Total instance file bytes currently held.
+    instance_bytes: usize,
     bulk: HashMap<String, (Vec<u8>, String)>,
     /// Insertion order for oldest-first bulk eviction.
     bulk_order: VecDeque<String>,
@@ -196,6 +198,12 @@ struct MemoryInner {
 const MAX_BULK_BLOBS: usize = 10_000;
 /// See [`MAX_BULK_BLOBS`].
 const MAX_BULK_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Oldest instances are evicted past these bounds (STOW is
+/// unauthenticated by default, so an unbounded store is a DoS).
+const MAX_INSTANCES: usize = 10_000;
+/// See [`MAX_INSTANCES`] (counts stored file bytes).
+const MAX_INSTANCE_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 struct StoredInstance {
@@ -375,8 +383,13 @@ impl DicomWebStore for MemoryStore {
         let ts = meta.transfer_syntax().map_err(|e| e.to_string())?;
         let mut inner = self.lock();
         // Replace on re-store (same SOP Instance UID).
-        inner.instances.retain(|i| i.instance != instance);
-        inner.instances.push(StoredInstance {
+        if let Some(pos) = inner.instances.iter().position(|i| i.instance == instance)
+            && let Some(old) = inner.instances.remove(pos)
+        {
+            inner.instance_bytes -= old.file.len();
+        }
+        inner.instance_bytes += file.len();
+        inner.instances.push_back(StoredInstance {
             study: study.clone(),
             series: series.clone(),
             instance: instance.clone(),
@@ -384,6 +397,12 @@ impl DicomWebStore for MemoryStore {
             dataset,
             transfer_syntax: ts,
         });
+        while inner.instances.len() > MAX_INSTANCES || inner.instance_bytes > MAX_INSTANCE_BYTES {
+            let Some(oldest) = inner.instances.pop_front() else {
+                break;
+            };
+            inner.instance_bytes -= oldest.file.len();
+        }
         Ok(StoredIds {
             study,
             series,
@@ -472,25 +491,54 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
         Value::I32(v) => v.iter().map(ToString::to_string).collect(),
         _ => return false,
     };
-    // Comma-separated list = OR; `a-b` = inclusive range; trailing `*` =
-    // prefix; otherwise exact (case-insensitive for PN).
+    // Comma-separated list = OR; for DA/TM/DT/DS/IS, `a-b` is an
+    // inclusive range (numeric for DS/IS, lexicographic for the
+    // fixed-width datetimes); trailing `*` = prefix; otherwise exact
+    // (case-insensitive for PN). A `-` in any other VR is a literal
+    // character, not a range (mirrors C-FIND matching).
+    let range_vr = matches!(el.vr, Vr::Da | Vr::Tm | Vr::Dt | Vr::Ds | Vr::Is);
     for alt in pattern.split(',') {
         let alt = alt.trim();
         if alt.is_empty() {
             continue;
         }
-        if let Some((lo, hi)) = alt.split_once('-') {
-            // Open-ended ranges are half-bounded; a bare `-` matches all.
-            let hit = match (!lo.is_empty(), !hi.is_empty()) {
-                (true, true) => values.iter().any(|v| v.as_str() >= lo && v.as_str() <= hi),
-                (true, false) => values.iter().any(|v| v.as_str() >= lo),
-                (false, true) => values.iter().any(|v| v.as_str() <= hi),
-                (false, false) => true,
+        if range_vr && alt.contains('-') {
+            // Datetimes never start with '-'; numerics might ("-5--1").
+            let dash = if matches!(el.vr, Vr::Ds | Vr::Is) {
+                alt.get(1..).and_then(|rest| rest.find('-').map(|i| i + 1))
+            } else {
+                alt.find('-')
             };
-            if hit {
-                return true;
+            if let Some(d) = dash {
+                // d is a byte index of ASCII '-', so both slices land
+                // on char boundaries.
+                let (lo, hi) = (&alt[..d], &alt[d + 1..]);
+                let hit = if matches!(el.vr, Vr::Ds | Vr::Is) {
+                    let bound = |s: &str, open: f64| {
+                        if s.is_empty() {
+                            Some(open)
+                        } else {
+                            s.parse().ok()
+                        }
+                    };
+                    match (bound(lo, f64::NEG_INFINITY), bound(hi, f64::INFINITY)) {
+                        (Some(lo), Some(hi)) => values
+                            .iter()
+                            .any(|v| v.parse::<f64>().is_ok_and(|v| v >= lo && v <= hi)),
+                        _ => false,
+                    }
+                } else {
+                    values.iter().any(|v| {
+                        (lo.is_empty() || v.as_str() >= lo) && (hi.is_empty() || v.as_str() <= hi)
+                    })
+                };
+                if hit {
+                    return true;
+                }
+                continue;
             }
-            continue;
+            // Lone leading '-' (a negative literal): fall through to
+            // prefix/exact below.
         }
         if let Some(prefix) = alt.strip_suffix('*') {
             // PN matching is case-insensitive (as for exact matches);
@@ -672,8 +720,15 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
     }
 }
 
+/// Maximum QIDO query parameters: each unknown key scans the whole
+/// tag dictionary, so an unbounded list is a CPU DoS.
+const MAX_QIDO_PARAMS: usize = 100;
+
 fn qido<S: DicomWebStore>(store: &S, scope: QidoScope, query: &str) -> HttpResponse {
     let params = parse_query(query);
+    if params.len() > MAX_QIDO_PARAMS {
+        return HttpResponse::text(400, "too many query parameters");
+    }
     let mut limit = 100usize;
     let mut offset = 0usize;
     let mut filters = Vec::new();
@@ -1042,6 +1097,54 @@ mod tests {
         assert!(store.bulk_data(&ids[0]).is_none(), "oldest must evict");
         assert!(store.bulk_data(&first_extra).is_none());
         assert_eq!(store.lock().bulk.len(), MAX_BULK_BLOBS);
+    }
+
+    #[test]
+    fn instances_evict_oldest_past_cap() {
+        let store = MemoryStore::new();
+        for i in 0..(MAX_INSTANCES + 5) {
+            let uid = format!("1.2.3.{i}");
+            store
+                .store_instance(&test_file("1.2.3", "1.2.3.1", &uid, 2, 2), None)
+                .unwrap();
+        }
+        assert_eq!(store.len(), MAX_INSTANCES);
+        assert!(store.instance_file("1.2.3", "1.2.3.1", "1.2.3.0").is_none());
+        assert!(store.instance_file("1.2.3", "1.2.3.1", "1.2.3.1").is_none());
+        assert!(
+            store
+                .instance_file("1.2.3", "1.2.3.1", &format!("1.2.3.{}", MAX_INSTANCES + 4))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn qido_ranges_are_vr_gated_and_numeric() {
+        let mut ds = DataSet::new();
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "ABC-123");
+        ds.put_text(tags::STUDY_DATE, Vr::Da, "20240115");
+        ds.put_text(tags::SERIES_NUMBER, Vr::Is, "9");
+        // Hyphen in a non-range VR is literal, not a range.
+        assert!(match_attribute(&ds, tags::PATIENT_ID, "ABC-123"));
+        assert!(!match_attribute(&ds, tags::PATIENT_ID, "ABC-124"));
+        // IS ranges compare numerically: 9 is inside 1-10.
+        assert!(match_attribute(&ds, tags::SERIES_NUMBER, "1-10"));
+        assert!(match_attribute(&ds, tags::SERIES_NUMBER, "-5-10"));
+        assert!(!match_attribute(&ds, tags::SERIES_NUMBER, "10-20"));
+        // DA ranges stay lexicographic (fixed-width).
+        assert!(match_attribute(&ds, tags::STUDY_DATE, "20240101-20240131"));
+        assert!(!match_attribute(&ds, tags::STUDY_DATE, "20240201-20240228"));
+    }
+
+    #[test]
+    fn qido_rejects_param_flood() {
+        let store = stored();
+        let query = (0..=MAX_QIDO_PARAMS)
+            .map(|i| format!("UnknownKey{i}=x"))
+            .collect::<Vec<_>>()
+            .join("&");
+        let r = dispatch(&store, "http://x/wado", &get(&format!("/studies?{query}")));
+        assert_eq!(r.status, 400);
     }
 
     #[test]

@@ -80,19 +80,39 @@ fn plan_outputs(
         .collect()
 }
 
+/// In-place replacement goes through a temporary file + rename so a
+/// failed run keeps the original.
+///
+/// The temp name carries the pid plus an attempt counter and is
+/// created with create-new semantics: concurrent runs on the same
+/// file must not share one fixed temp name (and a planted symlink
+/// must not redirect the write elsewhere).
 fn write_output(dest: &Path, input: &Path, bytes: &[u8]) -> Result<(), String> {
     if dest != input {
         return std::fs::write(dest, bytes).map_err(|e| format!("{}: {e}", dest.display()));
     }
-    let tmp = input.with_extension("vyna-tmp");
-    if let Err(e) = std::fs::write(&tmp, bytes) {
-        return Err(format!("{}: {e}", tmp.display()));
+    for attempt in 0..100u32 {
+        let tmp = input.with_extension(format!("vyna-tmp-{}-{attempt}", std::process::id()));
+        let mut opts = std::fs::OpenOptions::new();
+        match opts.write(true).create_new(true).open(&tmp) {
+            Ok(mut f) => {
+                use std::io::Write;
+                if let Err(e) = f.write_all(bytes) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(format!("{}: {e}", tmp.display()));
+                }
+                drop(f);
+                if let Err(e) = std::fs::rename(&tmp, input) {
+                    let _ = std::fs::remove_file(&tmp);
+                    return Err(format!("{}: {e}", input.display()));
+                }
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", tmp.display())),
+        }
     }
-    if let Err(e) = std::fs::rename(&tmp, input) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(format!("{}: {e}", input.display()));
-    }
-    Ok(())
+    Err(format!("{}: cannot pick a temporary name", input.display()))
 }
 
 fn process_file(deid: &mut Deidentifier, input: &Path, dest: &Path) -> Result<String, String> {
@@ -258,5 +278,25 @@ mod tests {
         assert_ne!(meta2.media_storage_sop_instance_uid, "1.9.9.9");
         std::fs::remove_file(&input).unwrap();
         std::fs::remove_file(&output).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn in_place_write_skips_planted_symlink() {
+        let dir = std::env::temp_dir().join(format!("deid-out-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("anon.dcm");
+        let victim = dir.join("victim.txt");
+        std::fs::write(&file, b"original").unwrap();
+        std::fs::write(&victim, b"precious").unwrap();
+        // Plant a symlink at the first temp candidate: create-new must
+        // refuse it (not follow it into the victim).
+        let tmp0 = file.with_extension(format!("vyna-tmp-{}-0", std::process::id()));
+        std::os::unix::fs::symlink(&victim, &tmp0).unwrap();
+        write_output(&file, &file, b"edited").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"edited");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"precious");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

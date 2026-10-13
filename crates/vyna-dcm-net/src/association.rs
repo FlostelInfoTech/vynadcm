@@ -109,6 +109,10 @@ pub struct Association {
     /// dispatch loop (e.g. RELEASE-RQ mid-FIND). [`Association::recv`]
     /// drains this before touching the wire.
     pending: VecDeque<DimseEvent>,
+    /// PDVs read past a message boundary: one P-DATA-TF may carry
+    /// several messages, and [`Association::recv`] keeps the trailing
+    /// PDVs here for the next call instead of dropping them.
+    pdu_queue: VecDeque<Pdv>,
 }
 
 impl Association {
@@ -166,6 +170,7 @@ impl Association {
             read_timeout: opts.read_timeout,
             next_id: 1,
             pending: VecDeque::new(),
+            pdu_queue: VecDeque::new(),
         };
         let rq = AssociateRq {
             called_ae: called_ae.clone(),
@@ -253,6 +258,7 @@ impl Association {
             read_timeout: opts.read_timeout,
             next_id: 1,
             pending: VecDeque::new(),
+            pdu_queue: VecDeque::new(),
         }
     }
 
@@ -358,86 +364,86 @@ impl Association {
         let mut command: Option<Command> = None;
         let mut data_buf: Vec<u8> = Vec::new();
         loop {
-            match self.read_pdu().await? {
-                Pdu::Data(pdvs) => {
-                    for pdv in pdvs {
-                        let ctx = self
-                            .context_by_id(pdv.context_id)
-                            .ok_or(Error::UnknownContext(pdv.context_id))?
-                            .clone();
-                        if pdv.is_command {
-                            if command.is_some() {
-                                return Err(Error::BadPdu(
-                                    "command PDV after command complete".into(),
-                                ));
-                            }
-                            match cmd_ctx {
-                                Some(id) if id != pdv.context_id => {
-                                    return Err(Error::BadPdu("command PDVs span contexts".into()));
-                                }
-                                _ => cmd_ctx = Some(pdv.context_id),
-                            }
-                            if cmd_buf.len() as u64 + pdv.data.len() as u64 > self.max_message_bytes
-                            {
-                                return Err(Error::MessageTooLarge {
-                                    limit: self.max_message_bytes,
-                                });
-                            }
-                            cmd_buf.extend_from_slice(&pdv.data);
-                            if pdv.is_last {
-                                let cmd = decode_command(&cmd_buf)?;
-                                if !cmd.has_dataset() {
-                                    return Ok(DimseEvent::Message(Box::new(DimseMessage {
-                                        context_id: pdv.context_id,
-                                        command: cmd,
-                                        dataset: None,
-                                    })));
-                                }
-                                command = Some(cmd);
-                            }
-                        } else {
-                            let Some(cmd) = &command else {
-                                return Err(Error::BadPdu("dataset PDV before command".into()));
-                            };
-                            if Some(pdv.context_id) != cmd_ctx {
-                                return Err(Error::BadPdu("dataset PDV on wrong context".into()));
-                            }
-                            if data_buf.len() as u64 + pdv.data.len() as u64
-                                > self.max_message_bytes
-                            {
-                                return Err(Error::MessageTooLarge {
-                                    limit: self.max_message_bytes,
-                                });
-                            }
-                            data_buf.extend_from_slice(&pdv.data);
-                            if pdv.is_last {
-                                let ds = decode_dataset(&data_buf, ctx.transfer_syntax)?;
-                                return Ok(DimseEvent::Message(Box::new(DimseMessage {
-                                    context_id: pdv.context_id,
-                                    command: command.take().unwrap(),
-                                    dataset: Some(ds),
-                                })));
-                            }
-                            let _ = cmd;
-                        }
+            let pdv = match self.pdu_queue.pop_front() {
+                Some(p) => p,
+                None => match self.read_pdu().await? {
+                    Pdu::Data(pdvs) => {
+                        // decode_data rejects empty P-DATA-TFs, so the
+                        // queue is non-empty and the loop makes progress.
+                        self.pdu_queue.extend(pdvs);
+                        continue;
                     }
+                    Pdu::ReleaseRq => {
+                        crate::pdu::write_pdu(&mut self.stream, &Pdu::ReleaseRsp).await?;
+                        return Ok(DimseEvent::Released);
+                    }
+                    Pdu::Abort { source, reason } => {
+                        return Err(Error::Aborted {
+                            origin: source,
+                            reason,
+                        });
+                    }
+                    other => {
+                        return Err(Error::UnexpectedPdu {
+                            expected: "P-DATA-TF",
+                            got: other.name().to_string(),
+                        });
+                    }
+                },
+            };
+            let ctx = self
+                .context_by_id(pdv.context_id)
+                .ok_or(Error::UnknownContext(pdv.context_id))?
+                .clone();
+            if pdv.is_command {
+                if command.is_some() {
+                    return Err(Error::BadPdu("command PDV after command complete".into()));
                 }
-                Pdu::ReleaseRq => {
-                    crate::pdu::write_pdu(&mut self.stream, &Pdu::ReleaseRsp).await?;
-                    return Ok(DimseEvent::Released);
+                match cmd_ctx {
+                    Some(id) if id != pdv.context_id => {
+                        return Err(Error::BadPdu("command PDVs span contexts".into()));
+                    }
+                    _ => cmd_ctx = Some(pdv.context_id),
                 }
-                Pdu::Abort { source, reason } => {
-                    return Err(Error::Aborted {
-                        origin: source,
-                        reason,
+                if cmd_buf.len() as u64 + pdv.data.len() as u64 > self.max_message_bytes {
+                    return Err(Error::MessageTooLarge {
+                        limit: self.max_message_bytes,
                     });
                 }
-                other => {
-                    return Err(Error::UnexpectedPdu {
-                        expected: "P-DATA-TF",
-                        got: other.name().to_string(),
+                cmd_buf.extend_from_slice(&pdv.data);
+                if pdv.is_last {
+                    let cmd = decode_command(&cmd_buf)?;
+                    if !cmd.has_dataset() {
+                        return Ok(DimseEvent::Message(Box::new(DimseMessage {
+                            context_id: pdv.context_id,
+                            command: cmd,
+                            dataset: None,
+                        })));
+                    }
+                    command = Some(cmd);
+                }
+            } else {
+                let Some(cmd) = &command else {
+                    return Err(Error::BadPdu("dataset PDV before command".into()));
+                };
+                if Some(pdv.context_id) != cmd_ctx {
+                    return Err(Error::BadPdu("dataset PDV on wrong context".into()));
+                }
+                if data_buf.len() as u64 + pdv.data.len() as u64 > self.max_message_bytes {
+                    return Err(Error::MessageTooLarge {
+                        limit: self.max_message_bytes,
                     });
                 }
+                data_buf.extend_from_slice(&pdv.data);
+                if pdv.is_last {
+                    let ds = decode_dataset(&data_buf, ctx.transfer_syntax)?;
+                    return Ok(DimseEvent::Message(Box::new(DimseMessage {
+                        context_id: pdv.context_id,
+                        command: command.take().unwrap(),
+                        dataset: Some(ds),
+                    })));
+                }
+                let _ = cmd;
             }
         }
     }
@@ -525,6 +531,7 @@ mod tests {
             read_timeout: opts.read_timeout,
             next_id: u16::MAX,
             pending: VecDeque::new(),
+            pdu_queue: VecDeque::new(),
         };
         assert_eq!(assoc.next_message_id(), u16::MAX);
         assert_eq!(assoc.next_message_id(), 1);
@@ -592,5 +599,48 @@ mod tests {
             "{err:?}"
         );
         sent.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_keeps_trailing_pdvs() {
+        // One P-DATA-TF carrying two C-ECHO-RQ commands: both must
+        // surface; the second must not be dropped with the first.
+        let (a, b) = tokio::io::duplex(65536);
+        let mut w = a;
+        let pdvs: Vec<Pdv> = [1u16, 2]
+            .map(|id| Pdv {
+                context_id: 1,
+                is_command: true,
+                is_last: true,
+                data: encode_command(&Command::echo_rq(id)).unwrap(),
+            })
+            .to_vec();
+        crate::pdu::write_pdu(&mut w, &Pdu::Data(pdvs))
+            .await
+            .unwrap();
+        drop(w);
+        let mut receiver = Association::from_accepted(
+            Box::new(b),
+            AssociationInfo {
+                local_ae: AeTitle::new("SCP").unwrap(),
+                peer_ae: AeTitle::new("SCU").unwrap(),
+                peer_max_pdu: 0,
+            },
+            vec![NegotiatedContext {
+                id: 1,
+                abstract_syntax: vyna_dcm_core::sop_class::CT_IMAGE.to_string(),
+                transfer_syntax: TransferSyntax::ExplicitVrLittleEndian,
+                transfer_syntax_uid: TransferSyntax::ExplicitVrLittleEndian.uid().to_string(),
+            }],
+            &AssociationOptions::default(),
+        );
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            match receiver.recv().await.unwrap() {
+                DimseEvent::Message(m) => ids.push(m.command.message_id),
+                DimseEvent::Released => panic!("unexpected release"),
+            }
+        }
+        assert_eq!(ids, vec![Some(1), Some(2)]);
     }
 }

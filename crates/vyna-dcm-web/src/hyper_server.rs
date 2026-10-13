@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http_body_util::{BodyExt, Full};
@@ -14,9 +15,18 @@ use hyper_util::rt::TokioIo;
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::server::{DicomWebStore, HttpRequest, dispatch};
+use crate::{Error, Result};
 
 /// Cap for STOW request bodies (1 GiB).
 pub const MAX_BODY_LEN: usize = 1024 * 1024 * 1024;
+
+/// Maximum lifetime of one HTTP connection (slowloris guard): a peer
+/// that trickles bytes forever is cut off instead of hoarding a task.
+pub const MAX_CONN_SECS: u64 = 300;
+
+/// Maximum concurrent connections per [`serve_forever`] listener;
+/// connections past this are dropped at accept.
+pub const MAX_CONNECTIONS: usize = 1024;
 
 /// Optional access control for the plain-HTTP front end.
 ///
@@ -25,11 +35,23 @@ pub const MAX_BODY_LEN: usize = 1024 * 1024 * 1024;
 /// payloads routinely contain PHI: bind to loopback only, or put a
 /// TLS-terminating reverse proxy (with its own auth) in front, and
 /// consider setting [`ServerAuth::bearer_token`].
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct ServerAuth {
     /// When set, every request must carry
     /// `Authorization: Bearer <token>` or gets `401 Unauthorized`.
     pub bearer_token: Option<String>,
+}
+
+// Manual `Debug`: the token must never reach logs.
+impl std::fmt::Debug for ServerAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerAuth")
+            .field(
+                "bearer_token",
+                &self.bearer_token.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Whether `headers` (lowercased names) satisfy `auth`.
@@ -54,7 +76,7 @@ pub async fn serve_connection<S: DicomWebStore + 'static>(
     store: Arc<S>,
     public_base: String,
     tcp: TcpStream,
-) -> Result<(), String> {
+) -> Result<()> {
     serve_connection_with_auth(store, public_base, tcp, ServerAuth::default()).await
 }
 
@@ -64,10 +86,30 @@ pub async fn serve_connection_with_auth<S: DicomWebStore + 'static>(
     public_base: String,
     tcp: TcpStream,
     auth: ServerAuth,
-) -> Result<(), String> {
+) -> Result<()> {
+    serve_with_deadline(
+        store,
+        public_base,
+        tcp,
+        auth,
+        Duration::from_secs(MAX_CONN_SECS),
+    )
+    .await
+}
+
+/// [`serve_connection_with_auth`] with an explicit deadline (the
+/// public entry points use [`MAX_CONN_SECS`]).
+async fn serve_with_deadline<S: DicomWebStore + 'static>(
+    store: Arc<S>,
+    public_base: String,
+    tcp: TcpStream,
+    auth: ServerAuth,
+    deadline: Duration,
+) -> Result<()> {
     let io = TokioIo::new(tcp);
-    http1::Builder::new()
-        .serve_connection(
+    tokio::time::timeout(
+        deadline,
+        http1::Builder::new().serve_connection(
             io,
             service_fn(move |req: Request<hyper::body::Incoming>| {
                 let store = store.clone();
@@ -75,9 +117,11 @@ pub async fn serve_connection_with_auth<S: DicomWebStore + 'static>(
                 let auth = auth.clone();
                 async move { handle_one(store.as_ref(), &public_base, req, &auth).await }
             }),
-        )
-        .await
-        .map_err(|e| e.to_string())
+        ),
+    )
+    .await
+    .map_err(|_| Error::Http("connection timed out".into()))?
+    .map_err(|e| Error::Http(e.to_string()))
 }
 
 /// Bind and serve forever (each connection in its own task).
@@ -88,7 +132,7 @@ pub async fn serve_forever<S: DicomWebStore + 'static>(
     store: Arc<S>,
     public_base: String,
     bind: SocketAddr,
-) -> Result<(), String> {
+) -> Result<()> {
     serve_forever_with_auth(store, public_base, bind, ServerAuth::default()).await
 }
 
@@ -98,14 +142,22 @@ pub async fn serve_forever_with_auth<S: DicomWebStore + 'static>(
     public_base: String,
     bind: SocketAddr,
     auth: ServerAuth,
-) -> Result<(), String> {
-    let listener = TcpListener::bind(bind).await.map_err(|e| e.to_string())?;
+) -> Result<()> {
+    let listener = TcpListener::bind(bind)
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?;
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let Ok((tcp, _)) = listener.accept().await else {
             continue;
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            tracing::warn!("DICOMweb connection dropped: over {MAX_CONNECTIONS} concurrent");
+            continue;
+        };
         let (store, public_base, auth) = (store.clone(), public_base.clone(), auth.clone());
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(e) = serve_connection_with_auth(store, public_base, tcp, auth).await {
                 tracing::warn!("DICOMweb connection error: {e}");
             }
@@ -113,12 +165,18 @@ pub async fn serve_forever_with_auth<S: DicomWebStore + 'static>(
     }
 }
 
+/// Whether appending `next` bytes to `accumulated` would breach
+/// [`MAX_BODY_LEN`]; saturating so adversarial lengths can't wrap.
+fn body_over_cap(accumulated: usize, next: usize) -> bool {
+    accumulated.saturating_add(next) > MAX_BODY_LEN
+}
+
 async fn handle_one<S: DicomWebStore>(
     store: &S,
     public_base: &str,
     req: Request<hyper::body::Incoming>,
     auth: &ServerAuth,
-) -> Result<Response<Full<Bytes>>, hyper::Error> {
+) -> std::result::Result<Response<Full<Bytes>>, hyper::Error> {
     let (parts, body) = req.into_parts();
     let mut headers = std::collections::HashMap::new();
     for (name, value) in parts.headers.iter() {
@@ -144,7 +202,7 @@ async fn handle_one<S: DicomWebStore>(
     while let Some(frame) = body.frame().await {
         let frame = frame?;
         if let Some(data) = frame.data_ref() {
-            if raw_body.len() + data.len() > MAX_BODY_LEN {
+            if body_over_cap(raw_body.len(), data.len()) {
                 let mut resp =
                     Response::new(Full::new(Bytes::from_static(b"request body too large")));
                 *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
@@ -405,5 +463,61 @@ mod tests {
             Err(crate::Error::Status { status, .. }) => assert_eq!(status, 404),
             other => panic!("expected 404 status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn debug_redacts_bearer_token() {
+        let auth = ServerAuth {
+            bearer_token: Some("s3cret-token".into()),
+        };
+        let shown = format!("{auth:?}");
+        assert!(!shown.contains("s3cret"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn idle_connection_times_out() {
+        use tokio::io::AsyncWriteExt;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        // Trickle one line, then go silent (slowloris): the server
+        // must cut the connection instead of waiting forever.
+        client
+            .write_all(b"GET /studies HTTP/1.1\r\n")
+            .await
+            .unwrap();
+        let (tcp, _) = listener.accept().await.unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let err = serve_with_deadline(
+            store,
+            "http://x".to_string(),
+            tcp,
+            ServerAuth::default(),
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::Http(_)), "{err}");
+        assert!(err.to_string().contains("timed out"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn bind_conflict_returns_http_error() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = held.local_addr().unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let err = serve_forever(store, format!("http://{addr}"), addr)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Http(_)), "{err}");
+    }
+
+    #[test]
+    fn body_cap_boundary() {
+        assert!(!body_over_cap(0, 0));
+        assert!(!body_over_cap(MAX_BODY_LEN - 1, 1));
+        assert!(!body_over_cap(MAX_BODY_LEN, 0));
+        assert!(body_over_cap(MAX_BODY_LEN, 1));
+        assert!(body_over_cap(usize::MAX, usize::MAX));
     }
 }

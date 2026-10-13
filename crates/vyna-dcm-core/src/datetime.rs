@@ -91,6 +91,11 @@ impl Tm {
         } else if !matches!(digits.len(), 2 | 4 | 6) {
             return None;
         }
+        // Colon groups are shape-checked above but may carry no digits
+        // at all ("ab:cd"); the hour slice needs at least two.
+        if digits.len() < 2 {
+            return None;
+        }
         let hour: u8 = digits[0..2].parse().ok()?;
         if hour > 23 {
             return None;
@@ -304,5 +309,14 @@ mod tests {
         assert!(!is_valid_dt("20261301134523"));
         assert!(!is_valid_dt("20261011134523+2500"));
         assert!(!is_valid_dt("not-a-date"));
+    }
+
+    #[test]
+    fn tm_digitless_colon_groups_are_none() {
+        // Shape-valid colons with no digits must not panic (#0..2 slice).
+        assert_eq!(Tm::parse("ab:cd"), None);
+        assert_eq!(Tm::parse("ab:cd:ef"), None);
+        assert_eq!(Tm::parse("::"), None);
+        assert!(Tm::parse("12:34").is_some());
     }
 }

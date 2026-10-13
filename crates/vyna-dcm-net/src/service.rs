@@ -6,7 +6,7 @@
 //! - [`accept`] runs one inbound connection to release/abort.
 //! - [`run_scp`] runs the dispatch loop on an established [`Association`].
 //!
-//! SCU operations are `impl Association` methods in [`crate::scu`].
+//! SCU operations are [`Association`] methods in `scu`.
 
 use std::collections::HashMap;
 use std::sync::Arc;

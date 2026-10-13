@@ -363,9 +363,18 @@ fn encode_primitive(
             }
             Ok(out)
         }
-        Value::I64(_) => Err(unencodable(
-            "no DICOM VR encodes bare i64 (use SL/SS)".into(),
-        )),
+        Value::I64(v) => {
+            if !matches!(vr, Vr::Sv) {
+                return Err(unencodable(format!("i64 values with {vr}")));
+            }
+            let mut out = Vec::with_capacity(v.len() * 8);
+            for x in v {
+                let b = x.to_le_bytes();
+                let b = if little { b } else { x.to_be_bytes() };
+                out.extend_from_slice(&b);
+            }
+            Ok(out)
+        }
         Value::F32(v) => {
             if !matches!(vr, Vr::Fl | Vr::Of) {
                 return Err(unencodable(format!("f32 values with {vr}")));
@@ -500,6 +509,11 @@ mod tests {
                 vec![
                     DataSet::new().with(DataElement::uid(tags::REFERENCED_SOP_CLASS_UID, "1.2.3")),
                 ],
+            ))
+            .with(DataElement::new(
+                tags::SELECTOR_SV_VALUE,
+                Vr::Sv,
+                Value::I64(vec![-5, 7]),
             ))
     }
 

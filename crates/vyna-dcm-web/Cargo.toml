@@ -23,7 +23,7 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
-tokio = { workspace = true, features = ["rt", "net", "macros"] }
+tokio = { workspace = true, features = ["rt", "net", "macros", "sync", "time"] }
 tracing.workspace = true
 uuid.workspace = true
 hyper = { version = "1", features = ["server", "http1"], optional = true }

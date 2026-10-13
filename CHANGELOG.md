@@ -17,6 +17,30 @@ the workspace crate version (`Cargo.toml`).
   names a nonexistent `--study` flag.
 - `vyna-dcm-iod` enables `#![warn(missing_docs)]` like every other
   first-party crate (zero warnings).
+- Publish-readiness hardening batch (1 critical, 32 major):
+  pixel decode/encode now validates geometry with checked math and
+  a 1 GiB cap before allocating (zero dims rejected); RLE segment
+  math checked with `u64` offsets; `Tm` parse, `dump` truncate,
+  and de-id date shifts no longer panic/overflow; multipart parts,
+  in-memory DICOMweb/QR stores, QIDO params, QR matches (new
+  `A701` status for MOVE/GET), and HTTP connections/conn-lifetime
+  are capped; DICOMweb `serve_*` and `EcgRecording::new` return
+  typed errors; `Auth`, error enums, and IOD `Kind`/`CondRule` are
+  `#[non_exhaustive]`; de-id gates `YES\0`, exposes `uid_map()`,
+  stamps fresh markers, and writes temp files symlink-safely;
+  `Debug` impls redact secrets; ATNA handles IPv6 UDP, TLS read
+  timeouts, XML C0 controls, and syslog header injection; Native
+  DICOM Model XML maps illegal controls to U+FFFD; examples carry
+  `required-features`; intra-doc links fixed (`cargo doc` clean
+  under `-D warnings`).
+
+### Changed
+
+- **Breaking (pre-1.0):** `EcgRecording::new` returns
+  `vyna_dcm_ecg::Error` instead of `String`; DICOMweb `serve_*`
+  functions return `vyna_dcm_web::Error` instead of `String`.
+  Downstream matches on `Auth`, `Kind`, and `CondRule` need a
+  wildcard arm.
 
 ### Changed
 

@@ -296,7 +296,23 @@ fn resolve_ambiguous(tag: Tag, ds: &DataSet) -> Vr {
                 Vr::Ow
             }
         }
-        (0x0028, 0x0106) | (0x0028, 0x0107) | (0x0028, 0x0120) => {
+        (0x0018, 0x9810)
+        | (0x0022, 0x1452)
+        | (0x0028, 0x0071)
+        | (0x0028, 0x0104)
+        | (0x0028, 0x0105)
+        | (0x0028, 0x0106)
+        | (0x0028, 0x0107)
+        | (0x0028, 0x0108)
+        | (0x0028, 0x0109)
+        | (0x0028, 0x0110)
+        | (0x0028, 0x0111)
+        | (0x0028, 0x0120)
+        | (0x0028, 0x0121)
+        | (0x0040, 0x9211)
+        | (0x0040, 0x9216)
+        | (0x0060, 0x3004)
+        | (0x0060, 0x3006) => {
             if ds.uint16(tags::PIXEL_REPRESENTATION) == Some(1) {
                 Vr::Ss
             } else {
@@ -838,6 +854,10 @@ mod tests {
         decode_dataset(bytes, TransferSyntax::ExplicitVrLittleEndian)
     }
 
+    fn implicit_le(bytes: &[u8]) -> Result<DataSet> {
+        decode_dataset(bytes, TransferSyntax::ImplicitVrLittleEndian)
+    }
+
     #[test]
     fn decodes_explicit_text_and_numbers() {
         // (0010,0010) PN len 8 "Doe^John", (0028,0010) US len 2 = 512.
@@ -978,6 +998,36 @@ mod tests {
         match &ds.get(Tag::new(0x0072, 0x0082)).unwrap().value {
             Value::I64(v) => assert_eq!(v, &[-5, 7]),
             other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn implicit_vr_pixel_stats_follow_pixel_representation() {
+        for (rep, signed) in [(0u16, false), (1u16, true)] {
+            let mut bytes = vec![];
+            // (0028,0103) Pixel Representation.
+            bytes.extend([
+                0x28, 0x00, 0x03, 0x01, 0x02, 0x00, 0x00, 0x00, rep as u8, 0x00,
+            ]);
+            // (0028,0104) Smallest Valid Pixel Value = 0xFFFF.
+            bytes.extend([0x28, 0x00, 0x04, 0x01, 0x02, 0x00, 0x00, 0x00, 0xFF, 0xFF]);
+            let ds = implicit_le(&bytes).unwrap();
+            let el = ds.get(tags::SMALLEST_VALID_PIXEL_VALUE).unwrap();
+            if signed {
+                assert_eq!(el.vr, Vr::Ss);
+                assert!(
+                    matches!(el.value, Value::I16(ref v) if v == &[-1]),
+                    "{:?}",
+                    el.value
+                );
+            } else {
+                assert_eq!(el.vr, Vr::Us);
+                assert!(
+                    matches!(el.value, Value::U16(ref v) if v == &[65535]),
+                    "{:?}",
+                    el.value
+                );
+            }
         }
     }
 }

@@ -387,15 +387,38 @@ pub mod tags {
     pub use crate::dictionary_generated::tags_generated::*;
 }
 
-/// True for attributes whose real VR depends on sibling values
-/// (`ox`/`px`/`xs` in PS3.6: pixel, waveform and min/max/padding values).
+/// True for attributes whose real VR depends on sibling values:
+/// pixel data (`Bits Allocated`), waveform data (`Waveform Bits
+/// Allocated`), and the `US or SS` pixel-value statistics (`Pixel
+/// Representation`).
+///
+/// Deliberately excluded multi-VR entries (kept at their primary VR):
+/// LUT Descriptors (always US in practice; palette descriptors are
+/// mandated US), LUT Data (needs a LUT-Descriptor-value rule), and
+/// (0014,3050/3070) (no verified selection rule).
 #[must_use]
 pub const fn is_context_dependent_vr(tag: Tag) -> bool {
     matches!(
         (tag.0, tag.1),
-        (0x0028, 0x0106)
+        // US-or-SS by Pixel Representation (0028,0103).
+        (0x0018, 0x9810)
+            | (0x0022, 0x1452)
+            | (0x0028, 0x0071)
+            | (0x0028, 0x0104)
+            | (0x0028, 0x0105)
+            | (0x0028, 0x0106)
             | (0x0028, 0x0107)
+            | (0x0028, 0x0108)
+            | (0x0028, 0x0109)
+            | (0x0028, 0x0110)
+            | (0x0028, 0x0111)
             | (0x0028, 0x0120)
+            | (0x0028, 0x0121)
+            | (0x0040, 0x9211)
+            | (0x0040, 0x9216)
+            | (0x0060, 0x3004)
+            | (0x0060, 0x3006)
+            // OB-or-OW by (Waveform) Bits Allocated.
             | (0x5400, 0x0110)
             | (0x5400, 0x0112)
             | (0x5400, 0x100A)

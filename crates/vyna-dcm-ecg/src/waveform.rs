@@ -114,12 +114,17 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
     if rec.leads.iter().any(|l| l.len() != samples) {
         return Err(Error::Waveform("leads have unequal sample counts".into()));
     }
-    if !rec.sampling_frequency_hz.is_finite() || rec.sampling_frequency_hz <= 0.0 {
+    if rec.sampling_frequency_hz <= 0.0 {
         return Err(Error::Waveform(format!(
             "bad sampling frequency {}",
             rec.sampling_frequency_hz
         )));
     }
+    // Format a DS field, refusing non-finite floats (NaN/inf are not
+    // valid DS values).
+    let ds_field = |what: &str, v: f64| {
+        ds_format(v).ok_or_else(|| Error::Waveform(format!("non-finite {what}")))
+    };
     let channels =
         u16::try_from(rec.leads.len()).map_err(|_| Error::Waveform("too many leads".into()))?;
     let sample_count =
@@ -131,7 +136,7 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
     item.put_text(
         tags::SAMPLING_FREQUENCY,
         Vr::Ds,
-        ds_format(rec.sampling_frequency_hz),
+        ds_field("sampling frequency", rec.sampling_frequency_hz)?,
     );
     if let Some(label) = &rec.multiplex_label {
         item.put_text(tags::MULTIPLEX_GROUP_LABEL, Vr::Sh, label.clone());
@@ -147,7 +152,7 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
         ch.put_text(
             tags::CHANNEL_SENSITIVITY,
             Vr::Ds,
-            ds_format(lead.sensitivity),
+            ds_field("channel sensitivity", lead.sensitivity)?,
         );
         ch.put_sequence(
             tags::CHANNEL_SENSITIVITY_UNITS_SEQUENCE,
@@ -156,21 +161,37 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
         ch.put_text(
             tags::CHANNEL_SENSITIVITY_CORRECTION_FACTOR,
             Vr::Ds,
-            ds_format(lead.correction_factor),
+            ds_field("sensitivity correction factor", lead.correction_factor)?,
         );
-        ch.put_text(tags::CHANNEL_BASELINE, Vr::Ds, ds_format(lead.baseline));
+        ch.put_text(
+            tags::CHANNEL_BASELINE,
+            Vr::Ds,
+            ds_field("channel baseline", lead.baseline)?,
+        );
         ch.put_text(tags::CHANNEL_TIME_SKEW, Vr::Ds, "0");
         ch.put_text(tags::CHANNEL_SAMPLE_SKEW, Vr::Ds, "0");
         ch.put_text(tags::CHANNEL_OFFSET, Vr::Ds, "0");
         ch.put_u16_single(tags::WAVEFORM_BITS_STORED, rec.bits_allocated);
         if let Some(f) = lead.filter_low_hz {
-            ch.put_text(tags::FILTER_LOW_FREQUENCY, Vr::Ds, ds_format(f));
+            ch.put_text(
+                tags::FILTER_LOW_FREQUENCY,
+                Vr::Ds,
+                ds_field("filter frequency", f)?,
+            );
         }
         if let Some(f) = lead.filter_high_hz {
-            ch.put_text(tags::FILTER_HIGH_FREQUENCY, Vr::Ds, ds_format(f));
+            ch.put_text(
+                tags::FILTER_HIGH_FREQUENCY,
+                Vr::Ds,
+                ds_field("filter frequency", f)?,
+            );
         }
         if let Some(f) = lead.notch_hz {
-            ch.put_text(tags::NOTCH_FILTER_FREQUENCY, Vr::Ds, ds_format(f));
+            ch.put_text(
+                tags::NOTCH_FILTER_FREQUENCY,
+                Vr::Ds,
+                ds_field("filter frequency", f)?,
+            );
         }
         channels.push(ch);
     }
@@ -187,7 +208,11 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
     item.put_text(tags::WAVEFORM_SAMPLE_INTERPRETATION, Vr::Cs, interp);
     item.put_bytes(tags::WAVEFORM_DATA, Vr::Ow, interleave(rec)?);
     if let Some(f) = rec.powerline_hz {
-        item.put_text(tags::POWERLINE_FREQUENCY, Vr::Ds, ds_format(f));
+        item.put_text(
+            tags::POWERLINE_FREQUENCY,
+            Vr::Ds,
+            ds_field("powerline frequency", f)?,
+        );
     }
     if let Some(a) = &rec.amplifier_type {
         item.put_text(tags::WAVEFORM_AMPLIFIER_TYPE, Vr::Cs, a.clone());
@@ -224,10 +249,14 @@ fn units_item(units: &str) -> DataSet {
     item
 }
 
-/// Format an `f64` as a `DS` value (≤ 16 chars, no exponent).
-fn ds_format(v: f64) -> String {
+/// Format an `f64` as a `DS` value (≤ 16 chars, no exponent);
+/// `None` for non-finite inputs (never written: NaN/inf are not DS).
+fn ds_format(v: f64) -> Option<String> {
+    if !v.is_finite() {
+        return None;
+    }
     if v == 0.0 {
-        return "0".into();
+        return Some("0".into());
     }
     let mut s = format!("{v:.9}");
     while s.contains('.') && s.ends_with('0') {
@@ -239,7 +268,7 @@ fn ds_format(v: f64) -> String {
     if s.len() > 16 {
         s.truncate(16);
     }
-    s
+    Some(s)
 }
 
 /// Interleave channel samples (sample-major, little-endian).
@@ -295,7 +324,9 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
         .trim()
         .parse()
         .map_err(|_| Error::Waveform("bad Sampling Frequency".into()))?;
-    if channels == 0 || samples == 0 || freq <= 0.0 {
+    // `!is_finite` first: NaN compares false against `<= 0.0` and
+    // would otherwise slip through.
+    if channels == 0 || samples == 0 || !freq.is_finite() || freq <= 0.0 {
         return Err(Error::Waveform("empty waveform dimensions".into()));
     }
     let bits = item.uint16(tags::WAVEFORM_BITS_ALLOCATED).unwrap_or(16);
@@ -318,11 +349,13 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
     }
     let raw = waveform_bytes(item)?;
     let bytes_per_sample = bits as usize / 8;
-    if raw.len() != channels * samples * bytes_per_sample {
+    // u64 math: channels/samples come from the wire and their product
+    // overflows 32-bit usize.
+    let want = channels as u64 * samples as u64 * bytes_per_sample as u64;
+    if raw.len() as u64 != want {
         return Err(Error::Waveform(format!(
-            "waveform data {} bytes, want {}",
+            "waveform data {} bytes, want {want}",
             raw.len(),
-            channels * samples * bytes_per_sample
         )));
     }
 
@@ -383,7 +416,7 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
         });
     }
 
-    let mut rec = EcgRecording::new(leads, freq).map_err(Error::Waveform)?;
+    let mut rec = EcgRecording::new(leads, freq)?;
     rec.originality = item
         .string(tags::WAVEFORM_ORIGINALITY)
         .unwrap_or("ORIGINAL")
@@ -592,6 +625,37 @@ mod tests {
             let mut rec = twelve_lead();
             rec.sampling_frequency_hz = rate;
             assert!(recording_to_waveform_item(&rec).is_err(), "{rate}");
+        }
+    }
+
+    #[test]
+    fn non_finite_fields_are_rejected() {
+        // NaN/inf are not valid DS: never written, always an error.
+        let mut rec = twelve_lead();
+        rec.leads[0].sensitivity = f64::NAN;
+        assert!(recording_to_waveform_item(&rec).is_err());
+        let mut rec = twelve_lead();
+        rec.leads[0].baseline = f64::INFINITY;
+        assert!(recording_to_waveform_item(&rec).is_err());
+        let mut rec = twelve_lead();
+        rec.powerline_hz = Some(f64::NAN);
+        assert!(recording_to_waveform_item(&rec).is_err());
+        assert_eq!(ds_format(f64::NAN), None);
+        assert_eq!(ds_format(f64::INFINITY), None);
+        assert_eq!(ds_format(0.0).as_deref(), Some("0"));
+        assert_eq!(ds_format(1.5).as_deref(), Some("1.5"));
+    }
+
+    #[test]
+    fn wire_item_with_bad_frequency_is_rejected() {
+        let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        for bad in ["NaN", "inf", "-inf", "-500", "0", "abc"] {
+            let mut item = item.clone();
+            item.put_text(tags::SAMPLING_FREQUENCY, Vr::Ds, bad);
+            assert!(
+                recording_from_waveform_item(&item).is_err(),
+                "{bad} must not parse"
+            );
         }
     }
 }

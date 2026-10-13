@@ -41,7 +41,7 @@ pub struct RoleSelection {
 }
 
 /// User Identity Negotiation (RQ item `0x58`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct UserIdentity {
     /// Identity type: 1 username, 2 username+password, 3 Kerberos, 4 SAML.
     pub identity_type: u8,
@@ -51,6 +51,22 @@ pub struct UserIdentity {
     pub primary: Vec<u8>,
     /// Secondary field (password).
     pub secondary: Vec<u8>,
+}
+
+// Manual `Debug`: identity fields carry passwords, tickets, and SAML
+// assertions, none of which may reach logs.
+impl std::fmt::Debug for UserIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UserIdentity")
+            .field("identity_type", &self.identity_type)
+            .field(
+                "positive_response_requested",
+                &self.positive_response_requested,
+            )
+            .field("primary", &"<redacted>")
+            .field("secondary", &"<redacted>")
+            .finish()
+    }
 }
 
 /// A-ASSOCIATE-RQ PDU (`0x01`).
@@ -803,5 +819,29 @@ mod tests {
         let (_, mut bytes) = encode_pdu(&Pdu::AssociateRq(rq.clone())).unwrap();
         bytes.extend([0x99, 0x00, 0x00, 0x02, 0xAA, 0xBB]);
         assert_eq!(decode_pdu(0x01, &bytes).unwrap(), Pdu::AssociateRq(rq));
+    }
+
+    #[test]
+    fn debug_redacts_user_identity() {
+        let id = UserIdentity {
+            identity_type: 2,
+            positive_response_requested: true,
+            primary: b"ann".to_vec(),
+            secondary: b"hunter2".to_vec(),
+        };
+        let shown = format!("{id:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(!shown.contains("ann"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn adversarial_pdu_length_rejected_before_alloc() {
+        // A header claiming u32::MAX payload bytes with (almost) no
+        // bytes behind it must fail on the cap, not on a 4 GiB
+        // allocation: this test would OOM or hang otherwise.
+        let wire = [0x04u8, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0x00];
+        let mut r = &wire[..];
+        let err = read_pdu(&mut r, 64 * 1024 * 1024).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds cap"), "{err}");
     }
 }

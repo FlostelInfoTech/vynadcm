@@ -31,7 +31,7 @@ fn main() -> Result<(), String> {
         lead.filter_high_hz = Some(150.0);
         leads.push(lead);
     }
-    let rec = EcgRecording::new(leads, 500.0)?;
+    let rec = EcgRecording::new(leads, 500.0).map_err(|e| e.to_string())?;
     println!(
         "recording: {} leads x {} samples ({:.1} s)",
         rec.leads.len(),

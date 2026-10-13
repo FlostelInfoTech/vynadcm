@@ -42,7 +42,8 @@ fn shift_ymd(year: i64, month: i64, day: i64, offset: i64) -> Option<String> {
         return None;
     }
     let days = days_from_civil(year, month, day);
-    let (y, m, d) = civil_from_days(days + offset);
+    let shifted_days = days.checked_add(offset)?;
+    let (y, m, d) = civil_from_days(shifted_days);
     if !(1..=9999).contains(&y) {
         return None;
     }
@@ -78,6 +79,10 @@ mod tests {
         assert_eq!(shift_da("20241301", 7), None);
         assert_eq!(shift_da("00010101", -1), None);
         assert_eq!(shift_da("99991231", 1), None);
+        // day-count arithmetic must not overflow on extreme offsets.
+        assert_eq!(shift_da("20240101", i64::MAX), None);
+        assert_eq!(shift_da("20240101", i64::MIN), None);
+        assert_eq!(shift_dt("20240115120000", i64::MAX), None);
     }
 
     #[test]

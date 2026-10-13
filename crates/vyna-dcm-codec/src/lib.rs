@@ -97,16 +97,95 @@ pub(crate) fn samples_from_bytes(
 /// the wire; every other photometric stores the decoded length.
 /// (Decoders return RGB for 422 JPEG data, so only native and RLE
 /// paths — which preserve stored bytes — use this.)
-pub(crate) fn stored_frame_len(ds: &DataSet, rows: u16, columns: u16, decoded_len: usize) -> usize {
-    use vyna_dcm_core::tags;
+pub(crate) fn stored_frame_len(
+    ds: &DataSet,
+    rows: u16,
+    columns: u16,
+    decoded_len: usize,
+) -> Result<usize> {
+    use vyna_dcm_core::{Vr, tags};
     let is_422 = ds
         .string(tags::PHOTOMETRIC_INTERPRETATION)
         .is_some_and(|s| s.trim() == "YBR_FULL_422");
     if is_422 {
-        rows as usize * columns as usize * 2
+        (rows as usize)
+            .checked_mul(columns as usize)
+            .and_then(|n| n.checked_mul(2))
+            .ok_or_else(|| Error::BadValue {
+                tag: tags::PIXEL_DATA,
+                vr: Vr::Ow,
+                message: format!("stored dimensions {rows}x{columns} overflow"),
+            })
     } else {
-        decoded_len
+        Ok(decoded_len)
     }
+}
+
+/// Maximum decoded pixel payload one [`decode_pixels_with`] call will
+/// produce (decompression-bomb guard, matching the 1 GiB message and
+/// STOW caps). Geometry implying more is rejected with
+/// [`Error::BadValue`] instead of pre-allocating attacker-sized buffers.
+pub const MAX_PIXEL_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Validated pixel geometry: nonzero dimensions with checked frame
+/// math (overflow is an error, never a wrap or panic).
+struct PixelGeometry {
+    rows: u16,
+    columns: u16,
+    samples: u16,
+    bits: u16,
+    bytes_per_sample: usize,
+    frames: usize,
+    frame_len: usize,
+}
+
+fn pixel_geometry(ds: &DataSet) -> Result<PixelGeometry> {
+    use vyna_dcm_core::{Vr, tags};
+    let req_u16 = |tag| {
+        ds.uint16(tag).ok_or_else(|| Error::BadValue {
+            tag,
+            vr: Vr::Us,
+            message: "missing pixel descriptor".into(),
+        })
+    };
+    let rows = req_u16(tags::ROWS)?;
+    let columns = req_u16(tags::COLUMNS)?;
+    let samples = ds.uint16(tags::SAMPLES_PER_PIXEL).unwrap_or(1);
+    let bits = req_u16(tags::BITS_ALLOCATED)?;
+    for (tag, what, v) in [
+        (tags::ROWS, "Rows", rows),
+        (tags::COLUMNS, "Columns", columns),
+        (tags::SAMPLES_PER_PIXEL, "SamplesPerPixel", samples),
+        (tags::BITS_ALLOCATED, "BitsAllocated", bits),
+    ] {
+        if v == 0 {
+            return Err(Error::BadValue {
+                tag,
+                vr: Vr::Us,
+                message: format!("{what} must be nonzero"),
+            });
+        }
+    }
+    let bytes_per_sample = bits.div_ceil(8) as usize;
+    let frames = frame_count(ds)?;
+    let frame_len = (rows as usize)
+        .checked_mul(columns as usize)
+        .and_then(|n| n.checked_mul(samples as usize))
+        .and_then(|n| n.checked_mul(bytes_per_sample))
+        .ok_or_else(|| Error::BadValue {
+            tag: tags::PIXEL_DATA,
+            vr: Vr::Ow,
+            message: format!("pixel dimensions {rows}x{columns}x{samples} overflow"),
+        })?;
+    Ok(PixelGeometry {
+        rows,
+        columns,
+        samples,
+        bits,
+        bytes_per_sample,
+        frames,
+        frame_len,
+    })
 }
 
 /// Frame count from Number of Frames: absent means 1
@@ -137,6 +216,11 @@ fn jpeg_bot_usable(joined: &[u8], bot: &[u32], frames: usize, ts: TransferSyntax
     if bot.len() != frames || frames == 0 || bot[0] != 0 {
         return false;
     }
+    // Entries are u32 offsets; past 4 GiB the table cannot address
+    // the stream, so callers fall back to fragment-per-frame.
+    if joined.len() > u32::MAX as usize {
+        return false;
+    }
     for w in bot.windows(2) {
         if w[1] <= w[0] {
             return false;
@@ -153,7 +237,10 @@ fn jpeg_bot_usable(joined: &[u8], bot: &[u32], frames: usize, ts: TransferSyntax
     };
     bot.iter().all(|o| {
         let o = *o as usize;
-        o + 2 <= joined.len() && joined[o..o + 2] == *magic
+        match o.checked_add(2) {
+            Some(end) if end <= joined.len() => joined[o..end] == *magic,
+            _ => false,
+        }
     })
 }
 
@@ -343,25 +430,31 @@ pub fn decode_pixels_with(
     ts: TransferSyntax,
     codec: Option<&dyn PixelCodec>,
 ) -> Result<Vec<u8>> {
-    use vyna_dcm_core::{Value, tags};
+    use vyna_dcm_core::{Value, Vr, tags};
 
-    let req_u16 = |tag| {
-        ds.uint16(tag).ok_or_else(|| Error::BadValue {
-            tag,
-            vr: vyna_dcm_core::Vr::Us,
-            message: "missing pixel descriptor".into(),
-        })
+    let g = pixel_geometry(ds)?;
+    let (rows, columns, samples, bits) = (g.rows, g.columns, g.samples, g.bits);
+    let (bytes_per_sample, frames, frame_len) = (g.bytes_per_sample, g.frames, g.frame_len);
+    let bad_total = |msg: String| Error::BadValue {
+        tag: tags::PIXEL_DATA,
+        vr: Vr::Ow,
+        message: msg,
     };
-    let rows = req_u16(tags::ROWS)?;
-    let columns = req_u16(tags::COLUMNS)?;
-    let samples = ds.uint16(tags::SAMPLES_PER_PIXEL).unwrap_or(1);
-    let bits = req_u16(tags::BITS_ALLOCATED)?;
-    let bytes_per_sample = bits.div_ceil(8) as usize;
-    let frames = frame_count(ds)?;
-    let frame_len = rows as usize * columns as usize * samples as usize * bytes_per_sample;
-    let expected = frame_len * frames;
-    let stored_len = stored_frame_len(ds, rows, columns, frame_len);
-    let stored_expected = stored_len * frames;
+    let expected = frame_len
+        .checked_mul(frames)
+        .ok_or_else(|| bad_total(format!("{frames} frames of {frame_len} bytes overflow")))?;
+    let stored_len = stored_frame_len(ds, rows, columns, frame_len)?;
+    let stored_expected = stored_len.checked_mul(frames).ok_or_else(|| {
+        bad_total(format!(
+            "{frames} stored frames of {stored_len} bytes overflow"
+        ))
+    })?;
+    let biggest = expected.max(stored_expected);
+    if biggest > MAX_PIXEL_BYTES {
+        return Err(bad_total(format!(
+            "decoded pixel payload {biggest} bytes exceeds {MAX_PIXEL_BYTES}-byte cap"
+        )));
+    }
 
     let el = ds.get(tags::PIXEL_DATA).ok_or_else(|| Error::BadValue {
         tag: tags::PIXEL_DATA,
@@ -391,6 +484,7 @@ pub fn decode_pixels_with(
                 let joined = f.joined();
                 if rle::bot_usable(&joined, &f.basic_offset_table, frames) {
                     let mut offsets = f.basic_offset_table.clone();
+                    // Safe: bot_usable rejects streams past u32::MAX.
                     offsets.push(joined.len() as u32);
                     let mut out = Vec::with_capacity(stored_expected);
                     for w in offsets.windows(2) {
@@ -443,6 +537,7 @@ pub fn decode_pixels_with(
                 jpeg_bot_usable(&joined, &f.basic_offset_table, frames, ts)
             } {
                 let mut offsets = f.basic_offset_table.clone();
+                // Safe: jpeg_bot_usable rejects streams past u32::MAX.
                 offsets.push(joined.len() as u32);
                 let mut blobs = Vec::with_capacity(frames);
                 for w in offsets.windows(2) {
@@ -512,37 +607,29 @@ pub fn encode_pixels(
 ) -> Result<FragmentSequence> {
     use vyna_dcm_core::{Vr, tags};
 
-    let req_u16 = |tag| {
-        ds.uint16(tag).ok_or_else(|| Error::BadValue {
-            tag,
-            vr: Vr::Us,
-            message: "missing pixel descriptor".into(),
-        })
-    };
-    let rows = req_u16(tags::ROWS)?;
-    let columns = req_u16(tags::COLUMNS)?;
-    let samples = ds.uint16(tags::SAMPLES_PER_PIXEL).unwrap_or(1);
-    let bits = req_u16(tags::BITS_ALLOCATED)?;
-    let bytes_per_sample = bits.div_ceil(8) as usize;
-    let frames = frame_count(ds)?;
-    let frame_len = rows as usize * columns as usize * samples as usize * bytes_per_sample;
+    let g = pixel_geometry(ds)?;
+    let (rows, columns, samples, bits) = (g.rows, g.columns, g.samples, g.bits);
+    let (bytes_per_sample, frames, frame_len) = (g.bytes_per_sample, g.frames, g.frame_len);
     // RLE preserves stored bytes (possibly subsampled); JPEG encoders
     // take decoded RGB/mono.
-    let rle_frame_len = stored_frame_len(ds, rows, columns, frame_len);
+    let rle_frame_len = stored_frame_len(ds, rows, columns, frame_len)?;
     let want_frame_len = if ts == TransferSyntax::RleLossless {
         rle_frame_len
     } else {
         frame_len
     };
-    if raw.len() != want_frame_len * frames {
+    let want_total = want_frame_len
+        .checked_mul(frames)
+        .ok_or_else(|| Error::BadValue {
+            tag: tags::PIXEL_DATA,
+            vr: Vr::Ow,
+            message: format!("{frames} frames of {want_frame_len} bytes overflow"),
+        })?;
+    if raw.len() != want_total {
         return Err(Error::BadValue {
             tag: tags::PIXEL_DATA,
             vr: Vr::Ow,
-            message: format!(
-                "raw is {} bytes, expected {}",
-                raw.len(),
-                want_frame_len * frames
-            ),
+            message: format!("raw is {} bytes, expected {want_total}", raw.len()),
         });
     }
     if ts == TransferSyntax::RleLossless {
@@ -859,5 +946,88 @@ mod tests {
             matches!(err, Error::UnsupportedTransferSyntax(_)),
             "{err:?}"
         );
+    }
+
+    #[test]
+    fn pixel_geometry_overflow_is_an_error() {
+        // frame_len * frames overflows usize: must error, never panic.
+        let ds = DataSet::new()
+            .with(DataElement::u16_single(tags::ROWS, 4096))
+            .with(DataElement::u16_single(tags::COLUMNS, 4096))
+            .with(DataElement::u16_single(tags::SAMPLES_PER_PIXEL, 3))
+            .with(DataElement::u16_single(tags::BITS_ALLOCATED, 16))
+            .with(DataElement::text(
+                tags::NUMBER_OF_FRAMES,
+                vyna_dcm_core::Vr::Is,
+                usize::MAX.to_string(),
+            ));
+        let err = decode_pixels(&ds, TransferSyntax::ExplicitVrLittleEndian).unwrap_err();
+        assert!(matches!(err, Error::BadValue { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn pixel_geometry_over_cap_is_an_error() {
+        // ~25 GB of implied pixels: rejected by the cap, never allocated.
+        // (Checked before Pixel Data is even read, so no pixel payload
+        // is needed to trigger it.)
+        let ds =
+            geometry_ds(65535, 65535, 1).with(DataElement::u16_single(tags::SAMPLES_PER_PIXEL, 3));
+        let err = decode_pixels(&ds, TransferSyntax::ExplicitVrLittleEndian).unwrap_err();
+        match err {
+            Error::BadValue { message, .. } => assert!(
+                message.contains("exceeds"),
+                "expected cap error, got: {message}"
+            ),
+            other => panic!("expected BadValue, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pixel_geometry_zero_dims_rejected() {
+        let ds = geometry_ds(0, 8, 1).with(DataElement::bytes(
+            tags::PIXEL_DATA,
+            vyna_dcm_core::Vr::Ow,
+            vec![],
+        ));
+        let err = decode_pixels(&ds, TransferSyntax::ExplicitVrLittleEndian).unwrap_err();
+        assert!(matches!(err, Error::BadValue { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn encode_pixels_overflow_is_an_error() {
+        let ds = DataSet::new()
+            .with(DataElement::u16_single(tags::ROWS, 4096))
+            .with(DataElement::u16_single(tags::COLUMNS, 4096))
+            .with(DataElement::u16_single(tags::SAMPLES_PER_PIXEL, 1))
+            .with(DataElement::u16_single(tags::BITS_ALLOCATED, 16))
+            .with(DataElement::text(
+                tags::NUMBER_OF_FRAMES,
+                vyna_dcm_core::Vr::Is,
+                usize::MAX.to_string(),
+            ));
+        let err = encode_pixels(&ds, TransferSyntax::RleLossless, &[], None).unwrap_err();
+        assert!(matches!(err, Error::BadValue { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn encode_pixels_zero_dims_rejected_before_backend() {
+        // Zero Rows must fail in `pixel_geometry`, before any bundled
+        // backend (RLE, JPEG, JPEG-LS, JPEG 2000) sees the geometry.
+        let ds = geometry_ds(0, 8, 1);
+        for ts in [
+            TransferSyntax::RleLossless,
+            TransferSyntax::JpegBaseline8Bit,
+            TransferSyntax::JpegLsLossless,
+            TransferSyntax::Jpeg2000Lossless,
+        ] {
+            let err = encode_pixels(&ds, ts, &[], None).unwrap_err();
+            match err {
+                Error::BadValue { message, .. } => assert!(
+                    message.contains("must be nonzero"),
+                    "expected geometry error for {ts:?}, got: {message}"
+                ),
+                other => panic!("expected BadValue for {ts:?}, got: {other:?}"),
+            }
+        }
     }
 }
