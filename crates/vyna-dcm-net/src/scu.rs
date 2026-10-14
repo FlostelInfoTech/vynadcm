@@ -16,6 +16,7 @@ use crate::{
 
 /// C-MOVE / C-GET final outcome with sub-operation counts.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct MoveResult {
     /// Final DIMSE status.
     pub status: u16,
@@ -27,6 +28,10 @@ pub struct MoveResult {
     pub failed: u16,
     /// Warning sub-operations.
     pub warning: u16,
+    /// Per-sub-operation `(sop_instance_uid, status)` outcomes in
+    /// arrival order. C-GET only (the SCU observes each STORE it
+    /// acks); C-MOVE carries counts alone, so this stays empty there.
+    pub sub_operations: Vec<(String, u16)>,
 }
 
 impl MoveResult {
@@ -37,6 +42,7 @@ impl MoveResult {
             completed: cmd.completed.unwrap_or(0),
             failed: cmd.failed.unwrap_or(0),
             warning: cmd.warning.unwrap_or(0),
+            sub_operations: Vec::new(),
         }
     }
 }
@@ -52,16 +58,39 @@ pub const MAX_FIND_MATCHES: usize = 10_000;
 /// C-FIND identifiers are small key sets, so 256 MiB is generous headroom.
 pub const MAX_FIND_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Default pending-response cap for SCU multi-response loops
+/// ([`Association::find_with`], [`Association::find_cancelable`],
+/// [`Association::get_with`], C-MOVE awaits): past this the
+/// association aborts with [`Error::TooManyResponses`]. Own SCPs cap
+/// at 10,000 matches, so 100,000 is 10x headroom for foreign peers.
+pub const MAX_PENDING_RESPONSES: u32 = 100_000;
+
 impl Association {
-    /// C-ECHO against the Verification (or any echoable) SOP class.
-    pub async fn echo(&mut self, sop_class_uid: &str) -> Result<u16> {
+    /// Send one request and await its single response: the shared core
+    /// of every single-RSP SCU method (echo/store/N-services), so the
+    /// context lookup → ID → send → await shape cannot drift per copy.
+    async fn request_single(
+        &mut self,
+        sop_class_uid: &str,
+        rsp_field: u16,
+        build: impl FnOnce(u16) -> Command,
+        dataset: Option<&DataSet>,
+    ) -> Result<DimseMessage> {
         let ctx = self
             .context_for(sop_class_uid)
             .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
             .clone();
         let id = self.next_message_id();
-        self.send(ctx.id, &Command::echo_rq(id), None).await?;
-        let msg = self.expect_message(CF::C_ECHO_RSP, id).await?;
+        let cmd = build(id);
+        self.send(ctx.id, &cmd, dataset).await?;
+        self.expect_message(rsp_field, id).await
+    }
+
+    /// C-ECHO against the Verification (or any echoable) SOP class.
+    pub async fn echo(&mut self, sop_class_uid: &str) -> Result<u16> {
+        let msg = self
+            .request_single(sop_class_uid, CF::C_ECHO_RSP, Command::echo_rq, None)
+            .await?;
         Ok(msg.command.status.unwrap_or(status::PROCESSING_FAILURE))
     }
 
@@ -73,18 +102,29 @@ impl Association {
         sop_instance_uid: &str,
         priority: u16,
     ) -> Result<u16> {
-        let ctx = self
-            .context_for(sop_class_uid)
-            .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
-            .clone();
-        let id = self.next_message_id();
-        let cmd = Command::store_rq(id, priority, sop_class_uid, sop_instance_uid);
-        self.send(ctx.id, &cmd, Some(dataset)).await?;
-        let msg = self.expect_message(CF::C_STORE_RSP, id).await?;
-        Ok(msg.command.status.unwrap_or(status::PROCESSING_FAILURE))
+        let msg = self
+            .request_single(
+                sop_class_uid,
+                CF::C_STORE_RSP,
+                |id| Command::store_rq(id, priority, sop_class_uid, sop_instance_uid),
+                Some(dataset),
+            )
+            .await?;
+        let s = msg.command.status.unwrap_or(status::PROCESSING_FAILURE);
+        // Warnings (B000 coercions) otherwise vanish: callers check
+        // success-or-not, and the peer's caveat goes unlogged.
+        if status::is_warning(s) {
+            tracing::warn!("C-STORE of {sop_instance_uid} succeeded with warning {s:#06X}");
+        }
+        Ok(s)
     }
 
     /// C-FIND with a per-match callback; returns the final status.
+    ///
+    /// Streaming, but not unbounded: past `max_pending_responses`
+    /// (`100,000` by default) the association aborts with
+    /// [`Error::TooManyResponses`]. Raise the option for legitimately
+    /// huge result sets.
     pub async fn find_with(
         &mut self,
         sop_class_uid: &str,
@@ -103,10 +143,12 @@ impl Association {
             Some(query),
         )
         .await?;
+        let mut pending = 0u32;
         loop {
             let msg = self.expect_message(CF::C_FIND_RSP, id).await?;
             let s = msg.command.status.unwrap_or(status::PROCESSING_FAILURE);
             if status::is_pending(s) {
+                self.count_pending(&mut pending).await?;
                 if let Some(ds) = msg.dataset {
                     on_match(ds);
                 }
@@ -119,7 +161,8 @@ impl Association {
     /// C-FIND collecting all matches (capped: [`MAX_FIND_MATCHES`]
     /// responses / [`MAX_FIND_BYTES`] bytes; past either cap the SCU
     /// drains to the final response and errors, keeping the
-    /// association usable). For unbounded streaming use [`Association::find_with`].
+    /// association usable). For callback streaming use [`Association::find_with`]
+    /// (capped by `max_pending_responses`, aborting past it).
     pub async fn find_all(
         &mut self,
         sop_class_uid: &str,
@@ -199,10 +242,12 @@ impl Association {
             Some(query),
         )
         .await?;
+        let mut pending = 0u32;
         loop {
             let msg = self.expect_message(CF::C_FIND_RSP, id).await?;
             let s = msg.command.status.unwrap_or(status::PROCESSING_FAILURE);
             if status::is_pending(s) {
+                self.count_pending(&mut pending).await?;
                 let keep = match msg.dataset {
                     Some(ds) => on_match(ds),
                     None => true,
@@ -210,12 +255,15 @@ impl Association {
                 if !keep {
                     self.send(ctx.id, &Command::cancel_rq(id), None).await?;
                     // Drain in-flight pendings until the final response.
+                    // The drain shares the pending budget (a rogue peer
+                    // must not hold it forever either).
                     loop {
                         let fin = self.expect_message(CF::C_FIND_RSP, id).await?;
                         let fs = fin.command.status.unwrap_or(status::CANCEL);
                         if !status::is_pending(fs) {
                             return Ok(fs);
                         }
+                        self.count_pending(&mut pending).await?;
                     }
                 }
             } else {
@@ -250,6 +298,9 @@ impl Association {
     /// transfer_syntax)` and returns the C-STORE-RSP status for each
     /// instance. Encapsulated datasets arrive as-is (fragments); the
     /// callback owns any conversion.
+    ///
+    /// Sub-operations plus PENDINGs count toward `max_pending_responses`
+    /// (past it: [`Error::TooManyResponses`] + abort).
     pub async fn get_with(
         &mut self,
         sop_class_uid: &str,
@@ -268,11 +319,17 @@ impl Association {
             Some(query),
         )
         .await?;
+        let mut pending = 0u32;
+        let mut sub_operations: Vec<(String, u16)> = Vec::new();
         loop {
             match self.recv().await? {
                 DimseEvent::Released => return Err(Error::Released),
                 DimseEvent::Message(m) if m.command.field == CF::C_STORE_RQ => {
-                    let store_id = m.command.message_id.unwrap_or(0);
+                    self.count_pending(&mut pending).await?;
+                    // A STORE-RSP with ID 0 matches nothing on the peer.
+                    let Some(store_id) = m.command.message_id else {
+                        return Err(Error::BadCommand("C-STORE-RQ without Message ID".into()));
+                    };
                     let class = m.command.affected_sop_class_uid.clone().unwrap_or_default();
                     let inst = m
                         .command
@@ -285,6 +342,9 @@ impl Association {
                         }
                         _ => status::PROCESSING_FAILURE,
                     };
+                    // Keep (instance, status): without it a callback
+                    // warning surfaces only as an anonymous count.
+                    sub_operations.push((inst.clone(), s));
                     let rsp = Command::store_rsp(store_id, Some(class), Some(inst), s);
                     self.send(m.context_id, &rsp, None).await?;
                 }
@@ -292,8 +352,11 @@ impl Association {
                     check_id(&m, id)?;
                     let s = m.command.status.unwrap_or(status::PROCESSING_FAILURE);
                     if !status::is_pending(s) {
-                        return Ok(MoveResult::from_command(&m.command));
+                        let mut result = MoveResult::from_command(&m.command);
+                        result.sub_operations = sub_operations;
+                        return Ok(result);
                     }
+                    self.count_pending(&mut pending).await?;
                 }
                 DimseEvent::Message(m) => {
                     return Err(Error::UnexpectedPdu {
@@ -312,14 +375,15 @@ impl Association {
         sop_instance_uid: &str,
         dataset: Option<&DataSet>,
     ) -> Result<(u16, Option<DataSet>)> {
-        let ctx = self
-            .context_for(sop_class_uid)
-            .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
-            .clone();
-        let id = self.next_message_id();
-        let cmd = Command::n_create_rq(id, sop_class_uid, sop_instance_uid, dataset.is_some());
-        self.send(ctx.id, &cmd, dataset).await?;
-        let msg = self.expect_message(CF::N_CREATE_RSP, id).await?;
+        let has_dataset = dataset.is_some();
+        let msg = self
+            .request_single(
+                sop_class_uid,
+                CF::N_CREATE_RSP,
+                |id| Command::n_create_rq(id, sop_class_uid, sop_instance_uid, has_dataset),
+                dataset,
+            )
+            .await?;
         Ok((
             msg.command.status.unwrap_or(status::PROCESSING_FAILURE),
             msg.dataset,
@@ -333,14 +397,14 @@ impl Association {
         sop_instance_uid: &str,
         dataset: &DataSet,
     ) -> Result<(u16, Option<DataSet>)> {
-        let ctx = self
-            .context_for(sop_class_uid)
-            .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
-            .clone();
-        let id = self.next_message_id();
-        let cmd = Command::n_set_rq(id, sop_class_uid, sop_instance_uid);
-        self.send(ctx.id, &cmd, Some(dataset)).await?;
-        let msg = self.expect_message(CF::N_SET_RSP, id).await?;
+        let msg = self
+            .request_single(
+                sop_class_uid,
+                CF::N_SET_RSP,
+                |id| Command::n_set_rq(id, sop_class_uid, sop_instance_uid),
+                Some(dataset),
+            )
+            .await?;
         Ok((
             msg.command.status.unwrap_or(status::PROCESSING_FAILURE),
             msg.dataset,
@@ -354,14 +418,14 @@ impl Association {
         sop_instance_uid: &str,
         attributes: Vec<Tag>,
     ) -> Result<(u16, Option<DataSet>)> {
-        let ctx = self
-            .context_for(sop_class_uid)
-            .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
-            .clone();
-        let id = self.next_message_id();
-        let cmd = Command::n_get_rq(id, sop_class_uid, sop_instance_uid, attributes);
-        self.send(ctx.id, &cmd, None).await?;
-        let msg = self.expect_message(CF::N_GET_RSP, id).await?;
+        let msg = self
+            .request_single(
+                sop_class_uid,
+                CF::N_GET_RSP,
+                |id| Command::n_get_rq(id, sop_class_uid, sop_instance_uid, attributes),
+                None,
+            )
+            .await?;
         Ok((
             msg.command.status.unwrap_or(status::PROCESSING_FAILURE),
             msg.dataset,
@@ -376,40 +440,42 @@ impl Association {
         action_type_id: u16,
         dataset: Option<&DataSet>,
     ) -> Result<(u16, Option<DataSet>)> {
-        let ctx = self
-            .context_for(sop_class_uid)
-            .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
-            .clone();
-        let id = self.next_message_id();
-        let cmd = Command::n_action_rq(
-            id,
-            sop_class_uid,
-            sop_instance_uid,
-            action_type_id,
-            dataset.is_some(),
-        );
-        self.send(ctx.id, &cmd, dataset).await?;
-        let msg = self.expect_message(CF::N_ACTION_RSP, id).await?;
-        Ok((
-            msg.command.status.unwrap_or(status::PROCESSING_FAILURE),
-            msg.dataset,
-        ))
+        let has_dataset = dataset.is_some();
+        let msg = self
+            .request_single(
+                sop_class_uid,
+                CF::N_ACTION_RSP,
+                |id| {
+                    Command::n_action_rq(
+                        id,
+                        sop_class_uid,
+                        sop_instance_uid,
+                        action_type_id,
+                        has_dataset,
+                    )
+                },
+                dataset,
+            )
+            .await?;
+        let s = msg.command.status.unwrap_or(status::PROCESSING_FAILURE);
+        // N-ACTION callers (commitment, UPS) check success-or-not; log
+        // anything else so warnings/failures leave a trail.
+        if !status::is_success(s) {
+            tracing::warn!("N-ACTION on {sop_instance_uid} returned {s:#06X}");
+        }
+        Ok((s, msg.dataset))
     }
 
     /// N-DELETE.
     pub async fn n_delete(&mut self, sop_class_uid: &str, sop_instance_uid: &str) -> Result<u16> {
-        let ctx = self
-            .context_for(sop_class_uid)
-            .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
-            .clone();
-        let id = self.next_message_id();
-        self.send(
-            ctx.id,
-            &Command::n_delete_rq(id, sop_class_uid, sop_instance_uid),
-            None,
-        )
-        .await?;
-        let msg = self.expect_message(CF::N_DELETE_RSP, id).await?;
+        let msg = self
+            .request_single(
+                sop_class_uid,
+                CF::N_DELETE_RSP,
+                |id| Command::n_delete_rq(id, sop_class_uid, sop_instance_uid),
+                None,
+            )
+            .await?;
         Ok(msg.command.status.unwrap_or(status::PROCESSING_FAILURE))
     }
 
@@ -422,20 +488,23 @@ impl Association {
         event_type_id: u16,
         dataset: Option<&DataSet>,
     ) -> Result<u16> {
-        let ctx = self
-            .context_for(sop_class_uid)
-            .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
-            .clone();
-        let id = self.next_message_id();
-        let cmd = Command::n_event_report_rq(
-            id,
-            sop_class_uid,
-            sop_instance_uid,
-            event_type_id,
-            dataset.is_some(),
-        );
-        self.send(ctx.id, &cmd, dataset).await?;
-        let msg = self.expect_message(CF::N_EVENT_REPORT_RSP, id).await?;
+        let has_dataset = dataset.is_some();
+        let msg = self
+            .request_single(
+                sop_class_uid,
+                CF::N_EVENT_REPORT_RSP,
+                |id| {
+                    Command::n_event_report_rq(
+                        id,
+                        sop_class_uid,
+                        sop_instance_uid,
+                        event_type_id,
+                        has_dataset,
+                    )
+                },
+                dataset,
+            )
+            .await?;
         Ok(msg.command.status.unwrap_or(status::PROCESSING_FAILURE))
     }
 
@@ -461,7 +530,12 @@ impl Association {
         match self.recv().await? {
             DimseEvent::Released => Err(Error::Released),
             DimseEvent::Message(m) if m.command.field == CF::N_EVENT_REPORT_RQ => {
-                let report_id = m.command.message_id.unwrap_or(0);
+                // A report RSP with ID 0 matches nothing on the peer.
+                let Some(report_id) = m.command.message_id else {
+                    return Err(Error::BadCommand(
+                        "N-EVENT-REPORT-RQ without Message ID".into(),
+                    ));
+                };
                 if m.command.event_type_id != Some(1) {
                     // Nack the report before failing: the peer awaits
                     // this RSP and would otherwise hang to timeout.
@@ -522,12 +596,14 @@ impl Association {
     }
 
     async fn await_move_get(&mut self, field: u16, id: u16) -> Result<MoveResult> {
+        let mut pending = 0u32;
         loop {
             let msg = self.expect_message(field, id).await?;
             let s = msg.command.status.unwrap_or(status::PROCESSING_FAILURE);
             if !status::is_pending(s) {
                 return Ok(MoveResult::from_command(&msg.command));
             }
+            self.count_pending(&mut pending).await?;
         }
     }
 }
@@ -613,6 +689,64 @@ mod tests {
             max_pdu_len: 16384,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn find_with_aborts_past_pending_cap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handlers = ArcTestScp::new(TestScp {
+            stored: Mutex::new(vec![]),
+            find_matches: (0..5).map(|i| test_ds(&format!("1.2.3.{i}"))).collect(),
+            move_instances: vec![],
+            fail_store: false,
+        });
+        let h2 = handlers.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let acc = AcceptorOptions {
+                association: short_opts(),
+                ..Default::default()
+            };
+            accept(stream, &acc, &*h2, &ScpOptions::default())
+                .await
+                .unwrap();
+        });
+
+        let mut opts = short_opts();
+        opts.max_pending_responses = 2;
+        let mut assoc = Association::request(
+            &opts,
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            &addr.to_string(),
+            propose(
+                &[vyna_dcm_core::sop_class::STUDY_ROOT_FIND],
+                &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let seen = std::sync::Mutex::new(0u32);
+        let err = assoc
+            .find_with(
+                vyna_dcm_core::sop_class::STUDY_ROOT_FIND,
+                &DataSet::new(),
+                priority::MEDIUM,
+                |_| {
+                    *seen.lock().unwrap() += 1;
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::TooManyResponses { limit: 2 }),
+            "{err:?}"
+        );
+        assert_eq!(*seen.lock().unwrap(), 2);
     }
 
     #[tokio::test]

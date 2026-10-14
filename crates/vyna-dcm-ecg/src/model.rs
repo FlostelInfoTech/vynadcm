@@ -59,6 +59,12 @@ pub struct EcgLead {
     pub baseline: f64,
     /// MDC code value (`"partition:code"`, e.g. `"2:2"` for lead II).
     pub mdc_code: Option<String>,
+    /// Full Channel Source code triple when the source scheme is not
+    /// `MDC` (private/foreign schemes): decode preserves it verbatim
+    /// so re-encode emits the same triple instead of an MDC-by-label
+    /// guess (or `99VYNA`). Takes precedence over `mdc_code` and the
+    /// label lookup when set.
+    pub source_code: Option<ChannelSourceCode>,
     /// Low/high/notch filter frequencies in Hz, when known.
     pub filter_low_hz: Option<f64>,
     /// High-frequency filter in Hz.
@@ -78,6 +84,7 @@ impl EcgLead {
             correction_factor: 1.0,
             baseline: 0.0,
             mdc_code: None,
+            source_code: None,
             filter_low_hz: None,
             filter_high_hz: None,
             notch_hz: None,
@@ -204,6 +211,19 @@ pub const STANDARD_12_LEAD: [(&str, &str); 12] = [
     ("V5", "2:7"),
     ("V6", "2:8"),
 ];
+
+/// Channel Source Sequence code triple (Code Value, Coding Scheme
+/// Designator, Code Meaning), preserved verbatim for non-`MDC`
+/// schemes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChannelSourceCode {
+    /// Code Value (`(0008,0100)`).
+    pub value: String,
+    /// Coding Scheme Designator (`(0008,0102)`).
+    pub scheme: String,
+    /// Code Meaning (`(0008,0104)`).
+    pub meaning: String,
+}
 
 /// Look up the MDC code for a standard lead label.
 #[must_use]

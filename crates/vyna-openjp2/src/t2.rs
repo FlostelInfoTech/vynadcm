@@ -1208,15 +1208,20 @@ fn opj_t2_read_packet_header(
                 i += 1;
               }
               (*l_cblk).Mb = (*l_band).numbps as OPJ_UINT32;
-              if (*l_band).numbps as u32 + 1 < i {
+              /* Wrapping add: hostile input drives numbps to -1, and
+               * `MAX + 1` panics in debug (release/C wrap). Identical
+               * low 32 bits either way; the i64 true branch matches
+               * release wrapping without the i32 overflow panic. */
+              let p1 = ((*l_band).numbps as u32).wrapping_add(1);
+              if p1 < i {
                 /* Not totally sure what we should do in that situation,
                  * but that avoids the integer overflow of
                  * https://github.com/uclouvain/openjpeg/pull/1488
                  * while keeping the regression test suite happy.
                  */
-                (*l_cblk).numbps = ((*l_band).numbps + 1 - i as i32) as u32;
+                (*l_cblk).numbps = ((*l_band).numbps as i64 + 1 - i as i64) as u32;
               } else {
-                (*l_cblk).numbps = (*l_band).numbps as u32 + 1 - i;
+                (*l_cblk).numbps = p1 - i;
               }
               (*l_cblk).numlenbits = 3 as OPJ_UINT32
             }

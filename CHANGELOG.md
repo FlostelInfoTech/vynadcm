@@ -3,10 +3,16 @@
 All notable changes to VynaDCM are documented here. Versions follow
 the workspace crate version (`Cargo.toml`).
 
-## [Unreleased]
+## [Unreleased] (targeting 0.6.0 — pre-1.0 breaking changes present)
 
 ### Fixed
 
+- CLI-visible behavior changes (operators, read this): `wadors
+  --frames` now exits nonzero when the server returns zero parts
+  (was silent exit 0 while writing nothing); `dcmodify` and `pdf2dcm`
+  now reject unparsable PersonNames with exit 1 (was silent
+  truncation); all SCP tools drop peers past 1024 concurrent
+  associations (was unbounded spawn-per-accept).
 - ATNA audit-code corrections, verified against NEMA PS3.16 Annex D
   (IHE ITI TF convention): participant source role is 110153
   ("Source Role ID", was 110152/"Source") and destination role is
@@ -69,6 +75,26 @@ the workspace crate version (`Cargo.toml`).
   `compile_error!` (upstream's `no_std` port is unfinished —
   upstream 0.6.1 fails identically) instead of ~28 confusing
   resolution errors; position documented in the fork README.
+- Round-2 publish-readiness review batch (0 majors + 85 minors,
+  every finding fixed and test-pinned). Operator-visible edges:
+  STOW/QIDO/WADO now honor `Accept` (406 otherwise); undecodable
+  WADO frames are 500 (was 404); `wadors --metadata` keeps
+  `BulkDataURI` links; new RetrieveStudy/RetrieveSeries routes;
+  STOW responses carry `ReferencedSOPSequence`; `deidentify`
+  clears source file-meta identity (class UID, AE titles) and
+  rejects bad `--patient-id` with exit 1 (was panic/101);
+  `pdf2dcm --referring-physician` rejects bad names (was silent
+  truncation); `wadorsd` rejects empty `--bearer-token`.
+  Pre-1.0 breaking notes: `Deidentifier::with_replacement_id` now
+  returns `Result` (`InvalidReplacementId` on overlong/backslash/
+  control input); `DicomWebStore` gains `study_files`/`series_files`,
+  `store_instance` takes `Bytes` by value, `instance_file`/`bulk_data`
+  return `Bytes`, `instance_frames` returns `Result`;
+  `StoredIds` gains `sop_class`; `Part.body` and `HttpResponse.body`
+  are `Bytes`; `encode_multipart`/`HttpResponse::multipart` return
+  `Result`; `DicomWebClient::wado_file` returns `Bytes`;
+  `EcgLead` gains `source_code`; General ECG channel cap is 24
+  (was 12, contradicting PS3.3 A.34.4.4.3).
 
 ## [0.5.0] — 2026-10-13
 

@@ -1,5 +1,5 @@
 //! DICOM mapping for ECG recordings (12-Lead / General ECG Waveform IODs,
-//! PS3.3 A.34.3 / A.34.5 + Waveform Module C.10.9).
+//! PS3.3 A.34.3 / A.34.4 + Waveform Module C.10.9).
 //!
 //! [`recording_to_waveform_item`] / [`recording_from_waveform_item`] convert
 //! one multiplex group; [`recording_to_dataset`] builds a complete SOP
@@ -340,6 +340,14 @@ pub fn recording_to_waveform_item(rec: &EcgRecording) -> Result<DataSet> {
 
 fn lead_source_item(lead: &crate::model::EcgLead) -> DataSet {
     let mut item = DataSet::new();
+    // A preserved foreign/private triple round-trips verbatim: it
+    // wins over the MDC-by-label guess below.
+    if let Some(src) = &lead.source_code {
+        item.put_text(tags::CODE_VALUE, Vr::Sh, src.value.clone());
+        item.put_text(tags::CODING_SCHEME_DESIGNATOR, Vr::Sh, src.scheme.clone());
+        item.put_text(tags::CODE_MEANING, Vr::Lo, src.meaning.clone());
+        return item;
+    }
     match lead
         .mdc_code
         .clone()
@@ -537,14 +545,25 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
             .and_then(|s| s.first()?.string(tags::CODE_VALUE))
             .unwrap_or("mV")
             .to_string();
-        let mdc_code = def
+        let source = def
             .sequence(tags::CHANNEL_SOURCE_SEQUENCE)
-            .and_then(|s| s.first())
-            .and_then(|s| {
-                (s.string(tags::CODING_SCHEME_DESIGNATOR) == Some("MDC"))
-                    .then(|| s.string(tags::CODE_VALUE).map(str::to_string))
-                    .flatten()
-            });
+            .and_then(|s| s.first().cloned());
+        let mdc_code = source.as_ref().and_then(|s| {
+            (s.string(tags::CODING_SCHEME_DESIGNATOR) == Some("MDC"))
+                .then(|| s.string(tags::CODE_VALUE).map(str::to_string))
+                .flatten()
+        });
+        // Non-MDC schemes (private/foreign) keep the full triple so
+        // re-encode emits the same code instead of an MDC-by-label
+        // guess; a missing source item leaves both unset.
+        let source_code = source.as_ref().and_then(|s| {
+            let scheme = s.string(tags::CODING_SCHEME_DESIGNATOR)?;
+            (scheme != "MDC").then(|| crate::model::ChannelSourceCode {
+                value: s.string(tags::CODE_VALUE).unwrap_or_default().to_string(),
+                scheme: scheme.to_string(),
+                meaning: s.string(tags::CODE_MEANING).unwrap_or_default().to_string(),
+            })
+        });
         let mut lead_samples = Vec::with_capacity(samples);
         for t in 0..samples {
             // u64 with an explicit bound: the product can exceed
@@ -579,6 +598,7 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
             correction_factor: num(tags::CHANNEL_SENSITIVITY_CORRECTION_FACTOR, 1.0),
             baseline: num(tags::CHANNEL_BASELINE, 0.0),
             mdc_code,
+            source_code,
             filter_low_hz: opt_num(tags::FILTER_LOW_FREQUENCY),
             filter_high_hz: opt_num(tags::FILTER_HIGH_FREQUENCY),
             notch_hz: opt_num(tags::NOTCH_FILTER_FREQUENCY),
@@ -621,7 +641,7 @@ fn waveform_bytes(item: &DataSet) -> Result<Vec<u8>> {
 /// Validated here: UID syntax for all four UID fields, Patient Sex
 /// (`M`/`F`/`O` when non-empty), Waveform Originality (in the item
 /// builder), the non-empty Type 1 Instance Number, and the
-/// per-SOP-class channel caps (12-lead ≤ 13, General ECG ≤ 12). Other
+/// per-SOP-class channel caps (12-lead ≤ 13, General ECG ≤ 24). Other
 /// free-text fields (dates, names, labels, descriptions) are the
 /// caller's responsibility and are written verbatim: garbage in,
 /// non-conformant out.
@@ -646,11 +666,11 @@ pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Resul
             "Patient Sex {sex:?} (want M, F, or O)"
         )));
     }
-    // Per-SOP-class channel caps (A.34.3.4.4 / A.34.5.4.3); other
+    // Per-SOP-class channel caps (A.34.3.4.4 / A.34.4.4.3); other
     // waveform SOP classes pass through uncapped.
     let cap = match meta.sop_class_uid.as_str() {
         SOP_12_LEAD_ECG => Some(13),
-        SOP_GENERAL_ECG => Some(12),
+        SOP_GENERAL_ECG => Some(24),
         _ => None,
     };
     if let Some(max) = cap
@@ -807,6 +827,29 @@ mod tests {
             assert_eq!(a.mdc_code, b.mdc_code);
         }
         assert_eq!(back.powerline_hz, Some(50.0));
+    }
+
+    #[test]
+    fn foreign_channel_source_round_trips_verbatim() {
+        // A private/foreign scheme on a standard-labeled channel must
+        // survive decode + re-encode — not become an MDC-by-label
+        // guess (MDC/2:2) or 99VYNA.
+        let mut rec = twelve_lead();
+        rec.leads[1].source_code = Some(crate::model::ChannelSourceCode {
+            value: "X".into(),
+            scheme: "99FOO".into(),
+            meaning: "Foreign lead II".into(),
+        });
+        let item = recording_to_waveform_item(&rec).unwrap();
+        let back = recording_from_waveform_item(&item).unwrap();
+        assert_eq!(back.leads[1].source_code, rec.leads[1].source_code);
+        assert_eq!(back.leads[1].mdc_code, None);
+        let again = recording_to_waveform_item(&back).unwrap();
+        let defs = again.sequence(tags::CHANNEL_DEFINITION_SEQUENCE).unwrap();
+        let src = defs[1].sequence(tags::CHANNEL_SOURCE_SEQUENCE).unwrap()[0].clone();
+        assert_eq!(src.string(tags::CODE_VALUE), Some("X"));
+        assert_eq!(src.string(tags::CODING_SCHEME_DESIGNATOR), Some("99FOO"));
+        assert_eq!(src.string(tags::CODE_MEANING), Some("Foreign lead II"));
     }
 
     #[test]
@@ -1201,7 +1244,8 @@ mod tests {
             recording_to_waveform_item(&rec),
             Err(Error::InvalidMeta(_))
         ));
-        // Channel caps: 12-lead <= 13, General <= 12.
+        // Channel caps: 12-lead <= 13 (A.34.3.4.4), General <= 24
+        // (A.34.4.4.3: 1-24, so >12-lead carts use General ECG).
         let many: Vec<EcgLead> = (0..14)
             .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
             .collect();
@@ -1210,19 +1254,24 @@ mod tests {
         assert!(recording_to_dataset(&rec14, &meta12).is_err());
         let mut meta_gen = dated_meta();
         meta_gen.sop_class_uid = SOP_GENERAL_ECG.to_string();
-        assert!(recording_to_dataset(&rec14, &meta_gen).is_err());
-        // Boundaries hold: 13 on 12-lead, 12 on General.
+        assert!(recording_to_dataset(&rec14, &meta_gen).is_ok());
+        // Boundaries hold: 13/14 on 12-lead, 24/25 on General.
         let thirteen: Vec<EcgLead> = (0..13)
             .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
             .collect();
         let rec13 = EcgRecording::new(thirteen, 500.0).unwrap();
         assert!(recording_to_dataset(&rec13, &dated_meta()).is_ok());
-        assert!(recording_to_dataset(&rec13, &meta_gen).is_err());
-        let twelve: Vec<EcgLead> = (0..12)
+        assert!(recording_to_dataset(&rec13, &meta_gen).is_ok());
+        let twenty_four: Vec<EcgLead> = (0..24)
             .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
             .collect();
-        let rec12 = EcgRecording::new(twelve, 500.0).unwrap();
-        assert!(recording_to_dataset(&rec12, &meta_gen).is_ok());
+        let rec24 = EcgRecording::new(twenty_four, 500.0).unwrap();
+        assert!(recording_to_dataset(&rec24, &meta_gen).is_ok());
+        let twenty_five: Vec<EcgLead> = (0..25)
+            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
+            .collect();
+        let rec25 = EcgRecording::new(twenty_five, 500.0).unwrap();
+        assert!(recording_to_dataset(&rec25, &meta_gen).is_err());
         // Unknown waveform SOPs pass through uncapped.
         let mut meta_other = dated_meta();
         meta_other.sop_class_uid = "1.2.840.10008.5.1.4.1.1.9.2.2".into();

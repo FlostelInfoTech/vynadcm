@@ -356,9 +356,9 @@ deidentify old.dcm --in-place   # rewrite via a temp file
 - `--date-offset DAYS` keeps longitudinal intervals across the whole
   batch (one UID map per run); without it, dates become `19000101`.
 - `--patient-id` / `--patient-name` set the dummy text stamped
-  into `Dummy`-action tags (Patient ID itself is emptied and
-  Patient's Name removed per E.1 `Z`/`X`); `--retain-private-tags`
-  keeps private groups.
+  into `Dummy`-action tags (Patient ID and Patient's Name themselves
+  are emptied per E.1 `Z`); `--retain-private-tags` keeps private
+  groups.
 - Files with Burned In Annotation `YES` are refused (pixels are
   never altered); file-meta UIDs follow the remapped dataset.
 

@@ -356,6 +356,9 @@ pub trait Handlers: Send + Sync {
     /// Dispatch fails dataset-less requests before this runs, so
     /// `query` always came from a real Identifier.
     /// Return a failure status with no matches to fail the whole FIND.
+    /// The status must be final (success/warning/failure/cancel):
+    /// `PENDING` is coerced to `SUCCESS` (with a warning logged), since
+    /// a PENDING final would hang the peer awaiting more matches.
     async fn on_find(&self, _ctx: &RequestContext<'_>, _query: &DataSet) -> (u16, Vec<DataSet>) {
         (status::SOP_CLASS_NOT_SUPPORTED, Vec::new())
     }
@@ -628,6 +631,7 @@ pub async fn run_scp<H: Handlers>(
             DimseEvent::Message(msg) => {
                 if let Err(e) = dispatch(assoc, handlers, opts, *msg).await {
                     tracing::warn!("SCP dispatch failed: {e}");
+                    // Best-effort: the dispatch error is the outcome.
                     assoc.abort(2, 0).await.ok();
                     return Err(e);
                 }
@@ -654,7 +658,45 @@ async fn dispatch<H: Handlers>(
         command: &msg.command,
     };
     let cmd = &msg.command;
-    let rsp_id = cmd.message_id.unwrap_or(0);
+    // Message ID is mandatory in requests (PS3.7): a response with ID
+    // 0 matches nothing on the peer, so fail closed (abort) instead of
+    // emitting an unroutable response. Exception: C-CANCEL-RQ carries
+    // only Message ID Being Responded To by design — but that must be
+    // present (the cancel arm never responds, so the 0 is unused).
+    let rsp_id = match cmd.message_id {
+        Some(id) => id,
+        None if cmd.field == CF::C_CANCEL_RQ => {
+            if cmd.message_id_rsp.is_none() {
+                return Err(Error::BadCommand(
+                    "C-CANCEL-RQ without Message ID Being Responded To".into(),
+                ));
+            }
+            0
+        }
+        None => {
+            return Err(Error::BadCommand(format!(
+                "request without Message ID ({})",
+                cmd.name()
+            )));
+        }
+    };
+    // The request must name the SOP Class its presentation context was
+    // negotiated for: anything else is cross-context service (handlers
+    // would serve Y while responses echo X).
+    let request_uid = match cmd.field {
+        CF::N_SET_RQ | CF::N_GET_RQ | CF::N_ACTION_RQ | CF::N_DELETE_RQ => {
+            &cmd.requested_sop_class_uid
+        }
+        _ => &cmd.affected_sop_class_uid,
+    };
+    if let Some(uid) = request_uid
+        && *uid != context.abstract_syntax
+    {
+        return Err(Error::BadCommand(format!(
+            "SOP Class {uid} requested on context negotiated for {}",
+            context.abstract_syntax
+        )));
+    }
 
     match cmd.field {
         CF::C_ECHO_RQ => {
@@ -732,6 +774,15 @@ async fn dispatch<H: Handlers>(
                     }
                 }
             }
+            // PENDING is not a final status: a handler returning it
+            // would hang the peer awaiting more matches, so coerce
+            // (loudly) to SUCCESS — the matches already sent stand.
+            let final_status = if status::is_pending(final_status) {
+                tracing::warn!("C-FIND handler returned PENDING as final; coercing to SUCCESS");
+                status::SUCCESS
+            } else {
+                final_status
+            };
             let rsp = Command::find_rsp(
                 rsp_id,
                 cmd.affected_sop_class_uid.clone(),
@@ -775,16 +826,30 @@ async fn dispatch<H: Handlers>(
             send_optional(assoc, ctx_id, rsp, ds).await?;
         }
         CF::N_GET_RQ => {
+            // The Requested SOP Instance UID is mandatory: without it
+            // the framework must not run the handler and echo a
+            // UID-less SUCCESS.
+            let (class, inst) = match (
+                cmd.requested_sop_class_uid.clone(),
+                cmd.requested_sop_instance_uid.clone(),
+            ) {
+                (Some(c), Some(i)) => (c, i),
+                _ => {
+                    let rsp = Command::n_get_rsp(
+                        rsp_id,
+                        cmd.requested_sop_class_uid.clone(),
+                        cmd.requested_sop_instance_uid.clone(),
+                        status::MISSING_ATTRIBUTE_VALUE,
+                        false,
+                    );
+                    assoc.send(ctx_id, &rsp, None).await?;
+                    return Ok(());
+                }
+            };
             let (s, ds) = handlers.on_n_get(&rctx).await;
             // Conformant requests carry Requested UIDs; the response
             // echoes them as Affected UIDs.
-            let rsp = Command::n_get_rsp(
-                rsp_id,
-                cmd.requested_sop_class_uid.clone(),
-                cmd.requested_sop_instance_uid.clone(),
-                s,
-                ds.is_some(),
-            );
+            let rsp = Command::n_get_rsp(rsp_id, Some(class), Some(inst), s, ds.is_some());
             assoc.send(ctx_id, &rsp, ds.as_ref()).await?;
         }
         CF::N_ACTION_RQ => {
@@ -818,18 +883,26 @@ async fn dispatch<H: Handlers>(
                 .await?;
         }
         CF::N_EVENT_REPORT_RQ => {
+            // Validate identity BEFORE the handler runs: committing a
+            // report the framework cannot route a response to lets the
+            // peer observe handler timing for instances it only guesses.
+            let Some(sop_class) = cmd.affected_sop_class_uid.clone() else {
+                return Err(Error::BadCommand(
+                    "N-EVENT-REPORT without Affected SOP Class UID".into(),
+                ));
+            };
+            let Some(sop_instance) = cmd.affected_sop_instance_uid.clone() else {
+                return Err(Error::BadCommand(
+                    "N-EVENT-REPORT without Affected SOP Instance UID".into(),
+                ));
+            };
             let s = handlers.on_n_event_report(&rctx, msg.dataset).await;
             // Event reports (unlike the other N-services) carry
             // Affected UIDs in the request itself.
             assoc
                 .send(
                     ctx_id,
-                    &Command::n_event_report_rsp(
-                        rsp_id,
-                        cmd.affected_sop_class_uid.clone(),
-                        cmd.affected_sop_instance_uid.clone(),
-                        s,
-                    ),
+                    &Command::n_event_report_rsp(rsp_id, Some(sop_class), Some(sop_instance), s),
                     None,
                 )
                 .await?;
@@ -846,9 +919,11 @@ async fn dispatch<H: Handlers>(
     Ok(())
 }
 
-/// Emit one SCP-initiated follow-up and await its RSP. Anything
-/// but the matching RSP (e.g. a release) is stashed for the
-/// dispatch loop — never swallowed.
+/// Emit one SCP-initiated follow-up and await its RSP, looping past
+/// strays (a single `recv` would orphan a late RSP to the dispatch
+/// loop, which A-ABORTs it). Strays hold aside under the twin budget
+/// and stash once the RSP lands — stashing inside the loop would
+/// replay them through `recv`'s pending-first queue forever.
 async fn emit_follow_up(assoc: &mut Association, ctx_id: u8, f: ScpFollowUp) -> Result<()> {
     let ScpFollowUp::EventReport {
         sop_class_uid,
@@ -865,28 +940,48 @@ async fn emit_follow_up(assoc: &mut Association, ctx_id: u8, f: ScpFollowUp) -> 
         dataset.is_some(),
     );
     assoc.send(ctx_id, &rq, dataset.as_ref()).await?;
-    match assoc.recv().await? {
-        DimseEvent::Message(m)
-            if m.command.field == CF::N_EVENT_REPORT_RSP
-                && m.command.message_id_rsp == Some(id) =>
-        {
-            tracing::debug!(
-                "follow-up N-EVENT-REPORT acked: {:#06X}",
-                m.command.status.unwrap_or(0)
-            );
-        }
-        DimseEvent::Released => {
-            assoc.stash(DimseEvent::Released)?;
-        }
-        DimseEvent::Message(other) => {
-            tracing::warn!(
-                "stashing {} instead of a follow-up RSP",
-                other.command.name()
-            );
-            assoc.stash(DimseEvent::Message(other))?;
+    let mut strays: Vec<DimseEvent> = Vec::new();
+    let mut strays_bytes: u64 = 0;
+    loop {
+        match assoc.recv().await? {
+            DimseEvent::Message(m)
+                if m.command.field == CF::N_EVENT_REPORT_RSP
+                    && m.command.message_id_rsp == Some(id) =>
+            {
+                for s in strays {
+                    assoc.stash(s)?;
+                }
+                tracing::debug!(
+                    "follow-up N-EVENT-REPORT acked: {:#06X}",
+                    m.command.status.unwrap_or(0)
+                );
+                return Ok(());
+            }
+            DimseEvent::Message(m) => {
+                if strays.len() >= MAX_STASHED_EVENTS {
+                    return Err(Error::TooManyStashed {
+                        limit: MAX_STASHED_EVENTS,
+                    });
+                }
+                let size = m.dataset.as_ref().map(|ds| ds.approx_bytes()).unwrap_or(0);
+                if strays_bytes.saturating_add(size) > MAX_STASHED_BYTES {
+                    return Err(Error::StashedTooLarge {
+                        limit: MAX_STASHED_BYTES,
+                    });
+                }
+                strays_bytes += size;
+                tracing::debug!("holding {} instead of a follow-up RSP", m.command.name());
+                strays.push(DimseEvent::Message(m));
+            }
+            DimseEvent::Released => {
+                for s in strays {
+                    assoc.stash(s)?;
+                }
+                assoc.stash(DimseEvent::Released)?;
+                return Ok(());
+            }
         }
     }
-    Ok(())
 }
 
 async fn send_optional(
@@ -951,6 +1046,13 @@ async fn handle_move<H: Handlers>(
         tracing::warn!("C-MOVE destination is not a valid AE title; failing");
         return fail_final(assoc, status::MOVE_DESTINATION_UNKNOWN).await;
     };
+    // Empty plan: SUCCESS with zero counts and no outbound association
+    // (a flaky-but-valid destination must not fail a zero-match retrieve).
+    if plan.total == 0 {
+        let rsp = Command::move_get_rsp(true, rsp_id, sop, status::SUCCESS, 0, 0, 0, 0);
+        assoc.send(ctx_id, &rsp, None).await?;
+        return Ok(());
+    }
     let Ok(proposed) = propose(&classes, &ts) else {
         tracing::warn!("C-MOVE proposes too many storage classes; failing");
         return fail_final(assoc, status::PROCESSING_FAILURE).await;
@@ -959,7 +1061,8 @@ async fn handle_move<H: Handlers>(
         &move_cfg.assoc_options,
         &move_cfg.calling_ae,
         &dest_ae,
-        &format!("{host}:{port}"),
+        // Tuple form: pre-joined "host:port" mis-parses IPv6 literals.
+        (host.as_str(), port),
         proposed,
     )
     .await
@@ -979,7 +1082,7 @@ async fn handle_move<H: Handlers>(
         let remaining = u16::try_from(plan.total.saturating_sub(i + 1)).unwrap_or(u16::MAX);
         let outcome = match plan.load(i).await {
             RetrieveLoad::Ready(inst) => Some(
-                outbound
+                match outbound
                     .store(
                         &inst.dataset,
                         &inst.sop_class_uid,
@@ -987,7 +1090,29 @@ async fn handle_move<H: Handlers>(
                         priority::MEDIUM,
                     )
                     .await
-                    .unwrap_or(status::PROCESSING_FAILURE),
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // Transport death, not a store failure: release and
+                        // fail the whole MOVE. Looping on would block a full
+                        // read_timeout per remaining instance on a dead socket.
+                        tracing::warn!("C-MOVE outbound transport failed: {e}");
+                        // Best-effort: the transport is known-dead already.
+                        outbound.release().await.ok();
+                        let rsp = Command::move_get_rsp(
+                            true,
+                            rsp_id,
+                            sop,
+                            status::PROCESSING_FAILURE,
+                            remaining,
+                            done_ok,
+                            done_fail,
+                            done_warn,
+                        );
+                        assoc.send(ctx_id, &rsp, None).await?;
+                        return Ok(());
+                    }
+                },
             ),
             RetrieveLoad::Failed => {
                 done_fail = done_fail.saturating_add(1);
@@ -1017,10 +1142,12 @@ async fn handle_move<H: Handlers>(
         match poll_cancel(assoc, rsp_id).await? {
             CancelPoll::KeepGoing => {}
             CancelPoll::Released => {
+                // Best-effort: the inbound side is gone; outcome fixed.
                 outbound.release().await.ok();
                 return Ok(());
             }
             CancelPoll::Cancelled => {
+                // Best-effort: the CANCEL final below is the outcome.
                 outbound.release().await.ok();
                 let rsp = Command::move_get_rsp(
                     true,
@@ -1037,6 +1164,8 @@ async fn handle_move<H: Handlers>(
             }
         }
     }
+    // Best-effort: all sub-operations concluded; the final below stands
+    // regardless of whether the goodbye handshake completes.
     outbound.release().await.ok();
     // A SUCCESS final with failed sub-operations lies to the caller;
     // PS3.4 C.4.2/C.4.3 report B000 instead.
@@ -1219,6 +1348,26 @@ async fn handle_get<H: Handlers>(
             done_warn,
         );
         assoc.send(ctx_id, &rsp, None).await?;
+        // Like MOVE: poll after every PENDING so a cancel arriving
+        // after the final sub-op is honored (CANCEL, not SUCCESS).
+        match poll_cancel(assoc, rsp_id).await? {
+            CancelPoll::KeepGoing => {}
+            CancelPoll::Released => return Ok(()),
+            CancelPoll::Cancelled => {
+                let rsp = Command::move_get_rsp(
+                    false,
+                    rsp_id,
+                    sop.clone(),
+                    status::CANCEL,
+                    remaining,
+                    done_ok,
+                    done_fail,
+                    done_warn,
+                );
+                assoc.send(ctx_id, &rsp, None).await?;
+                return Ok(());
+            }
+        }
     }
     // See handle_move: failures surface as B000, never SUCCESS.
     let final_status = if done_fail > 0 {
@@ -1249,7 +1398,219 @@ pub(crate) fn default_read_timeout() -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::association::{AssociationOptions, AsyncReadWrite};
     use crate::pdu::{AssociateRq, ProposedContext};
+    use std::sync::Mutex;
+    use vyna_dcm_core::TransferSyntax;
+
+    /// SCP-side association over a duplex half, with one negotiated
+    /// context for `sop`. Returns the association plus the peer half
+    /// for observing responses.
+    fn duplex_scp(sop: &str) -> (Association, tokio::io::DuplexStream, NegotiatedContext) {
+        let (a, b) = tokio::io::duplex(65536);
+        let ctx = NegotiatedContext {
+            id: 1,
+            abstract_syntax: sop.to_string(),
+            transfer_syntax: TransferSyntax::ExplicitVrLittleEndian,
+            transfer_syntax_uid: TransferSyntax::ExplicitVrLittleEndian.uid().to_string(),
+        };
+        let info = AssociationInfo {
+            local_ae: AeTitle::new("SCP").unwrap(),
+            peer_ae: AeTitle::new("SCU").unwrap(),
+            peer_max_pdu: 0,
+        };
+        let opts = AssociationOptions::default();
+        (
+            Association::from_accepted(
+                Box::new(a) as Box<dyn AsyncReadWrite>,
+                info,
+                vec![ctx.clone()],
+                &opts,
+            ),
+            b,
+            ctx,
+        )
+    }
+
+    struct ProbeHandlers {
+        find_final: u16,
+        find_matches: Vec<DataSet>,
+        n_get_called: Mutex<bool>,
+        event_called: Mutex<bool>,
+    }
+
+    impl Handlers for ProbeHandlers {
+        async fn on_find(
+            &self,
+            _ctx: &RequestContext<'_>,
+            _query: &DataSet,
+        ) -> (u16, Vec<DataSet>) {
+            (self.find_final, self.find_matches.clone())
+        }
+
+        async fn on_n_get(&self, _ctx: &RequestContext<'_>) -> (u16, Option<DataSet>) {
+            *self.n_get_called.lock().unwrap() = true;
+            (status::SUCCESS, None)
+        }
+
+        async fn on_n_event_report(
+            &self,
+            _ctx: &RequestContext<'_>,
+            _dataset: Option<DataSet>,
+        ) -> u16 {
+            *self.event_called.lock().unwrap() = true;
+            status::SUCCESS
+        }
+    }
+
+    /// Read response statuses from the peer half until a final.
+    async fn rsp_statuses(peer: &mut Association, field: u16, id: u16) -> Vec<u16> {
+        let mut out = Vec::new();
+        loop {
+            let m = peer.recv().await.unwrap();
+            let DimseEvent::Message(m) = m else {
+                panic!("released")
+            };
+            assert_eq!(m.command.field, field);
+            assert_eq!(m.command.message_id_rsp, Some(id));
+            let s = m.command.status.unwrap();
+            out.push(s);
+            if !status::is_pending(s) {
+                return out;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_idless_and_cross_context_requests() {
+        let handlers = ProbeHandlers {
+            find_final: status::SUCCESS,
+            find_matches: vec![],
+            n_get_called: Mutex::new(false),
+            event_called: Mutex::new(false),
+        };
+        let opts = ScpOptions::default();
+        // No Message ID: fail closed, no unroutable response.
+        let (mut assoc, _b, ctx) = duplex_scp("1.2.840.10008.1.1");
+        let mut cmd = Command::echo_rq(1);
+        cmd.message_id = None;
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: cmd,
+            dataset: None,
+        };
+        let err = dispatch(&mut assoc, &handlers, &opts, msg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadCommand(_)), "{err:?}");
+        // SOP Class outside the negotiated context: fail closed.
+        let (mut assoc, _b, ctx) = duplex_scp("1.2.840.10008.5.1.4.1.1.2");
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: Command::find_rq(7, priority::MEDIUM, "1.2.840.10008.5.1.4.1.1.4"),
+            dataset: Some(DataSet::new()),
+        };
+        let err = dispatch(&mut assoc, &handlers, &opts, msg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadCommand(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn find_pending_final_coerces_to_success() {
+        let mut one = DataSet::new();
+        one.put_text(
+            vyna_dcm_core::tags::PATIENT_NAME,
+            vyna_dcm_core::Vr::Pn,
+            "Doe^Jane",
+        );
+        let handlers = ProbeHandlers {
+            find_final: status::PENDING,
+            find_matches: vec![one],
+            n_get_called: Mutex::new(false),
+            event_called: Mutex::new(false),
+        };
+        let opts = ScpOptions::default();
+        let sop = "1.2.840.10008.5.1.4.1.2.2.1";
+        let (mut assoc, b, ctx) = duplex_scp(sop);
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: Command::find_rq(3, priority::MEDIUM, sop),
+            dataset: Some(DataSet::new()),
+        };
+        dispatch(&mut assoc, &handlers, &opts, msg).await.unwrap();
+        drop(assoc);
+        let info = AssociationInfo {
+            local_ae: AeTitle::new("SCU").unwrap(),
+            peer_ae: AeTitle::new("SCP").unwrap(),
+            peer_max_pdu: 0,
+        };
+        let mut peer = Association::from_accepted(
+            Box::new(b) as Box<dyn AsyncReadWrite>,
+            info,
+            vec![ctx],
+            &AssociationOptions::default(),
+        );
+        // One PENDING-with-dataset, then a SUCCESS final (not PENDING).
+        assert_eq!(
+            rsp_statuses(&mut peer, CF::C_FIND_RSP, 3).await,
+            vec![status::PENDING, status::SUCCESS]
+        );
+    }
+
+    #[tokio::test]
+    async fn n_services_validate_identity_before_handlers() {
+        let handlers = ProbeHandlers {
+            find_final: status::SUCCESS,
+            find_matches: vec![],
+            n_get_called: Mutex::new(false),
+            event_called: Mutex::new(false),
+        };
+        let opts = ScpOptions::default();
+        // N-GET without Requested SOP Instance UID: 0121, no handler run.
+        let sop = "1.2.840.10008.3.1.2.3.1";
+        let (mut assoc, b, ctx) = duplex_scp(sop);
+        let mut cmd = Command::n_get_rq(5, sop, "1.2.9", vec![]);
+        cmd.requested_sop_instance_uid = None;
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: cmd,
+            dataset: None,
+        };
+        dispatch(&mut assoc, &handlers, &opts, msg).await.unwrap();
+        assert!(!*handlers.n_get_called.lock().unwrap());
+        drop(assoc);
+        let info = AssociationInfo {
+            local_ae: AeTitle::new("SCU").unwrap(),
+            peer_ae: AeTitle::new("SCP").unwrap(),
+            peer_max_pdu: 0,
+        };
+        let mut peer = Association::from_accepted(
+            Box::new(b) as Box<dyn AsyncReadWrite>,
+            info,
+            vec![ctx],
+            &AssociationOptions::default(),
+        );
+        assert_eq!(
+            rsp_statuses(&mut peer, CF::N_GET_RSP, 5).await,
+            vec![status::MISSING_ATTRIBUTE_VALUE]
+        );
+        // N-EVENT-REPORT without Affected UIDs: abort, no handler run.
+        let sop = "1.2.840.10008.1.20.1";
+        let (mut assoc, _b, ctx) = duplex_scp(sop);
+        let mut cmd = Command::n_event_report_rq(6, sop, "1.2.8", 1, false);
+        cmd.affected_sop_instance_uid = None;
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: cmd,
+            dataset: None,
+        };
+        let err = dispatch(&mut assoc, &handlers, &opts, msg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadCommand(_)), "{err:?}");
+        assert!(!*handlers.event_called.lock().unwrap());
+    }
 
     fn sample_rq() -> AssociateRq {
         AssociateRq {

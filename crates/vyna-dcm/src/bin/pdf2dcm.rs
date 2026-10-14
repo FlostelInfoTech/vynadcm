@@ -145,12 +145,6 @@ fn run(args: &Args) -> i32 {
             return 1;
         }
     };
-    if !pdf.starts_with(b"%PDF-") {
-        eprintln!(
-            "pdf2dcm: warning: {} does not start with %PDF- magic",
-            args.input.display()
-        );
-    }
     let patient_name = match PersonName::try_parse(&args.patient_name) {
         Ok(n) => n,
         Err(e) => {
@@ -171,7 +165,18 @@ fn run(args: &Args) -> i32 {
     meta.content_date = args.content_date.clone();
     meta.content_time = args.content_time.clone();
     meta.acquisition_datetime = args.acquisition_datetime.clone();
-    meta.referring_physician = args.referring_physician.as_deref().map(PersonName::parse);
+    // Strict parse like --patient-name: user input must fail on
+    // truncation (backslash, over-count groups/components), not
+    // silently keep `Back` out of `Back\Slash`.
+    if let Some(name) = &args.referring_physician {
+        match PersonName::try_parse(name) {
+            Ok(n) => meta.referring_physician = Some(n),
+            Err(e) => {
+                eprintln!("pdf2dcm: bad --referring-physician: {e}");
+                return 1;
+            }
+        }
+    }
     meta.title = args.title.clone().or_else(|| {
         args.input
             .file_name()
@@ -239,4 +244,59 @@ fn run(args: &Args) -> i32 {
             .unwrap_or_default()
     );
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args_for(input: &std::path::Path, output: &std::path::Path, extra: &[&str]) -> Args {
+        let mut argv = vec![
+            "pdf2dcm".to_string(),
+            input.to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+        ];
+        argv.extend(extra.iter().map(|s| s.to_string()));
+        Args::try_parse_from(argv).unwrap()
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("pdf2dcm-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn referring_physician_parse_failure_is_exit_1() {
+        let dir = scratch("phys");
+        let input = dir.join("in.pdf");
+        let output = dir.join("out.dcm");
+        std::fs::write(&input, b"%PDF-1.4\ntrailer\n").unwrap();
+        // A backslash is two PN values, not one: fail like
+        // --patient-name does instead of silently keeping `Back`.
+        let args = args_for(&input, &output, &["--referring-physician", "Back\\Slash"]);
+        assert_eq!(run(&args), 1);
+        assert!(!output.exists());
+        let dir = scratch("phys-ok");
+        let input = dir.join("in.pdf");
+        let output = dir.join("out.dcm");
+        std::fs::write(&input, b"%PDF-1.4\ntrailer\n").unwrap();
+        let args = args_for(&input, &output, &["--referring-physician", "Ref^Erin"]);
+        assert_eq!(run(&args), 0);
+        assert!(output.exists());
+    }
+
+    #[test]
+    fn non_pdf_input_fails_once_from_the_builder() {
+        let dir = scratch("nonpdf");
+        let input = dir.join("in.pdf");
+        let output = dir.join("out.dcm");
+        std::fs::write(&input, b"definitely not a pdf").unwrap();
+        let args = args_for(&input, &output, &[]);
+        // Exit 1 with the builder's "not a PDF file" error (the old
+        // pre-check warning is gone: one cause, one message).
+        assert_eq!(run(&args), 1);
+        assert!(!output.exists());
+    }
 }

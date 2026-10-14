@@ -37,9 +37,12 @@ impl NameComponents {
 
     fn parse(group: &str) -> Self {
         // Lossy fallback for the decode path: keep the first five,
-        // drop the rest (dirty files must still read).
+        // drop the rest (dirty files must still read). Only trailing
+        // padding is insignificant (PS3.5 §6.2): leading spaces like
+        // " van Gogh" are data, so trim_end, never trim.
         let mut parts = group.split('^');
-        let take = |it: &mut std::str::Split<'_, char>| it.next().unwrap_or("").trim().to_string();
+        let take =
+            |it: &mut std::str::Split<'_, char>| it.next().unwrap_or("").trim_end().to_string();
         Self {
             family: take(&mut parts),
             given: take(&mut parts),
@@ -51,7 +54,9 @@ impl NameComponents {
 
     fn try_parse(group: &str) -> Result<Self, Error> {
         let mut parts = group.split('^');
-        let take = |it: &mut std::str::Split<'_, char>| it.next().unwrap_or("").trim().to_string();
+        // trim_end only: leading spaces are significant (see parse).
+        let take =
+            |it: &mut std::str::Split<'_, char>| it.next().unwrap_or("").trim_end().to_string();
         let out = Self {
             family: take(&mut parts),
             given: take(&mut parts),
@@ -138,7 +143,8 @@ impl PersonName {
     }
 
     /// Strict parse: rejects backslashes (split multi-valued names
-    /// first), groups past the 3rd, and components past the 5th.
+    /// first), groups past the 3rd, components past the 5th, and any
+    /// group longer than 64 characters (PS3.5 §6.2).
     pub fn try_parse(s: &str) -> Result<Self, Error> {
         if s.contains('\\') {
             return Err(Error::Parse(
@@ -162,7 +168,27 @@ impl PersonName {
         if groups.next().is_some() {
             return Err(Error::Parse("PN has more than 3 groups".into()));
         }
+        // PS3.5 caps each group (delimiters included) at 64 characters;
+        // overlong user input must fail here, not encode non-conformant.
+        for g in [&out.alphabetic]
+            .into_iter()
+            .chain(out.ideographic.as_ref())
+            .chain(out.phonetic.as_ref())
+        {
+            if g.to_dicom_string().chars().count() > 64 {
+                return Err(Error::Parse("PN group exceeds 64 characters".into()));
+            }
+        }
         Ok(out)
+    }
+
+    /// True when the name renders as an empty string (empty
+    /// alphabetic group, no ideographic/phonetic groups). Mirrors the
+    /// [`Value`](crate::Value) text emptiness rule so blank values
+    /// agree across VRs.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.alphabetic.is_empty() && self.ideographic.is_none() && self.phonetic.is_none()
     }
 
     /// Encode back to a DICOM `PN` string.
@@ -202,8 +228,8 @@ impl PersonName {
     pub fn from_parts(family: &str, given: &str) -> Self {
         Self {
             alphabetic: NameComponents {
-                family: family.trim().to_string(),
-                given: given.trim().to_string(),
+                family: family.trim_end().to_string(),
+                given: given.trim_end().to_string(),
                 ..NameComponents::default()
             },
             ..Self::default()
@@ -228,6 +254,7 @@ impl FromStr for PersonName {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Value;
 
     #[test]
     fn parses_five_components() {
@@ -243,6 +270,10 @@ mod tests {
         assert!(PersonName::try_parse("A^B^C^D^E^F").is_err());
         assert!(PersonName::try_parse("a=b=c=d").is_err());
         assert!(PersonName::try_parse("A\\B").is_err());
+        // PS3.5 caps each group at 64 characters (delimiters count).
+        assert!(PersonName::try_parse(&"A".repeat(65)).is_err());
+        assert!(PersonName::try_parse(&format!("{}={}", "B".repeat(65), "x")).is_err());
+        assert!(PersonName::try_parse(&"C".repeat(64)).is_ok());
         assert!(PersonName::try_parse("A^B^C^D^E=a=b").is_ok());
         // Lossy parse keeps its documented truncation (decode path).
         let pn = PersonName::parse("A^B^C^D^E^F=a=b=c=d");
@@ -251,6 +282,29 @@ mod tests {
         let pn = PersonName::parse("Doe^Jane\\Smith^John");
         assert_eq!(pn.to_dicom_string(), "Doe^Jane");
         assert!(!pn.to_dicom_string().contains('\\'));
+    }
+
+    #[test]
+    fn leading_spaces_are_significant() {
+        // Only trailing value padding strips; " van Gogh" keeps its space.
+        let pn = PersonName::parse(" van Gogh^Vincent");
+        assert_eq!(pn.alphabetic.family, " van Gogh");
+        assert_eq!(pn.to_dicom_string(), " van Gogh^Vincent");
+        let pn = PersonName::try_parse(" van Gogh^Vincent  ").unwrap();
+        assert_eq!(pn.to_dicom_string(), " van Gogh^Vincent");
+        assert_eq!(
+            PersonName::from_parts(" van Gogh", "Vincent").to_dicom_string(),
+            " van Gogh^Vincent"
+        );
+    }
+
+    #[test]
+    fn empty_name_renders_empty() {
+        assert!(PersonName::parse("").is_empty());
+        assert!(PersonName::parse("== ").is_empty());
+        assert!(!PersonName::parse("Doe^Jane").is_empty());
+        assert!(Value::PersonName(vec![PersonName::parse("")]).is_empty());
+        assert!(!Value::PersonName(vec![PersonName::parse("A")]).is_empty());
     }
 
     #[test]

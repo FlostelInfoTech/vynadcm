@@ -184,10 +184,17 @@ let acceptor = AcceptorOptions {
     ..Default::default()
 };
 let handlers = Arc::new(StoreScp);
+// Bound concurrency: an unbounded spawn-per-accept lets a peer hold
+// arbitrary associations (the bins cap at `MAX_SCP_ASSOCIATIONS` = 1024).
+let slots = Arc::new(tokio::sync::Semaphore::new(1024));
 loop {
     let Ok((tcp, _)) = listener.accept().await else { continue };
+    let Ok(permit) = slots.clone().try_acquire_owned() else {
+        continue; // saturated: drop the peer, keep serving
+    };
     let (a, h) = (acceptor.clone(), handlers.clone());
     tokio::spawn(async move {
+        let _permit = permit;
         accept(tcp, &a, &*h, &ScpOptions::default()).await.ok();
     });
 }
@@ -282,7 +289,7 @@ for raw bytes, or `wado_uri_dataset(...)` parsed; set `content_type`,
 
 ## 9. DICOMweb server
 
-Serve a `DicomWebStore` (use `MemoryStore`, or implement the six-method
+Serve a `DicomWebStore` (use `MemoryStore`, or implement the nine-method
 trait over your own archive) behind the hyper front end:
 
 ```rust
@@ -294,10 +301,22 @@ use vyna_dcm::web::server::MemoryStore;
 let store = Arc::new(MemoryStore::new());
 let listener = TcpListener::bind("127.0.0.1:8080").await.unwrap();
 let base = "http://127.0.0.1:8080/dicom-web".to_string();
+// Bound concurrency like the SCP bins do (`MAX_SCP_ASSOCIATIONS` = 1024):
+// unbounded spawn-per-accept lets one peer hold every connection.
+let slots = Arc::new(tokio::sync::Semaphore::new(1024));
 loop {
-    let Ok((tcp, _)) = listener.accept().await else { break };
+    let Ok((tcp, _)) = listener.accept().await else {
+        // Back off and keep serving: a transient failure (EMFILE)
+        // must not kill the server.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        continue;
+    };
+    let Ok(permit) = slots.clone().try_acquire_owned() else {
+        continue; // saturated: drop the peer, keep serving
+    };
     let (s, b) = (store.clone(), base.clone());
     tokio::spawn(async move {
+        let _permit = permit;
         serve_connection(s, b, tcp).await.ok();
     });
 }

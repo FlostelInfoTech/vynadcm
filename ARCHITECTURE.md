@@ -160,7 +160,7 @@ The physics convention follows PS3.3 C.10.9:
 
 ## vyna-dcm-deid — de-identification
 
-- `profile.rs` — `Action` enum + 197-tag `BASIC_PROFILE` (PS3.15 E
+- `profile.rs` — `Action` enum + 636-row `BASIC_PROFILE` (PS3.15 E
   semantics; curated subset, Type-disciplined).
 - `engine.rs` — `Deidentifier` (dummies, UID map, date offset,
   private retention) + `DeidReport`; `dates.rs` holds the
@@ -192,8 +192,10 @@ The physics convention follows PS3.3 C.10.9:
 
 ## Cross-cutting conventions
 
-- **Errors**: each crate has `error.rs` with a thiserror `Error` and a
-  `Result<T>` alias; `#![warn(missing_docs)]` is on everywhere.
+- **Errors**: each `vyna-dcm-*` crate except `iod` has `error.rs`
+  with a thiserror `Error` and a `Result<T>` alias (`iod::validate`
+  returns `Option<Report>` instead; the `openjp2` fork has its own
+  layout); `#![warn(missing_docs)]` is on everywhere.
 - **No panics on input**: decoders validate lengths/VRs and return
   errors; PDU sizes are capped (`max_incoming_pdu`, default 64 MiB).
 - **Determinism**: encoders emit canonical byte order; dataset, Part-10

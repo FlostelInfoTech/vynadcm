@@ -14,7 +14,7 @@
 
 use base64::Engine;
 use serde_json::{Map, Value as Json, json};
-use vyna_dcm_core::{DataElement, DataSet, PersonName, Tag, Value, Vr};
+use vyna_dcm_core::{DataElement, DataSet, FragmentSequence, PersonName, Tag, Value, Vr};
 
 use crate::{Error, Result};
 
@@ -199,6 +199,46 @@ pub(crate) fn allows_inline_binary(vr: Vr) -> bool {
     )
 }
 
+/// Re-split joined `InlineBinary` bytes into per-frame fragments using
+/// the `BasicOffsetTable` the exporter writes. The table must start at
+/// 0, increase strictly, and stay within the decoded bytes; anything
+/// else errors (no silent fallback to framing-less bytes).
+fn split_fragments(tag: Tag, bytes: &[u8], table: &Json) -> Result<Value> {
+    let bad = |m: &str| Error::Json(format!("{tag}: bad BasicOffsetTable ({m})"));
+    let arr = table.as_array().ok_or_else(|| bad("not an array"))?;
+    if arr.is_empty() {
+        return Err(bad("empty"));
+    }
+    let mut offsets = Vec::with_capacity(arr.len());
+    for o in arr {
+        let n = o.as_u64().ok_or_else(|| bad("not uints"))?;
+        let n = usize::try_from(n).map_err(|_| bad("offset out of range"))?;
+        if n > bytes.len() {
+            return Err(bad("offset past end"));
+        }
+        if offsets.last().is_some_and(|prev| n <= *prev) {
+            return Err(bad("not strictly increasing"));
+        }
+        offsets.push(n);
+    }
+    if offsets[0] != 0 {
+        return Err(bad("must start at 0"));
+    }
+    let mut fragments = Vec::with_capacity(offsets.len());
+    for (i, start) in offsets.iter().enumerate() {
+        let end = offsets.get(i + 1).copied().unwrap_or(bytes.len());
+        fragments.push(bytes[*start..end].to_vec());
+    }
+    let mut table = Vec::with_capacity(offsets.len());
+    for o in &offsets {
+        table.push(u32::try_from(*o).map_err(|_| bad("offset out of range"))?);
+    }
+    Ok(Value::Fragments(FragmentSequence {
+        basic_offset_table: table,
+        fragments,
+    }))
+}
+
 fn element_from_json_depth(tag: Tag, obj: &Json, depth: usize) -> Result<DataElement> {
     let obj = obj
         .as_object()
@@ -211,14 +251,27 @@ fn element_from_json_depth(tag: Tag, obj: &Json, depth: usize) -> Result<DataEle
         .map_err(|_| Error::Json(format!("{tag}: bad vr")))?;
 
     if let Some(b64) = obj.get("InlineBinary").and_then(Json::as_str) {
+        // Annex F carries one form per value object (mirrors the XML rule).
+        if obj.contains_key("Value") {
+            return Err(Error::Json(format!(
+                "{tag}: InlineBinary and Value are mutually exclusive"
+            )));
+        }
         let bytes = B64.decode(b64).map_err(|e| Error::Base64(e.to_string()))?;
         if !allows_inline_binary(vr) {
             return Err(Error::Json(format!(
                 "{tag}: InlineBinary not allowed for {vr}"
             )));
         }
-        // Fragments cannot be distinguished from bytes in the compact form;
-        // keep bytes (callers re-fragment for encapsulated syntaxes).
+        // Fragment framing round-trips: the exporter writes joined bytes
+        // plus the table, so a present table re-splits them into frames.
+        // Other VRs ignore the member (bytes, as before).
+        if matches!(vr, Vr::Ob | Vr::Ow)
+            && let Some(table) = obj.get("BasicOffsetTable")
+        {
+            let fragments = split_fragments(tag, &bytes, table)?;
+            return Ok(DataElement::new(tag, vr, fragments));
+        }
         return Ok(DataElement::new(tag, vr, Value::Bytes(bytes)));
     }
 
@@ -389,6 +442,56 @@ fn nonfinite_token(v: &Json) -> Option<f64> {
 mod tests {
     use super::*;
     use vyna_dcm_core::tags;
+
+    #[test]
+    fn inline_binary_and_value_are_mutually_exclusive() {
+        let v: Json =
+            serde_json::from_str(r#"{"7FE00010":{"vr":"OW","InlineBinary":"AQI=","Value":[1,2]}}"#)
+                .unwrap();
+        let err = dataset_from_json(&v).unwrap_err();
+        assert!(err.to_string().contains("mutually exclusive"), "{err}");
+    }
+
+    #[test]
+    fn basic_offset_table_resplits_fragments() {
+        // Export writes joined bytes + table; import must restore framing.
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::new(
+            tags::PIXEL_DATA,
+            Vr::Ow,
+            Value::Fragments(FragmentSequence {
+                basic_offset_table: vec![0, 4],
+                fragments: vec![vec![1u8, 2, 3, 4], vec![5u8, 6]],
+            }),
+        ));
+        let json = dataset_to_json(&ds);
+        let back = dataset_from_json(&json).unwrap();
+        match &back.get(tags::PIXEL_DATA).unwrap().value {
+            Value::Fragments(f) => {
+                assert_eq!(f.basic_offset_table, vec![0, 4]);
+                assert_eq!(f.fragments, vec![vec![1u8, 2, 3, 4], vec![5u8, 6]]);
+            }
+            other => panic!("{other:?}"),
+        }
+        // Malformed tables error rather than silently dropping framing.
+        for table in ["[]", "[4]", "[0,0]", "[0,99]", "[\"x\"]", "{}"] {
+            let v: Json = serde_json::from_str(&format!(
+                "{{\"7FE00010\":{{\"vr\":\"OW\",\"InlineBinary\":\"AQI=\",\"BasicOffsetTable\":{table}}}}}"
+            ))
+            .unwrap();
+            assert!(dataset_from_json(&v).is_err(), "{table}");
+        }
+        // Other InlineBinary-capable VRs ignore the member (bytes).
+        let v: Json = serde_json::from_str(
+            r#"{"7FE00008":{"vr":"OD","InlineBinary":"AQI=","BasicOffsetTable":[0,1]}}"#,
+        )
+        .unwrap();
+        let back = dataset_from_json(&v).unwrap();
+        assert!(matches!(
+            back.get(Tag::new(0x7FE0, 0x0008)).unwrap().value,
+            Value::Bytes(_)
+        ));
+    }
 
     #[test]
     fn pn_three_groups_roundtrip() {

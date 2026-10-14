@@ -104,6 +104,9 @@ pub mod status {
     pub const DATASET_MISMATCH: u16 = 0xA900;
     /// Failure: move destination unknown.
     pub const MOVE_DESTINATION_UNKNOWN: u16 = 0xA801;
+    /// Failure: a mandatory (Type 1) attribute is missing — e.g. the
+    /// Requested SOP Instance UID of an N-service request.
+    pub const MISSING_ATTRIBUTE_VALUE: u16 = 0x0121;
 
     /// `0x0000`.
     #[must_use]

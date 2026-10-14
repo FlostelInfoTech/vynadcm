@@ -42,16 +42,19 @@ pub struct HttpRequest {
     pub body: Bytes,
 }
 
-// Manual `Debug`: embedders log requests, so the `Authorization`
-// credential stays out and the (possibly PHI-carrying, possibly
-// huge) body shows as a length only.
+// Manual `Debug`: embedders log requests, so credentials stay out
+// (`Authorization`, session cookies) and the (possibly
+// PHI-carrying, possibly huge) body shows as a length only.
 impl std::fmt::Debug for HttpRequest {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let headers: HashMap<&str, &str> = self
             .headers
             .iter()
             .map(|(k, v)| {
-                let v = if k == "authorization" || k == "proxy-authorization" {
+                let v = if matches!(
+                    k.as_str(),
+                    "authorization" | "proxy-authorization" | "cookie" | "set-cookie"
+                ) {
                     "<redacted>"
                 } else {
                     v.as_str()
@@ -76,8 +79,9 @@ pub struct HttpResponse {
     pub status: u16,
     /// Response headers.
     pub headers: Vec<(String, String)>,
-    /// Body bytes.
-    pub body: Vec<u8>,
+    /// Body bytes (shared: bulk/instance payloads are not copied
+    /// per response).
+    pub body: Bytes,
 }
 
 impl HttpResponse {
@@ -87,7 +91,7 @@ impl HttpResponse {
         Self {
             status,
             headers: vec![("content-type".into(), "application/dicom+json".into())],
-            body: serde_json::to_vec(value).unwrap_or_default(),
+            body: Bytes::from(serde_json::to_vec(value).unwrap_or_default()),
         }
     }
 
@@ -97,28 +101,45 @@ impl HttpResponse {
         Self {
             status,
             headers: vec![("content-type".into(), "text/plain".into())],
-            body: message.into().into_bytes(),
+            body: Bytes::from(message.into().into_bytes()),
         }
     }
 
     /// `multipart/related` response.
-    #[must_use]
-    pub fn multipart(parts: &[Part], root_type: &str) -> Self {
-        let (content_type, body) = encode_multipart(parts, &new_boundary(), root_type);
-        Self {
+    ///
+    /// Fails when a part header carries CR/LF (framing injection)
+    /// — embedder-supplied parts are not trusted.
+    pub fn multipart(parts: &[Part], root_type: &str) -> std::result::Result<Self, String> {
+        let (content_type, body) =
+            encode_multipart(parts, &new_boundary(), root_type).map_err(|e| e.to_string())?;
+        Ok(Self {
             status: 200,
             headers: vec![("content-type".into(), content_type)],
-            body,
+            body: Bytes::from(body),
+        })
+    }
+
+    /// `405 Method Not Allowed` with the `Allow` header RFC 9110
+    /// §15.5.5 wants (this API speaks GET and POST only).
+    #[must_use]
+    pub fn method_not_allowed() -> Self {
+        Self {
+            status: 405,
+            headers: vec![
+                ("content-type".into(), "text/plain".into()),
+                ("allow".into(), "GET, POST".into()),
+            ],
+            body: Bytes::from_static(b"method not allowed"),
         }
     }
 
     /// Raw-bytes response.
     #[must_use]
-    pub fn bytes(status: u16, content_type: impl Into<String>, body: Vec<u8>) -> Self {
+    pub fn bytes(status: u16, content_type: impl Into<String>, body: impl Into<Bytes>) -> Self {
         Self {
             status,
             headers: vec![("content-type".into(), content_type.into())],
-            body,
+            body: body.into(),
         }
     }
 }
@@ -156,6 +177,9 @@ pub struct StoredIds {
     pub series: String,
     /// SOP Instance UID.
     pub instance: String,
+    /// SOP Class UID (dataset, else file meta): feeds the STOW
+    /// response `ReferencedSOPSequence`.
+    pub sop_class: String,
 }
 
 /// DICOMweb storage backend.
@@ -170,8 +194,17 @@ pub trait DicomWebStore: Send + Sync {
         offset: usize,
     ) -> Vec<DataSet>;
 
-    /// Full Part-10 bytes of an instance.
-    fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Vec<u8>>;
+    /// Full Part-10 bytes of an instance (shared: retrieving must
+    /// not copy a multi-hundred-MB file per GET).
+    fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Bytes>;
+
+    /// All instance files of a study in store order (RetrieveStudy,
+    /// PS3.18 §6.5.3); empty when the study is unknown.
+    fn study_files(&self, study: &str) -> Vec<Bytes>;
+
+    /// All instance files of one series in store order
+    /// (RetrieveSeries, PS3.18 §6.5.4); empty when unknown.
+    fn series_files(&self, study: &str, series: &str) -> Vec<Bytes>;
 
     /// Metadata dataset (bulk elements removed) plus extracted blobs.
     fn instance_metadata(
@@ -182,28 +215,37 @@ pub trait DicomWebStore: Send + Sync {
     ) -> Option<(DataSet, Vec<BulkBlob>)>;
 
     /// Raw native-order frame bytes for 1-based frame numbers.
+    ///
+    /// `Ok(None)` means the instance (or a requested frame number) is
+    /// absent; `Err` means the instance exists but is undecodable
+    /// (no pixels, garbage frame count, length mismatch) — the
+    /// dispatcher maps those to 404 and 500 respectively.
     fn instance_frames(
         &self,
         study: &str,
         series: &str,
         instance: &str,
         frames: &[u32],
-    ) -> Option<Vec<Vec<u8>>>;
+    ) -> std::result::Result<Option<Vec<Vec<u8>>>, String>;
 
     /// Store one Part-10 file; `study_hint` (STOW URL) must match the file.
+    ///
+    /// Takes the file by value as shared [`Bytes`]: STOW moves each
+    /// decoded part straight into the store instead of copying the
+    /// upload a second time.
     fn store_instance(
         &self,
-        file: &[u8],
+        file: Bytes,
         study_hint: Option<&str>,
     ) -> std::result::Result<StoredIds, String>;
 
     /// Register blobs, returning one id per blob for `BulkDataURI`s.
     /// Implementations MUST return exactly `blobs.len()` ids:
     /// anything else makes the metadata endpoint answer 500.
-    fn put_bulk(&self, blobs: Vec<(Vec<u8>, String)>) -> Vec<String>;
+    fn put_bulk(&self, blobs: Vec<(Bytes, String)>) -> Vec<String>;
 
     /// Resolve a bulk id to `(bytes, content_type)`.
-    fn bulk_data(&self, id: &str) -> Option<(Vec<u8>, String)>;
+    fn bulk_data(&self, id: &str) -> Option<(Bytes, String)>;
 }
 
 /// Thread-safe in-memory [`DicomWebStore`] (tests, tools, small archives).
@@ -217,7 +259,7 @@ struct MemoryInner {
     instances: VecDeque<StoredInstance>,
     /// Total instance file bytes currently held.
     instance_bytes: usize,
-    bulk: HashMap<String, (Vec<u8>, String)>,
+    bulk: HashMap<String, (Bytes, String)>,
     /// Insertion order for oldest-first bulk eviction.
     bulk_order: VecDeque<String>,
     /// Total bulk bytes currently held.
@@ -241,7 +283,7 @@ struct StoredInstance {
     study: String,
     series: String,
     instance: String,
-    file: Vec<u8>,
+    file: Bytes,
     dataset: DataSet,
     transfer_syntax: TransferSyntax,
 }
@@ -337,13 +379,31 @@ impl DicomWebStore for MemoryStore {
         out
     }
 
-    fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Vec<u8>> {
+    fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Bytes> {
         let inner = self.lock();
         inner
             .instances
             .iter()
             .find(|i| i.study == study && i.series == series && i.instance == instance)
             .map(|i| i.file.clone())
+    }
+
+    fn study_files(&self, study: &str) -> Vec<Bytes> {
+        self.lock()
+            .instances
+            .iter()
+            .filter(|i| i.study == study)
+            .map(|i| i.file.clone())
+            .collect()
+    }
+
+    fn series_files(&self, study: &str, series: &str) -> Vec<Bytes> {
+        self.lock()
+            .instances
+            .iter()
+            .filter(|i| i.study == study && i.series == series)
+            .map(|i| i.file.clone())
+            .collect()
     }
 
     fn instance_metadata(
@@ -368,40 +428,49 @@ impl DicomWebStore for MemoryStore {
         series: &str,
         instance: &str,
         frames: &[u32],
-    ) -> Option<Vec<Vec<u8>>> {
+    ) -> std::result::Result<Option<Vec<Vec<u8>>>, String> {
         let inner = self.lock();
-        let inst = inner
+        let Some(inst) = inner
             .instances
             .iter()
-            .find(|i| i.study == study && i.series == series && i.instance == instance)?;
-        let pixels = decode_pixels(&inst.dataset, inst.transfer_syntax).ok()?;
+            .find(|i| i.study == study && i.series == series && i.instance == instance)
+        else {
+            return Ok(None);
+        };
+        let pixels = decode_pixels(&inst.dataset, inst.transfer_syntax)
+            .map_err(|e| format!("cannot decode pixels: {e}"))?;
         // Absent frame count means single-frame; present-but-garbage
-        // is a 404, not a license to serve all frames as frame 1.
+        // is undecodable (500), not a license to serve all frames.
         let count: usize = match inst.dataset.string(tags::NUMBER_OF_FRAMES) {
             None => 1,
             Some(s) => match s.parse() {
                 Ok(n) if n >= 1 => n,
-                _ => return None,
+                _ => {
+                    return Err(format!("cannot decode frames: bad NumberOfFrames {s:?}"));
+                }
             },
         };
         if pixels.len() % count != 0 {
-            return None;
+            return Err(format!(
+                "cannot decode frames: {} pixel bytes not divisible by {count} frames",
+                pixels.len()
+            ));
         }
         let frame_len = pixels.len() / count;
         let mut out = Vec::with_capacity(frames.len());
         for f in frames {
             if *f == 0 || *f as usize > count {
-                return None;
+                return Ok(None);
             }
             let start = (*f as usize - 1) * frame_len;
             out.push(pixels[start..start + frame_len].to_vec());
         }
-        Some(out)
+        Ok(Some(out))
     }
 
     fn store_instance(
         &self,
-        file: &[u8],
+        file: Bytes,
         study_hint: Option<&str>,
     ) -> std::result::Result<StoredIds, String> {
         // A single file over the byte cap would evict the whole store
@@ -414,7 +483,7 @@ impl DicomWebStore for MemoryStore {
                 file.len()
             ));
         }
-        let (meta, dataset) = read_part10(file).map_err(|e| e.to_string())?;
+        let (meta, dataset) = read_part10(&file).map_err(|e| e.to_string())?;
         let study = dataset
             .string(tags::STUDY_INSTANCE_UID)
             .ok_or("missing Study Instance UID")?
@@ -427,6 +496,12 @@ impl DicomWebStore for MemoryStore {
             .string(tags::SOP_INSTANCE_UID)
             .ok_or("missing SOP Instance UID")?
             .to_string();
+        // File meta always carries the class (`read_part10` requires
+        // it), so the STOW response refs never go without.
+        let sop_class = dataset
+            .string(tags::SOP_CLASS_UID)
+            .map(str::to_string)
+            .unwrap_or_else(|| meta.media_storage_sop_class_uid.clone());
         if let Some(hint) = study_hint
             && hint != study
         {
@@ -449,7 +524,7 @@ impl DicomWebStore for MemoryStore {
             study: study.clone(),
             series: series.clone(),
             instance: instance.clone(),
-            file: file.to_vec(),
+            file,
             dataset,
             transfer_syntax: ts,
         });
@@ -463,10 +538,11 @@ impl DicomWebStore for MemoryStore {
             study,
             series,
             instance,
+            sop_class,
         })
     }
 
-    fn put_bulk(&self, blobs: Vec<(Vec<u8>, String)>) -> Vec<String> {
+    fn put_bulk(&self, blobs: Vec<(Bytes, String)>) -> Vec<String> {
         let mut inner = self.lock();
         blobs
             .into_iter()
@@ -491,7 +567,7 @@ impl DicomWebStore for MemoryStore {
             .collect()
     }
 
-    fn bulk_data(&self, id: &str) -> Option<(Vec<u8>, String)> {
+    fn bulk_data(&self, id: &str) -> Option<(Bytes, String)> {
         self.lock().bulk.get(id).cloned()
     }
 }
@@ -741,6 +817,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
     match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["studies"]) => qido(
             store,
+            req,
             QidoScope {
                 level: "STUDY",
                 study: None,
@@ -750,6 +827,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
         ),
         ("GET", ["series"]) => qido(
             store,
+            req,
             QidoScope {
                 level: "SERIES",
                 study: None,
@@ -759,6 +837,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
         ),
         ("GET", ["instances"]) => qido(
             store,
+            req,
             QidoScope {
                 level: "IMAGE",
                 study: None,
@@ -768,6 +847,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
         ),
         ("GET", ["studies", study, "series"]) => qido(
             store,
+            req,
             QidoScope {
                 level: "SERIES",
                 study: Some((*study).to_string()),
@@ -777,6 +857,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
         ),
         ("GET", ["studies", study, "series", series, "instances"]) => qido(
             store,
+            req,
             QidoScope {
                 level: "IMAGE",
                 study: Some((*study).to_string()),
@@ -784,6 +865,18 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
             },
             &req.query,
         ),
+        ("GET", ["studies", study]) => {
+            if !accepts(req, &["application/dicom", "multipart/related"]) {
+                return HttpResponse::text(406, "study retrieve needs Accept: application/dicom");
+            }
+            retrieve_files(store.study_files(study), "study")
+        }
+        ("GET", ["studies", study, "series", series]) => {
+            if !accepts(req, &["application/dicom", "multipart/related"]) {
+                return HttpResponse::text(406, "series retrieve needs Accept: application/dicom");
+            }
+            retrieve_files(store.series_files(study, series), "series")
+        }
         ("GET", ["studies", study, "series", series, "instances", instance]) => {
             if !accepts(req, &["application/dicom", "multipart/related"]) {
                 return HttpResponse::text(406, "instance needs Accept: application/dicom");
@@ -792,7 +885,8 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                 Some(file) => HttpResponse::multipart(
                     &[Part::new("application/dicom", file)],
                     "application/dicom",
-                ),
+                )
+                .unwrap_or_else(|e| HttpResponse::text(500, e)),
                 None => HttpResponse::text(404, "instance not found"),
             }
         }
@@ -827,7 +921,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                     let ids = store.put_bulk(
                         blobs
                             .into_iter()
-                            .map(|b| (b.bytes, b.content_type))
+                            .map(|b| (Bytes::from(b.bytes), b.content_type))
                             .collect(),
                     );
                     // A short id list would silently drop BulkDataURIs
@@ -891,14 +985,16 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                 return HttpResponse::text(400, "bad frame list");
             }
             match store.instance_frames(study, series, instance, &frames) {
-                Some(raw) => {
+                Ok(Some(raw)) => {
                     let parts: Vec<Part> = raw
                         .into_iter()
                         .map(|b| Part::new("application/octet-stream", b))
                         .collect();
                     HttpResponse::multipart(&parts, "application/octet-stream")
+                        .unwrap_or_else(|e| HttpResponse::text(500, e))
                 }
-                None => HttpResponse::text(404, "instance or frames not found"),
+                Ok(None) => HttpResponse::text(404, "instance or frames not found"),
+                Err(e) => HttpResponse::text(500, e),
             }
         }
         ("GET", ["bulk", id]) => match store.bulk_data(id) {
@@ -908,7 +1004,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
         ("POST", ["studies"]) => stow(store, base, None, req),
         ("POST", ["studies", study]) => stow(store, base, Some(study), req),
         ("GET", _) => HttpResponse::text(404, "unknown DICOMweb resource"),
-        _ => HttpResponse::text(405, "method not allowed"),
+        _ => HttpResponse::method_not_allowed(),
     }
 }
 
@@ -928,7 +1024,31 @@ const MAX_QIDO_QUERY_BYTES: usize = 64 * 1024;
 /// distinct entries. 10,000 covers any real multiframe object.
 const MAX_WADO_FRAMES: usize = 10_000;
 
-fn qido<S: DicomWebStore>(store: &S, scope: QidoScope, query: &str) -> HttpResponse {
+/// RetrieveStudy/RetrieveSeries body: every instance file as one
+/// `application/dicom` part; empty means the study/series is unknown.
+fn retrieve_files(files: Vec<Bytes>, what: &str) -> HttpResponse {
+    if files.is_empty() {
+        return HttpResponse::text(404, format!("{what} not found"));
+    }
+    let parts: Vec<Part> = files
+        .into_iter()
+        .map(|f| Part::new("application/dicom", f))
+        .collect();
+    HttpResponse::multipart(&parts, "application/dicom")
+        .unwrap_or_else(|e| HttpResponse::text(500, e))
+}
+
+fn qido<S: DicomWebStore>(
+    store: &S,
+    req: &HttpRequest,
+    scope: QidoScope,
+    query: &str,
+) -> HttpResponse {
+    // This server answers QIDO in DICOM JSON only, like the WADO
+    // paths 406 anything else.
+    if !accepts(req, &["application/dicom+json"]) {
+        return HttpResponse::text(406, "QIDO needs Accept: application/dicom+json");
+    }
     if query.len() > MAX_QIDO_QUERY_BYTES {
         return HttpResponse::text(400, "query too long");
     }
@@ -1037,6 +1157,11 @@ fn stow<S: DicomWebStore>(
     study_hint: Option<&str>,
     req: &HttpRequest,
 ) -> HttpResponse {
+    // This server answers STOW in DICOM JSON only (success and
+    // failure bodies alike): 406 before touching the upload.
+    if !accepts(req, &["application/dicom+json"]) {
+        return HttpResponse::text(406, "STOW needs Accept: application/dicom+json");
+    }
     let ct = req
         .headers
         .get("content-type")
@@ -1060,11 +1185,14 @@ fn stow<S: DicomWebStore>(
     let mut failures: Vec<(Option<String>, Option<String>, String)> = Vec::new();
     // Media-type match, not string equality: compliant senders add
     // parameters such as `transfer-syntax` (PS3.18 §8.6).
+    // The clone is a refcount bump, not a copy: each part body (a
+    // zero-copy slice of the request buffer) moves into the store,
+    // while the failure path below can still read it for UIDs.
     for part in parts
         .iter()
         .filter(|p| is_dicom_media_type(&p.content_type))
     {
-        match store.store_instance(&part.body, study_hint) {
+        match store.store_instance(part.body.clone(), study_hint) {
             Ok(ids) => stored.push(ids),
             Err(reason) => {
                 let (class, inst) = sop_uids_of(&part.body);
@@ -1073,6 +1201,11 @@ fn stow<S: DicomWebStore>(
         }
     }
     if stored.is_empty() {
+        // Non-DICOM parts skip without failure entries, so zero
+        // failures means zero DICOM parts — not an empty reason.
+        if failures.is_empty() {
+            return HttpResponse::text(400, "no application/dicom parts in STOW request");
+        }
         let reasons: Vec<&str> = failures.iter().map(|(_, _, r)| r.as_str()).collect();
         return HttpResponse::text(400, format!("nothing stored: {}", reasons.join("; ")));
     }
@@ -1107,6 +1240,7 @@ fn stow<S: DicomWebStore>(
             409,
             &serde_json::json!({
                 "00081198": {"vr": "SQ", "Value": items},
+                "00081199": {"vr": "SQ", "Value": referenced_sop_items(&stored)},
                 "00081190": {"vr": "UR", "Value": [format!("{base}/studies/{}", stored[0].study)]},
             }),
         );
@@ -1114,9 +1248,24 @@ fn stow<S: DicomWebStore>(
     HttpResponse::json(
         200,
         &serde_json::json!({
+            "00081199": {"vr": "SQ", "Value": referenced_sop_items(&stored)},
             "00081190": {"vr": "UR", "Value": [format!("{base}/studies/{}", stored[0].study)]}
         }),
     )
+}
+
+/// One `ReferencedSOPSequence` item per stored instance (PS3.18
+/// Store Instances Response: class + instance refs for what landed).
+fn referenced_sop_items(stored: &[StoredIds]) -> Vec<serde_json::Value> {
+    stored
+        .iter()
+        .map(|ids| {
+            serde_json::json!({
+                "00081150": {"vr": "UI", "Value": [ids.sop_class]},
+                "00081155": {"vr": "UI", "Value": [ids.instance]},
+            })
+        })
+        .collect()
 }
 
 /// STOW-RS Failure Reason for a part that could not be stored
@@ -1175,10 +1324,16 @@ mod tests {
     fn stored() -> MemoryStore {
         let store = MemoryStore::new();
         store
-            .store_instance(&test_file("1.2.3", "1.2.3.1", "1.2.3.1.1", 4, 4), None)
+            .store_instance(
+                Bytes::from(test_file("1.2.3", "1.2.3.1", "1.2.3.1.1", 4, 4)),
+                None,
+            )
             .unwrap();
         store
-            .store_instance(&test_file("1.2.3", "1.2.3.2", "1.2.3.2.1", 2, 2), None)
+            .store_instance(
+                Bytes::from(test_file("1.2.3", "1.2.3.2", "1.2.3.2.1", 2, 2)),
+                None,
+            )
             .unwrap();
         store
     }
@@ -1253,9 +1408,14 @@ mod tests {
             .insert("authorization".into(), "Bearer s3cret".into());
         req.headers
             .insert("accept".into(), "application/json".into());
+        req.headers.insert("cookie".into(), "session=abc123".into());
+        req.headers
+            .insert("set-cookie".into(), "session=def456".into());
         req.body = Bytes::from_static(b"PHI-BYTES");
         let shown = format!("{req:?}");
         assert!(!shown.contains("s3cret"), "{shown}");
+        assert!(!shown.contains("abc123"), "{shown}");
+        assert!(!shown.contains("def456"), "{shown}");
         assert!(!shown.contains("PHI-BYTES"), "{shown}");
         assert!(shown.contains("<redacted>"), "{shown}");
         assert!(shown.contains("body_len"), "{shown}");
@@ -1425,8 +1585,16 @@ mod tests {
             self.inner.search(scope, filters, limit, offset)
         }
 
-        fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Vec<u8>> {
+        fn instance_file(&self, study: &str, series: &str, instance: &str) -> Option<Bytes> {
             self.inner.instance_file(study, series, instance)
+        }
+
+        fn study_files(&self, study: &str) -> Vec<Bytes> {
+            self.inner.study_files(study)
+        }
+
+        fn series_files(&self, study: &str, series: &str) -> Vec<Bytes> {
+            self.inner.series_files(study, series)
         }
 
         fn instance_metadata(
@@ -1444,25 +1612,25 @@ mod tests {
             series: &str,
             instance: &str,
             frames: &[u32],
-        ) -> Option<Vec<Vec<u8>>> {
+        ) -> std::result::Result<Option<Vec<Vec<u8>>>, String> {
             self.inner.instance_frames(study, series, instance, frames)
         }
 
         fn store_instance(
             &self,
-            file: &[u8],
+            file: Bytes,
             study_hint: Option<&str>,
         ) -> std::result::Result<StoredIds, String> {
             self.inner.store_instance(file, study_hint)
         }
 
-        fn put_bulk(&self, blobs: Vec<(Vec<u8>, String)>) -> Vec<String> {
+        fn put_bulk(&self, blobs: Vec<(Bytes, String)>) -> Vec<String> {
             let mut ids = self.inner.put_bulk(blobs);
             ids.pop();
             ids
         }
 
-        fn bulk_data(&self, id: &str) -> Option<(Vec<u8>, String)> {
+        fn bulk_data(&self, id: &str) -> Option<(Bytes, String)> {
             self.inner.bulk_data(id)
         }
     }
@@ -1470,8 +1638,8 @@ mod tests {
     #[test]
     fn oversize_single_instance_rejected_not_stored_then_evicted() {
         let store = MemoryStore::new();
-        let big = vec![0u8; MAX_INSTANCE_BYTES + 1];
-        let err = store.store_instance(&big, None).unwrap_err();
+        let big = Bytes::from(vec![0u8; MAX_INSTANCE_BYTES + 1]);
+        let err = store.store_instance(big, None).unwrap_err();
         assert!(err.contains("exceeds the store cap"), "{err}");
         assert!(store.is_empty());
     }
@@ -1491,8 +1659,14 @@ mod tests {
     fn bulk_ids_are_unpredictable_and_evict_oldest() {
         let store = MemoryStore::new();
         let ids = store.put_bulk(vec![
-            (vec![1u8; 8], "application/octet-stream".to_string()),
-            (vec![2u8; 8], "application/octet-stream".to_string()),
+            (
+                Bytes::from(vec![1u8; 8]),
+                "application/octet-stream".to_string(),
+            ),
+            (
+                Bytes::from(vec![2u8; 8]),
+                "application/octet-stream".to_string(),
+            ),
         ]);
         // UUID-simple ids: 32 lowercase hex chars, unique.
         assert_eq!(ids.len(), 2);
@@ -1505,7 +1679,10 @@ mod tests {
         // Past the blob cap the oldest entries are evicted.
         let mut first_extra = String::new();
         for i in 0..(MAX_BULK_BLOBS + 10) {
-            let id = store.put_bulk(vec![(vec![0u8; 8], "application/octet-stream".to_string())]);
+            let id = store.put_bulk(vec![(
+                Bytes::from(vec![0u8; 8]),
+                "application/octet-stream".to_string(),
+            )]);
             if i == 0 {
                 first_extra = id[0].clone();
             }
@@ -1521,7 +1698,7 @@ mod tests {
         for i in 0..(MAX_INSTANCES + 5) {
             let uid = format!("1.2.3.{i}");
             store
-                .store_instance(&test_file("1.2.3", "1.2.3.1", &uid, 2, 2), None)
+                .store_instance(Bytes::from(test_file("1.2.3", "1.2.3.1", &uid, 2, 2)), None)
                 .unwrap();
         }
         assert_eq!(store.len(), MAX_INSTANCES);
@@ -1677,7 +1854,8 @@ mod tests {
             &[Part::new("application/dicom", file)],
             "b1",
             "application/dicom",
-        );
+        )
+        .unwrap();
         let req = HttpRequest {
             method: "POST".into(),
             path: "/studies".into(),
@@ -1688,6 +1866,18 @@ mod tests {
         let r = dispatch(&store, "http://x/wado", &req);
         assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
         assert!(String::from_utf8_lossy(&r.body).contains("00081190"));
+        // Success carries the stored-instance refs too (PS3.18).
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let refs = v["00081199"]["Value"].as_array().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0]["00081150"]["Value"][0],
+            serde_json::json!(vyna_dcm_core::sop_class::CT_IMAGE)
+        );
+        assert_eq!(
+            refs[0]["00081155"]["Value"][0],
+            serde_json::json!("9.9.9.1.1")
+        );
         assert_eq!(store.len(), 3);
 
         // Study mismatch is rejected.
@@ -1696,7 +1886,8 @@ mod tests {
             &[Part::new("application/dicom", file)],
             "b2",
             "application/dicom",
-        );
+        )
+        .unwrap();
         let req = HttpRequest {
             method: "POST".into(),
             path: "/studies/7.7.7".into(),
@@ -1716,7 +1907,8 @@ mod tests {
             )],
             "b3",
             "application/dicom",
-        );
+        )
+        .unwrap();
         let req = HttpRequest {
             method: "POST".into(),
             path: "/studies".into(),
@@ -1729,12 +1921,83 @@ mod tests {
     }
 
     #[test]
+    fn retrieve_study_and_series_serve_every_instance() {
+        let store = stored();
+        // Study 1.2.3 holds two instances (different series).
+        let r = dispatch(&store, "http://x/wado", &get("/studies/1.2.3"));
+        assert_eq!(r.status, 200);
+        let ct = r
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .unwrap()
+            .1
+            .clone();
+        let (mime, params) = parse_content_type(&ct);
+        assert_eq!(mime, "multipart/related");
+        let parts = decode_multipart(
+            &r.body,
+            params.get("boundary").map(String::as_str).unwrap_or(""),
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 2);
+        assert!(parts.iter().all(|p| p.content_type == "application/dicom"));
+        // One series narrows to its single instance.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/1.2.3/series/1.2.3.1"),
+        );
+        assert_eq!(r.status, 200);
+        let ct = r
+            .headers
+            .iter()
+            .find(|(k, _)| k == "content-type")
+            .unwrap()
+            .1
+            .clone();
+        let (_, params) = parse_content_type(&ct);
+        let parts = decode_multipart(
+            &r.body,
+            params.get("boundary").map(String::as_str).unwrap_or(""),
+        )
+        .unwrap();
+        assert_eq!(parts.len(), 1);
+        // Unknown study/series 404; wrong media 406s.
+        assert_eq!(
+            dispatch(&store, "http://x/wado", &get("/studies/9.9")).status,
+            404
+        );
+        assert_eq!(
+            dispatch(&store, "http://x/wado", &get("/studies/1.2.3/series/9.9")).status,
+            404
+        );
+        assert_eq!(
+            dispatch(
+                &store,
+                "http://x/wado",
+                &get_accept("/studies/1.2.3", "image/jpeg")
+            )
+            .status,
+            406
+        );
+    }
+
+    #[test]
     fn unknown_routes_404() {
         let store = stored();
         assert_eq!(dispatch(&store, "http://x", &get("/nope")).status, 404);
         let mut bad = get("/studies");
         bad.method = "DELETE".into();
-        assert_eq!(dispatch(&store, "http://x", &bad).status, 405);
+        let r = dispatch(&store, "http://x", &bad);
+        assert_eq!(r.status, 405);
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "allow" && v == "GET, POST"),
+            "{:?}",
+            r.headers
+        );
     }
 
     #[test]
@@ -1819,15 +2082,41 @@ mod tests {
             TransferSyntax::ExplicitVrLittleEndian,
         );
         store
-            .store_instance(&write_part10(&meta, &ds).unwrap(), None)
+            .store_instance(Bytes::from(write_part10(&meta, &ds).unwrap()), None)
             .unwrap();
-        // Present-but-garbage count: 404, not frame-1-of-everything.
+        // Present-but-garbage count: the instance exists but is
+        // undecodable, so 500 — not 404, not frame-1-of-everything.
         let r = dispatch(
             &store,
             "http://x/wado",
             &get("/studies/9.9.9/series/9.9.9.1/instances/9.9.9.1.1/frames/1"),
         );
-        assert_eq!(r.status, 404);
+        assert_eq!(r.status, 500);
+    }
+
+    #[test]
+    fn frames_for_pixel_less_instance_is_500_not_404() {
+        let store = MemoryStore::new();
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::SOP_CLASS_UID, vyna_dcm_core::sop_class::CT_IMAGE);
+        ds.put_uid(tags::SOP_INSTANCE_UID, "9.9.8.1.1");
+        ds.put_uid(tags::STUDY_INSTANCE_UID, "9.9.8");
+        ds.put_uid(tags::SERIES_INSTANCE_UID, "9.9.8.1");
+        let meta = FileMeta::new(
+            vyna_dcm_core::sop_class::CT_IMAGE,
+            "9.9.8.1.1",
+            TransferSyntax::ExplicitVrLittleEndian,
+        );
+        store
+            .store_instance(Bytes::from(write_part10(&meta, &ds).unwrap()), None)
+            .unwrap();
+        // Stored fine (no pixels required), but frames are undecodable.
+        let r = dispatch(
+            &store,
+            "http://x/wado",
+            &get("/studies/9.9.8/series/9.9.8.1/instances/9.9.8.1.1/frames/1"),
+        );
+        assert_eq!(r.status, 500);
     }
 
     #[test]
@@ -1959,6 +2248,66 @@ mod tests {
     }
 
     #[test]
+    fn qido_and_stow_negotiate_accept() {
+        let store = stored();
+        // QIDO speaks dicom+json only.
+        assert_eq!(
+            dispatch(
+                &store,
+                "http://x/wado",
+                &get_accept("/studies", "application/dicom+xml")
+            )
+            .status,
+            406
+        );
+        assert_eq!(
+            dispatch(
+                &store,
+                "http://x/wado",
+                &get_accept("/studies", "application/dicom+json")
+            )
+            .status,
+            200
+        );
+        let (ct, body) = encode_multipart(
+            &[Part::new(
+                "application/dicom",
+                test_file("7.7.7", "7.7.7.1", "7.7.7.1.1", 2, 2),
+            )],
+            "b406",
+            "application/dicom",
+        )
+        .unwrap();
+        // STOW answers dicom+json only, even on success.
+        let mut xml_only = stow_req("/studies", &ct, body.clone());
+        xml_only
+            .headers
+            .insert("accept".into(), "application/dicom+xml".into());
+        assert_eq!(dispatch(&store, "http://x/wado", &xml_only).status, 406);
+        let mut json = stow_req("/studies", &ct, body);
+        json.headers
+            .insert("accept".into(), "application/dicom+json".into());
+        assert_eq!(dispatch(&store, "http://x/wado", &json).status, 200);
+    }
+
+    #[test]
+    fn stow_without_dicom_parts_names_the_problem() {
+        let store = stored();
+        let (ct, body) = encode_multipart(
+            &[Part::new("application/octet-stream", b"hello".to_vec())],
+            "bnone",
+            "application/octet-stream",
+        )
+        .unwrap();
+        let r = dispatch(&store, "http://x/wado", &stow_req("/studies", &ct, body));
+        assert_eq!(r.status, 400);
+        assert_eq!(
+            String::from_utf8_lossy(&r.body).as_ref(),
+            "no application/dicom parts in STOW request"
+        );
+    }
+
+    #[test]
     fn stow_rejects_malformed_uploads() {
         let store = stored();
         // Not multipart/related.
@@ -2009,7 +2358,8 @@ mod tests {
             ],
             "b409",
             "application/dicom",
-        );
+        )
+        .unwrap();
         let r = dispatch(&store, "http://x/wado", &stow_req("/studies", &ct, body));
         assert_eq!(r.status, 409, "{}", String::from_utf8_lossy(&r.body));
         let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
@@ -2029,8 +2379,16 @@ mod tests {
             failed[1]["00081155"]["Value"][0],
             serde_json::json!("5.5.5.1.2")
         );
-        // The good instance still stored.
+        // The good instance still stored — and referenced: 409
+        // carries ReferencedSOPSequence for what landed, alongside
+        // FailedSOPSequence for what did not.
         assert_eq!(store.len(), 3);
+        let refs = v["00081199"]["Value"].as_array().unwrap();
+        assert_eq!(refs.len(), 1);
+        assert_eq!(
+            refs[0]["00081155"]["Value"][0],
+            serde_json::json!("5.5.5.1.1")
+        );
     }
 
     #[test]
@@ -2058,13 +2416,13 @@ mod tests {
         for i in 0..5 {
             store
                 .store_instance(
-                    &test_file(
+                    Bytes::from(test_file(
                         &format!("7.7.{i}"),
                         &format!("7.7.{i}.1"),
                         &format!("7.7.{i}.1.1"),
                         2,
                         2,
-                    ),
+                    )),
                     None,
                 )
                 .unwrap();
@@ -2089,13 +2447,13 @@ mod tests {
         for i in 5..1005 {
             store
                 .store_instance(
-                    &test_file(
+                    Bytes::from(test_file(
                         &format!("7.7.{i}"),
                         &format!("7.7.{i}.1"),
                         &format!("7.7.{i}.1.1"),
                         2,
                         2,
-                    ),
+                    )),
                     None,
                 )
                 .unwrap();

@@ -6,6 +6,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use vyna_dcm_core::tags;
+use vyna_dcm_web::Bytes;
 use vyna_dcm_web::DicomWebClient;
 use vyna_dcm_web::hyper_server::serve_connection;
 use vyna_dcm_web::server::{DicomWebStore, MemoryStore};
@@ -40,7 +41,7 @@ const INST: &str = "1.2.826.0.1.3680043.2.1143.645555672621490099565175366964099
 async fn qido_finds_seeded_instance() {
     let store = Arc::new(MemoryStore::new());
     store
-        .store_instance(&corpus("emri_small.dcm"), None)
+        .store_instance(Bytes::from(corpus("emri_small.dcm")), None)
         .unwrap();
     let (base, server) = serve(store).await;
     let client = DicomWebClient::new(&base).unwrap();
@@ -63,12 +64,14 @@ async fn qido_finds_seeded_instance() {
 async fn wado_round_trips_file_metadata_frames() {
     let store = Arc::new(MemoryStore::new());
     let file = corpus("emri_small.dcm");
-    store.store_instance(&file, None).unwrap();
+    store
+        .store_instance(Bytes::from(file.clone()), None)
+        .unwrap();
     let (base, server) = serve(store).await;
     let client = DicomWebClient::new(&base).unwrap();
     // Instance bytes are exact.
     let back = client.wado_file(STUDY, SERIES, INST).await.unwrap();
-    assert_eq!(back, file);
+    assert_eq!(back.as_ref(), file.as_slice());
     // Metadata strips bulk elements (BulkDataURI links parse as empty).
     let meta = client.wado_metadata(STUDY, SERIES, INST).await.unwrap();
     assert!(matches!(

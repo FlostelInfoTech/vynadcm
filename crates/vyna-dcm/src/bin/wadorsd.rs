@@ -57,6 +57,14 @@ async fn run(args: &Args) -> Result<(), String> {
         .bind
         .parse()
         .map_err(|_| format!("bad --bind {:?}", args.bind))?;
+    // An empty token suppresses the PHI warning while 401ing every
+    // request (no `Authorization` header can ever match it): reject
+    // it loudly instead of running a "protected" dead server.
+    if args.bearer_token.as_deref().is_some_and(str::is_empty) {
+        return Err(
+            "empty --bearer-token authenticates nothing; omit it or pass a real token".into(),
+        );
+    }
     if needs_phi_warning(&addr, &args.bearer_token) {
         eprintln!(
             "wadorsd WARNING: serving PHI over unauthenticated plain HTTP on {addr} \
@@ -65,16 +73,28 @@ async fn run(args: &Args) -> Result<(), String> {
         );
     }
     let store = Arc::new(MemoryStore::new());
+    let mut read = 0usize;
     let mut skipped = 0usize;
     for file in webcommon::collect_dcm_files(&args.dir) {
+        read += 1;
         let bytes = std::fs::read(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-        match store.store_instance(&bytes, None) {
+        match store.store_instance(vyna_dcm::web::Bytes::from(bytes), None) {
             Ok(_) => {}
             Err(e) => {
                 eprintln!("wadorsd: skipping {}: {e}", file.display());
                 skipped += 1;
             }
         }
+    }
+    // The store caps at 10k instances / 1 GiB with oldest-first
+    // eviction: when seeding overflows the caps the startup line
+    // would otherwise under-report with no hint anything was lost.
+    if store.len() + skipped != read {
+        eprintln!(
+            "wadorsd WARNING: seeded {read} file(s) but the store holds {} \
+             (store caps evicted the oldest)",
+            store.len()
+        );
     }
     println!(
         "wadorsd serving {} instance(s) ({} skipped) from {} on http://{}/",
@@ -114,5 +134,17 @@ mod tests {
             let addr: std::net::SocketAddr = bind.parse().unwrap();
             assert_eq!(needs_phi_warning(&addr, &tok), warn, "{bind}");
         }
+    }
+
+    #[tokio::test]
+    async fn empty_bearer_token_rejected() {
+        let args = Args {
+            bind: "127.0.0.1:1".into(),
+            dir: PathBuf::from("."),
+            public_base: None,
+            bearer_token: Some(String::new()),
+        };
+        let err = run(&args).await.unwrap_err();
+        assert!(err.contains("empty --bearer-token"), "{err}");
     }
 }

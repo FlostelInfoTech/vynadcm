@@ -72,20 +72,30 @@ impl Deidentifier {
 
     /// Replacement value for [`Action::Dummy`] text attributes.
     ///
-    /// # Panics
-    ///
-    /// Panics when `id` exceeds 16 bytes: the value flows into
-    /// `SH`/`AE`/`CS` rows capped at 16 characters, and an overlong
-    /// dummy would emit invalid DICOM.
-    #[must_use]
-    pub fn with_replacement_id(mut self, id: impl Into<String>) -> Self {
+    /// Fails instead of truncating: over 16 bytes (the value flows
+    /// into `SH`/`AE`/`CS` rows capped at 16 characters), backslash
+    /// (the encoder joins text components with `\`, so an embedded
+    /// one decodes back as two values — silent VM corruption), or
+    /// control characters (not valid in text VRs) are rejected.
+    pub fn with_replacement_id(mut self, id: impl Into<String>) -> Result<Self> {
         let id = id.into();
-        assert!(
-            id.len() <= 16,
-            "replacement ID exceeds the 16-byte SH/AE/CS limit: {id:?}"
-        );
+        if id.len() > 16 {
+            return Err(Error::InvalidReplacementId(format!(
+                "exceeds the 16-byte SH/AE/CS limit: {id:?}"
+            )));
+        }
+        if id.contains('\\') {
+            return Err(Error::InvalidReplacementId(format!(
+                "backslash would corrupt multi-valued elements: {id:?}"
+            )));
+        }
+        if id.chars().any(|c| c.is_control()) {
+            return Err(Error::InvalidReplacementId(format!(
+                "control characters are not valid in text VRs: {id:?}"
+            )));
+        }
         self.replacement_id = id;
-        self
+        Ok(self)
     }
 
     /// Replacement value for [`Action::Dummy`] person names.
@@ -136,9 +146,11 @@ impl Deidentifier {
     ///
     /// Only the dataset is touched: callers that persist file meta
     /// must remap Media Storage SOP Instance UID through
-    /// [`uid_map`](Self::uid_map) and replace Implementation Version
-    /// Name with their own, or the original UIDs and the source
-    /// writer's version leak into the output meta header.
+    /// [`uid_map`](Self::uid_map), replace Implementation Class UID
+    /// and Version Name with their own, and clear the file-meta AE
+    /// titles — or the original UIDs, the source writer's identity,
+    /// and the source site's network endpoints leak into the output
+    /// meta header (see the `deidentify` CLI for the full pattern).
     ///
     /// The `YES` / `113100` conformance markers are stamped only for a
     /// clean Basic-profile run: a custom profile, retained privates,
@@ -301,7 +313,20 @@ impl Deidentifier {
                 return;
             }
             Vr::Ob | Vr::Ow | Vr::Of | Vr::Od | Vr::Ol | Vr::Ov | Vr::Un => {
-                ds.put_bytes(tag, vr, self.replacement_id.clone().into_bytes());
+                // `OF`/`OD`/`OL`/`OV` need 4/8-byte multiples (the
+                // encoder's even-padding does not guarantee that):
+                // pad with zeros, which decode as valid 0/0.0 values.
+                let unit = match vr {
+                    Vr::Of | Vr::Ol => 4,
+                    Vr::Od | Vr::Ov => 8,
+                    Vr::Ow => 2,
+                    _ => 1,
+                };
+                let mut bytes = self.replacement_id.clone().into_bytes();
+                while !bytes.len().is_multiple_of(unit) {
+                    bytes.push(0);
+                }
+                ds.put_bytes(tag, vr, bytes);
             }
             // Plain-text VRs take the replacement id verbatim.
             Vr::Ae | Vr::Cs | Vr::Sh | Vr::Lo | Vr::St | Vr::Lt | Vr::Ut | Vr::Uc | Vr::Ur => {
@@ -350,6 +375,12 @@ impl Deidentifier {
         let Some(el) = ds.get_mut(tag) else {
             return;
         };
+        // Zero-length elements hold no PHI: leave them silently (a
+        // warning here would withhold the Basic Profile markers over
+        // nothing — empty Type 2 values are common in real files).
+        if el.value.is_empty() {
+            return;
+        }
         let Value::Text(values) = &mut el.value else {
             report
                 .warnings
@@ -379,6 +410,12 @@ impl Deidentifier {
         let Some(el) = ds.get_mut(tag) else {
             return;
         };
+        // Zero-length elements hold no PHI: leave them silently (see
+        // `apply_remap` — a warning would withhold markers over an
+        // empty Type 2 date).
+        if el.value.is_empty() {
+            return;
+        }
         let vr = el.vr;
         let Value::Text(values) = &mut el.value else {
             report
@@ -386,13 +423,21 @@ impl Deidentifier {
                 .push(format!("date element kept (not text): {tag:?}"));
             return;
         };
+        // A custom profile can point a shift action at any VR, but a
+        // date dummy/shift is only meaningful for DA/DT: writing
+        // "19000101" into a TM (or UI/PN/numeric) element emits
+        // VR-invalid output, so warn-and-keep instead (both branches).
+        if !matches!(vr, Vr::Da | Vr::Dt) {
+            report
+                .warnings
+                .push(format!("shift action kept (not a date VR {vr:?}): {tag:?}"));
+            return;
+        }
         let is_dt = vr == Vr::Dt;
         report.dates_touched += 1;
         let Some(offset) = self.date_offset else {
             // No offset: the shift degrades to empty/dummy, which
-            // destroys intervals (counted only for real date VRs —
-            // a custom profile can point shift actions anywhere).
-            let longitudinal = matches!(vr, Vr::Da | Vr::Dt);
+            // destroys intervals.
             if zero_when_no_offset {
                 el.value = Value::Empty;
                 report.zeroed += 1;
@@ -402,14 +447,14 @@ impl Deidentifier {
                 } else {
                     crate::profile::DUMMY_DATE
                 };
-                for value in values.iter_mut() {
+                // Empty components hold no PHI: skip them like the
+                // with-offset branch does.
+                for value in values.iter_mut().filter(|s| !s.is_empty()) {
                     *value = dummy.to_string();
                 }
                 report.dummied += 1;
             }
-            if longitudinal {
-                report.dates_lost += 1;
-            }
+            report.dates_lost += 1;
             return;
         };
         // Empty components hold no PHI: skip them like apply_remap
@@ -455,8 +500,11 @@ pub struct DeidReport {
     /// Date components shifted ([`Action::ShiftDate`] /
     /// [`Action::ShiftDateOrZero`] with an offset set).
     pub dates_shifted: usize,
-    /// Date elements seen by either shift action (shifted, dummied,
-    /// or zeroed — but not kept values, which warn instead).
+    /// Date (`DA`/`DT`) elements with text values seen by either
+    /// shift action — shifted, dummied, zeroed, warned-and-kept, or
+    /// skipped-empty-component alike (per-value outcomes land in
+    /// `dates_shifted`/`dates_lost`, kept values warn). Wholly empty
+    /// elements return before counting (they hold no PHI).
     pub dates_touched: usize,
     /// Date (`DA`/`DT`) elements whose values were emptied, dummied,
     /// or removed, destroying longitudinal intervals (`TM` excluded:
@@ -913,6 +961,7 @@ mod tests {
         ds.put_text(tags::CLINICAL_TRIAL_SUBJECT_ID, Vr::Lo, "SUBJ-0");
         Deidentifier::new()
             .with_replacement_id("SUBJ-7")
+            .unwrap()
             .with_replacement_name("Subject^Seven")
             .unwrap()
             .apply(&mut ds)
@@ -1000,6 +1049,90 @@ mod tests {
         ));
         assert_eq!(report.dummied, 3);
         assert!(report.warnings.iter().any(|w| w.contains("SI dummy kept")));
+    }
+
+    #[test]
+    fn dummy_byte_vrs_pad_to_unit_multiples() {
+        // "ANONYMIZED" is 10 bytes: fine for OB/OW, but OF/OD/OL/OV
+        // need 4/8-byte multiples — pad with zeros, not even-padding.
+        let mut ds = DataSet::new();
+        ds.put_bytes(tags::PIXEL_DATA, Vr::Ow, vec![1, 2, 3, 4]);
+        ds.put_bytes(tags::FLOAT_PIXEL_DATA, Vr::Of, vec![1, 2, 3, 4]);
+        ds.put_bytes(tags::DOUBLE_FLOAT_PIXEL_DATA, Vr::Od, vec![1, 2, 3, 4]);
+        ds.put_bytes(tags::SELECTOR_OL_VALUE, Vr::Ol, vec![1, 2, 3, 4]);
+        ds.put_bytes(tags::SELECTOR_OV_VALUE, Vr::Ov, vec![1, 2, 3, 4]);
+        Deidentifier::new()
+            .with_profile(&[
+                (tags::PIXEL_DATA, Action::Dummy),
+                (tags::FLOAT_PIXEL_DATA, Action::Dummy),
+                (tags::DOUBLE_FLOAT_PIXEL_DATA, Action::Dummy),
+                (tags::SELECTOR_OL_VALUE, Action::Dummy),
+                (tags::SELECTOR_OV_VALUE, Action::Dummy),
+            ])
+            .apply(&mut ds)
+            .unwrap();
+        for (tag, unit) in [
+            (tags::PIXEL_DATA, 2),
+            (tags::FLOAT_PIXEL_DATA, 4),
+            (tags::DOUBLE_FLOAT_PIXEL_DATA, 8),
+            (tags::SELECTOR_OL_VALUE, 4),
+            (tags::SELECTOR_OV_VALUE, 8),
+        ] {
+            let bytes = ds.bytes(tag).unwrap();
+            assert_eq!(bytes.len() % unit, 0, "{tag:?}: {}", bytes.len());
+            assert!(bytes.starts_with(b"ANONYMIZED"), "{tag:?}");
+            assert!(
+                bytes[b"ANONYMIZED".len()..].iter().all(|b| *b == 0),
+                "{tag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_uid_and_date_elements_stay_silent() {
+        // Zero-length Type 2 values hold no PHI: no warnings, no
+        // marker withholding, no remap/shift counts.
+        let mut ds = DataSet::new();
+        ds.put_null(tags::STUDY_INSTANCE_UID, Vr::Ui);
+        ds.put_null(tags::STUDY_DATE, Vr::Da);
+        ds.put_uid(tags::SERIES_INSTANCE_UID, "1.2.3.4");
+        ds.put_text(tags::SERIES_DATE, Vr::Da, "20200101");
+        let report = Deidentifier::new()
+            .with_date_offset(30)
+            .apply(&mut ds)
+            .unwrap();
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+        assert_eq!(report.uids_remapped, 1);
+        assert_eq!(report.dates_shifted, 1);
+        assert_eq!(ds.string(tags::SERIES_DATE), Some("20200131"));
+        assert!(
+            ds.get(tags::PATIENT_IDENTITY_REMOVED)
+                .is_some_and(|e| e.value == Value::Text(vec!["YES".to_string()]))
+        );
+    }
+
+    #[test]
+    fn shift_action_on_non_date_vr_warns_and_keeps() {
+        // Custom profile pointing shift actions at non-DA/DT VRs:
+        // warn-and-keep (both branches), never VR-invalid dummies.
+        for offset in [None, Some(30)] {
+            let mut ds = DataSet::new();
+            ds.put_text(tags::STUDY_TIME, Vr::Tm, "120000");
+            let mut deid =
+                Deidentifier::new().with_profile(&[(tags::STUDY_TIME, Action::ShiftDate)]);
+            if let Some(days) = offset {
+                deid = deid.with_date_offset(days);
+            }
+            let report = deid.apply(&mut ds).unwrap();
+            assert_eq!(ds.string(tags::STUDY_TIME), Some("120000"));
+            assert_eq!(report.dates_touched, 0);
+            assert_eq!(report.dates_lost, 0);
+            assert!(
+                report.warnings.iter().any(|w| w.contains("not a date VR")),
+                "{offset:?}: {:?}",
+                report.warnings
+            );
+        }
     }
 
     #[test]
@@ -1274,9 +1407,20 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "16-byte")]
-    fn overlong_replacement_id_panics() {
-        let _ = Deidentifier::new().with_replacement_id("12345678901234567");
+    fn bad_replacement_id_is_an_error_not_a_panic() {
+        // Overlong, backslash (VM corruption on encode), controls.
+        for bad in ["12345678901234567", "A\\B", "A\tB", "A\n", "\u{7f}"] {
+            let err = Deidentifier::new().with_replacement_id(bad).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidReplacementId(_)),
+                "{bad:?}: {err:?}"
+            );
+        }
+        assert!(
+            Deidentifier::new()
+                .with_replacement_id("1234567890123456")
+                .is_ok()
+        );
     }
 
     #[test]

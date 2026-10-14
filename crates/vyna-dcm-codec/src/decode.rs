@@ -207,6 +207,10 @@ fn decode_elements(
         });
     }
     let mut ds = DataSet::new();
+    // Implicit-VR `US-or-SS` tags met before Pixel Representation
+    // (three rule tags sort before (0028,0103)): resolved as US for
+    // now, flipped to SS below if the sibling arrives as 1.
+    let mut deferred_ss = Vec::new();
     while r.pos < end {
         let elem_offset = r.pos;
         let tag = r.tag()?;
@@ -230,7 +234,28 @@ fn decode_elements(
         {
             *charset = parse_specific_character_set(values);
         }
+        if !r.explicit
+            && vr == Vr::Us
+            && context_vr_rule(tag) == Some(ContextVrRule::PixelRepresentation)
+            && ds.get(tags::PIXEL_REPRESENTATION).is_none()
+        {
+            deferred_ss.push(tag);
+        }
         ds.insert(DataElement::new(tag, vr, value));
+    }
+    // Same-level fix-up: the sibling arrived late as signed, so the
+    // early elements are really SS. Bits are identical (`as i16`
+    // reinterprets); only the VR and typed value change.
+    if ds.uint16(tags::PIXEL_REPRESENTATION) == Some(1) {
+        for tag in deferred_ss {
+            if let Some(e) = ds.get_mut(tag)
+                && let Value::U16(v) = &e.value
+            {
+                let signed = v.iter().map(|x| *x as i16).collect();
+                e.vr = Vr::Ss;
+                e.value = Value::I16(signed);
+            }
+        }
     }
     Ok(ds)
 }
@@ -729,6 +754,9 @@ fn numerics<T, F>(raw: &[u8], unit: usize, little: bool, f: F, tag: Tag, vr: Vr)
 where
     F: Fn(&[u8], bool) -> T,
 {
+    // The match arms above pass literal widths; they must agree with
+    // the core table (single source of truth for VR widths).
+    debug_assert_eq!(Some(unit), vr.unit_size(), "width drift for {vr:?}");
     let mut raw = raw;
     if !raw.len().is_multiple_of(unit) {
         // Tolerate a single trailing pad byte on odd-length values.
@@ -836,6 +864,54 @@ fn split_values(text: &str, vr: Vr) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn numeric_widths_match_core_unit_size() {
+        // Cross-crate pin: the decode arms pass these literal widths
+        // to numerics(); if core's table changes, this fails loudly.
+        for (vr, width) in [
+            (Vr::Us, 2),
+            (Vr::Ss, 2),
+            (Vr::Ul, 4),
+            (Vr::Ol, 4),
+            (Vr::Sl, 4),
+            (Vr::Uv, 8),
+            (Vr::Ov, 8),
+            (Vr::Sv, 8),
+            (Vr::Fl, 4),
+            (Vr::Of, 4),
+            (Vr::Fd, 8),
+            (Vr::Od, 8),
+            (Vr::At, 4),
+        ] {
+            assert_eq!(vr.unit_size(), Some(width), "{vr:?}");
+        }
+    }
+
+    #[test]
+    fn preorder_us_or_ss_flips_when_pixel_rep_arrives_signed() {
+        // (0028,0071) sorts before (0028,0103): implicit-VR decode must
+        // not freeze it as US when the sibling arrives late as 1.
+        let mut raw = Vec::new();
+        for (g, e, val) in [
+            (0x0028u16, 0x0071u16, 0xFFFFu16),
+            (0x0028u16, 0x0103u16, 1u16),
+        ] {
+            raw.extend_from_slice(&g.to_le_bytes());
+            raw.extend_from_slice(&e.to_le_bytes());
+            raw.extend_from_slice(&2u32.to_le_bytes());
+            raw.extend_from_slice(&val.to_le_bytes());
+        }
+        let ds = implicit_le(&raw).unwrap();
+        let el = ds.get(Tag::new(0x0028, 0x0071)).unwrap();
+        assert_eq!(el.vr, Vr::Ss);
+        assert!(matches!(el.value, Value::I16(ref v) if v == &[-1i16]));
+        // Unsigned sibling: stays US (2nd value lives at 18..20).
+        raw[18..20].copy_from_slice(&0u16.to_le_bytes());
+        let ds = implicit_le(&raw).unwrap();
+        let el = ds.get(Tag::new(0x0028, 0x0071)).unwrap();
+        assert_eq!(el.vr, Vr::Us);
+    }
 
     fn explicit_le(bytes: &[u8]) -> Result<DataSet> {
         decode_dataset(bytes, TransferSyntax::ExplicitVrLittleEndian)

@@ -32,7 +32,7 @@ struct Args {
     #[arg(long)]
     patient_id: Option<String>,
     /// Dummy text for name-like `Dummy`-action tags (default:
-    /// ANONYMIZED). Patient's Name itself is removed per E.1 `X`.
+    /// ANONYMIZED). Patient's Name itself is emptied per E.1 `Z`.
     #[arg(long)]
     patient_name: Option<String>,
     /// Keep private data elements (default: removed).
@@ -135,9 +135,16 @@ fn process_file(deid: &mut Deidentifier, input: &Path, dest: &Path) -> Result<St
         .ok_or_else(|| format!("{}: missing SOP Instance UID", input.display()))?;
     meta.media_storage_sop_class_uid = class.to_string();
     meta.media_storage_sop_instance_uid = inst.to_string();
-    // The source writer's version must not leak into de-identified output.
+    // Source-writer identity must not leak into de-identified output:
+    // the Implementation Class UID names the vendor/model, and the
+    // file-meta AE titles name the source site's network endpoints
+    // (same identity class as Station AE Title, which E.1 removes).
+    meta.implementation_class_uid = vyna_dcm_core::VYNA_IMPLEMENTATION_CLASS_UID.to_string();
     meta.implementation_version_name =
         Some(vyna_dcm_core::VYNA_IMPLEMENTATION_VERSION_NAME.to_string());
+    meta.source_ae_title = None;
+    meta.sending_ae_title = None;
+    meta.receiving_ae_title = None;
     let out = write_part10(&meta, &ds).map_err(|e| format!("{}: {e}", input.display()))?;
     write_output(dest, &out)?;
     Ok(format!(
@@ -177,7 +184,13 @@ fn run() -> i32 {
         deid = deid.with_date_offset(days);
     }
     if let Some(id) = &args.patient_id {
-        deid = deid.with_replacement_id(id.clone());
+        match deid.with_replacement_id(id.clone()) {
+            Ok(d) => deid = d,
+            Err(e) => {
+                eprintln!("deidentify: bad --patient-id: {e}");
+                return 1;
+            }
+        }
     }
     if let Some(name) = &args.patient_name {
         match deid.with_replacement_name(name) {
@@ -269,11 +282,16 @@ mod tests {
         ds.put_uid(tags::SOP_CLASS_UID, "1.2.840.10008.5.1.4.1.1.7");
         ds.put_uid(tags::SOP_INSTANCE_UID, "1.9.9.9");
         ds.put_text(tags::PATIENT_ID, Vr::Lo, "E123");
-        let meta = FileMeta::new(
+        let mut meta = FileMeta::new(
             "1.2.840.10008.5.1.4.1.1.7",
             "1.9.9.9",
             TransferSyntax::ExplicitVrLittleEndian,
         );
+        // Source-writer identity that must not survive de-identification.
+        meta.implementation_class_uid = "9.9.9.424242".to_string();
+        meta.source_ae_title = Some("SOURCESCP".to_string());
+        meta.sending_ae_title = Some("SENDSITE".to_string());
+        meta.receiving_ae_title = Some("RECVSITE".to_string());
         std::fs::write(&input, vyna_dcm::write_part10(&meta, &ds).unwrap()).unwrap();
         let summary = process_file(&mut Deidentifier::new(), &input, &output).unwrap();
         // Patient ID is E.1 `Z`: zeroed (kept but emptied), not dummied.
@@ -286,6 +304,13 @@ mod tests {
             ds2.string(tags::SOP_INSTANCE_UID).unwrap()
         );
         assert_ne!(meta2.media_storage_sop_instance_uid, "1.9.9.9");
+        assert_eq!(
+            meta2.implementation_class_uid,
+            vyna_dcm_core::VYNA_IMPLEMENTATION_CLASS_UID
+        );
+        assert_eq!(meta2.source_ae_title, None);
+        assert_eq!(meta2.sending_ae_title, None);
+        assert_eq!(meta2.receiving_ae_title, None);
         std::fs::remove_file(&input).unwrap();
         std::fs::remove_file(&output).unwrap();
     }

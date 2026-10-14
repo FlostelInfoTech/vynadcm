@@ -379,7 +379,7 @@ async fn handle_one<S: DicomWebStore + 'static>(
     for (k, v) in &hresp.headers {
         builder = builder.header(k, v);
     }
-    match builder.body(Full::new(Bytes::from(hresp.body))) {
+    match builder.body(Full::new(hresp.body)) {
         Ok(resp) => Ok(resp),
         Err(_) => {
             let mut resp = Response::new(Full::new(Bytes::from_static(b"internal error")));
@@ -434,7 +434,10 @@ mod tests {
     async fn end_to_end_client_against_hyper() {
         let store = Arc::new(MemoryStore::new());
         store
-            .store_instance(&test_file("1.2.9", "1.2.9.1", "1.2.9.1.1", 4, 4), None)
+            .store_instance(
+                Bytes::from(test_file("1.2.9", "1.2.9.1", "1.2.9.1.1", 4, 4)),
+                None,
+            )
             .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

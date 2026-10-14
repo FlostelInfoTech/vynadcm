@@ -65,6 +65,29 @@ pub struct AssociationOptions {
     /// TCP connect timeout (a hanging SYN must not stall the caller —
     /// for C-MOVE that caller is an inbound association).
     pub connect_timeout: Duration,
+    /// Pending-response cap for SCU multi-response loops
+    /// (`find_with`, `find_cancelable`, `get_with`, MOVE awaits): past
+    /// this the association aborts with [`Error::TooManyResponses`],
+    /// so a rogue peer PENDING forever cannot hold the call forever.
+    pub max_pending_responses: u32,
+}
+
+impl Association {
+    /// Count one more non-final response toward
+    /// `max_pending_responses`; past the cap the association aborts
+    /// (draining would let a rogue peer hold the call forever).
+    pub(crate) async fn count_pending(&mut self, pending: &mut u32) -> Result<()> {
+        *pending = pending.saturating_add(1);
+        if *pending > self.max_pending_responses {
+            // Best-effort: the error below is the outcome; a failed
+            // abort just means the socket is already dead.
+            self.abort(0, 0).await.ok();
+            return Err(Error::TooManyResponses {
+                limit: self.max_pending_responses,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Default for AssociationOptions {
@@ -80,6 +103,7 @@ impl Default for AssociationOptions {
             application_context: APPLICATION_CONTEXT_NAME.to_string(),
             max_incoming_pdu: 64 * 1024 * 1024,
             max_message_bytes: 1024 * 1024 * 1024,
+            max_pending_responses: crate::MAX_PENDING_RESPONSES,
         }
     }
 }
@@ -127,6 +151,7 @@ pub struct Association {
     max_incoming_pdu: u32,
     max_message_bytes: u64,
     read_timeout: Duration,
+    max_pending_responses: u32,
     next_id: u16,
     /// Pushback queue: events seen by a cancel poll that belong to the
     /// dispatch loop (e.g. RELEASE-RQ mid-FIND), each with its dataset
@@ -140,12 +165,15 @@ pub struct Association {
 }
 
 impl Association {
-    /// Connect over TCP and request an association.
-    pub async fn request(
+    /// Connect over TCP and request an association. Any
+    /// [`ToSocketAddrs`](tokio::net::ToSocketAddrs) form works — prefer
+    /// `(host, port)` tuples over pre-joined `"host:port"` strings so
+    /// IPv6 literals resolve correctly.
+    pub async fn request<A: tokio::net::ToSocketAddrs>(
         opts: &AssociationOptions,
         calling_ae: &AeTitle,
         called_ae: &AeTitle,
-        addr: &str,
+        addr: A,
         proposed: Vec<ProposedContext>,
     ) -> Result<Self> {
         // A hanging SYN must time out: without this, a C-MOVE to a
@@ -196,6 +224,7 @@ impl Association {
             max_incoming_pdu: opts.max_incoming_pdu,
             max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
+            max_pending_responses: opts.max_pending_responses,
             next_id: 1,
             pending: VecDeque::new(),
             pdu_queue: VecDeque::new(),
@@ -284,6 +313,7 @@ impl Association {
             max_incoming_pdu: opts.max_incoming_pdu,
             max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
+            max_pending_responses: opts.max_pending_responses,
             next_id: 1,
             pending: VecDeque::new(),
             pdu_queue: VecDeque::new(),
@@ -592,6 +622,7 @@ mod tests {
             max_incoming_pdu: opts.max_incoming_pdu,
             max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
+            max_pending_responses: opts.max_pending_responses,
             next_id: u16::MAX,
             pending: VecDeque::new(),
             pdu_queue: VecDeque::new(),

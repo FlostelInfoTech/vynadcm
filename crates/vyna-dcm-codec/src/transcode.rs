@@ -510,15 +510,22 @@ fn refragment(frames: Vec<Vec<u8>>) -> Result<vyna_dcm_core::FragmentSequence> {
     let mut pos: u32 = 0;
     for frame in &frames {
         offsets.push(pos);
-        for chunk in frame.chunks(MAX_FRAGMENT) {
+        // Pad the frame-final chunk to even (PS3.5 §8.2) and address
+        // the padded stream: offsets must match wire item lengths.
+        let chunks = frame.chunks(MAX_FRAGMENT).len();
+        for (i, chunk) in frame.chunks(MAX_FRAGMENT).enumerate() {
+            let mut bytes = chunk.to_vec();
+            if i + 1 == chunks && bytes.len() % 2 == 1 {
+                bytes.push(0x00);
+            }
             pos = pos
-                .checked_add(chunk.len() as u32)
+                .checked_add(bytes.len() as u32)
                 .ok_or_else(|| Error::BadValue {
                     tag: tags::PIXEL_DATA,
                     vr: Vr::Ob,
                     message: "fragment stream exceeds 32-bit basic offset table".into(),
                 })?;
-            fragments.push(chunk.to_vec());
+            fragments.push(bytes);
         }
     }
     Ok(FragmentSequence {
@@ -1046,6 +1053,15 @@ mod tests {
         assert_eq!(seq.basic_offset_table, vec![0, 10]);
         assert!(seq.fragments.iter().all(|f| f.len() <= MAX_FRAGMENT));
         assert_eq!(seq.fragments.concat().len(), 10 + big.len());
+        // An odd final chunk pads to even and offsets address the
+        // padded stream (frame 1 starts after 10 + 65536 + 1002).
+        let odd = vec![7u8; MAX_FRAGMENT + 1001];
+        let seq = refragment(vec![vec![1u8; 10], odd, vec![2u8; 4]]).unwrap();
+        assert!(seq.fragments.iter().all(|f| f.len() % 2 == 0));
+        assert_eq!(
+            seq.basic_offset_table,
+            vec![0, 10, 10 + MAX_FRAGMENT as u32 + 1002]
+        );
     }
 
     #[test]

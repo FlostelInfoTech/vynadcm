@@ -33,6 +33,10 @@ struct Args {
     /// argv without a shell; `{file}` `{class}` `{instance}`
     /// `{patient}` `{study}` `{caller}` `{called}` expand per
     /// argument (values with spaces stay in one argv element).
+    /// Token values are peer-declared (dataset contents, negotiated
+    /// AE titles — nothing authenticates `{caller}` short of TLS
+    /// client certs), so hooks must treat them as untrusted input,
+    /// never as an identity proof.
     #[arg(long)]
     exec: Option<String>,
     /// Log patient names with each store (PHI: off by default).

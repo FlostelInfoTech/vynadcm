@@ -44,16 +44,14 @@ release/abort, and loop.
 - Services: C-ECHO.
 - SOP Classes proposed (SCU role):
   - Verification (C-ECHO) (`1.2.840.10008.1.1`).
-- Transfer syntaxes proposed: Explicit VR Little Endian and
-  Implicit VR Little Endian.
+- Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
 
 #### 3.1.2 `storescu` — C-STORE Part-10 files to a peer
 
 - Services: C-STORE.
 - SOP Classes: taken from the input files' SOP Class UIDs
   (any storage SOP Class the peer accepts).
-- Transfer syntaxes proposed: Explicit VR Little Endian and
-  Implicit VR Little Endian.
+- Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
 - Note: also proposes each input file's own transfer syntax.
 
 #### 3.1.3 `findscu` — C-FIND query and print matches
@@ -64,8 +62,7 @@ release/abort, and loop.
   - Patient Root Q/R — FIND (`1.2.840.10008.5.1.4.1.2.1.1`).
   - Patient/Study Only Q/R — FIND (`1.2.840.10008.5.1.4.1.2.3.1`).
   - Modality Worklist — FIND (`1.2.840.10008.5.1.4.31`).
-- Transfer syntaxes proposed: Explicit VR Little Endian and
-  Implicit VR Little Endian.
+- Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
 - Note: `--cancel N` stops after N matches; a requested FE00 exits 0.
 
 #### 3.1.4 `movescu` — C-MOVE retrieve: the peer sends matches to --dest (run storescp there)
@@ -75,8 +72,7 @@ release/abort, and loop.
   - Study Root Q/R — MOVE (`1.2.840.10008.5.1.4.1.2.2.2`).
   - Patient Root Q/R — MOVE (`1.2.840.10008.5.1.4.1.2.1.2`).
   - Patient/Study Only Q/R — MOVE (`1.2.840.10008.5.1.4.1.2.3.2`).
-- Transfer syntaxes proposed: Explicit VR Little Endian and
-  Implicit VR Little Endian.
+- Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
 
 #### 3.1.5 `getscu` — C-GET retrieve into a directory (instances arrive on this association)
 
@@ -110,24 +106,21 @@ release/abort, and loop.
   - Encapsulated PDF Storage (`1.2.840.10008.5.1.4.1.1.104.1`).
   - Encapsulated CDA Storage (`1.2.840.10008.5.1.4.1.1.104.2`).
   - Positron Emission Tomography Image Storage (`1.2.840.10008.5.1.4.1.1.128`).
-- Transfer syntaxes proposed: Explicit VR Little Endian and
-  Implicit VR Little Endian.
+- Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
 
 #### 3.1.6 `mppsscu` — Send an MPPS N-CREATE followed by N-SET
 
 - Services: N-CREATE, N-SET.
 - SOP Classes proposed (SCU role):
   - Modality Performed Procedure Step (`1.2.840.10008.3.1.2.3.3`).
-- Transfer syntaxes proposed: Explicit VR Little Endian and
-  Implicit VR Little Endian.
+- Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
 
 #### 3.1.7 `stgcmtscu` — Request storage commitment, then wait for the N-EVENT-REPORT (--timeout-secs bounds the wait)
 
 - Services: N-ACTION + N-EVENT-REPORT (commitment).
 - SOP Classes proposed (SCU role):
   - Storage Commitment Push Model (`1.2.840.10008.1.20.1`).
-- Transfer syntaxes proposed: Explicit VR Little Endian and
-  Implicit VR Little Endian.
+- Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
 
 ### 3.2 SCP tools
 
@@ -173,8 +166,8 @@ authentication unless the embedding application installs the
   one syntax per context from its accepted list.
 - Maximum PDU: tools offer 256 KiB (`max_pdu`); the largest
   accepted incoming PDU is 64 MiB (`max_incoming_pdu`).
-- Timeouts: SCU tools default to a 30 s per-read timeout, SCP tools
-  to 300 s (`--timeout-secs`).
+- Timeouts: SCU tools default to a 30 s per-read timeout,
+  SCP tools to 300 s (`--timeout-secs`).
 - The SCU proposes no Role Selection and no User Identity; the
   SCP accepts (echoes) any roles the peer proposes. No other
   extended negotiation (asynchronous operations, SOP Class
@@ -290,6 +283,14 @@ nothing truncates silently except where noted):
   1 GiB.
 - ATNA syslog: UDP frames 65,507 bytes (larger audits need TCP
   or TLS); 10 s connect/write timeout.
+- Association stash: 16 stray datasets / 64 MiB aggregate
+  (past that: the operation aborts the association).
+- Storage commitment: 10,000 referenced SOPs per request.
+- Connection setup: TCP connect and TLS handshake each 10 s.
+- DICOMweb server: QIDO query strings 64 KiB, aggregate
+  in-flight request bodies 4 GiB.
+- SCP tools: 1,024 concurrent associations per tool (past
+  that: the peer is dropped).
 
 ## Annex A — SOP Classes
 

@@ -88,12 +88,18 @@ impl DataSet {
     // -- typed readers ----------------------------------------------------
 
     /// First text value of `tag`, or `None` when absent/not text.
+    ///
+    /// Decoded `PN` values are [`Value::PersonName`], not text: use
+    /// [`person_names`](Self::person_names) or
+    /// [`person_name_string`](Self::person_name_string) for those.
     #[must_use]
     pub fn string(&self, tag: Tag) -> Option<&str> {
         self.get(tag).and_then(|e| e.value.first_text())
     }
 
     /// All text values of `tag`.
+    ///
+    /// Blind to decoded [`Value::PersonName`] like [`string`](Self::string).
     #[must_use]
     pub fn strings(&self, tag: Tag) -> Option<&[String]> {
         match self.get(tag).map(|e| &e.value) {
@@ -104,6 +110,11 @@ impl DataSet {
 
     /// Required string; [`Error::MissingAttribute`] when absent,
     /// [`Error::Value`] when present but empty or not text.
+    ///
+    /// Decoded `PN` values fail here (they are
+    /// [`Value::PersonName`]); read those with
+    /// [`person_names`](Self::person_names) or
+    /// [`person_name_string`](Self::person_name_string).
     pub fn require_string(&self, tag: Tag) -> Result<&str> {
         let Some(e) = self.get(tag) else {
             return Err(Error::MissingAttribute(tag.to_string()));
@@ -128,6 +139,16 @@ impl DataSet {
             Some(Value::PersonName(v)) => Some(v),
             _ => None,
         }
+    }
+
+    /// First person name of `tag` rendered as a DICOM string, or `None`
+    /// when absent/not `PN`. This is the `string()` equivalent for
+    /// decoded person names (which [`string`](Self::string) cannot see).
+    #[must_use]
+    pub fn person_name_string(&self, tag: Tag) -> Option<String> {
+        self.person_names(tag)?
+            .first()
+            .map(PersonName::to_dicom_string)
     }
 
     /// First `u16` of `tag` (`US`).
@@ -163,12 +184,15 @@ impl DataSet {
     /// hidden: the `as f64` conversion rounds). Text uses DS grammar:
     /// Rust-only spellings (`inf`, `NaN`, ...) are not numbers and
     /// yield `None` (binary `FL`/`FD` infinities stay faithful — the
-    /// bits really say that).
+    /// bits really say that). Text under any other VR (a `DA` like
+    /// `20261011`, an `LO` like `1.5`) is not a number either.
     #[must_use]
     pub fn float(&self, tag: Tag) -> Option<f64> {
         let e = self.get(tag)?;
         match &e.value {
-            Value::Text(v) => v.first().and_then(|s| parse_finite(s)),
+            Value::Text(v) if matches!(e.vr, Vr::Ds | Vr::Is) => {
+                v.first().and_then(|s| parse_finite(s))
+            }
             Value::F32(v) => v.first().map(|f| *f as f64),
             Value::F64(v) => v.first().copied(),
             Value::U16(v) => v.first().map(|f| *f as f64),
@@ -185,16 +209,19 @@ impl DataSet {
     /// unparseable text ones (mirrors [`DataSet::float`]).
     #[must_use]
     pub fn float_list(&self, tag: Tag) -> Option<Vec<f64>> {
-        match self.get(tag).map(|e| &e.value) {
-            Some(Value::Text(v)) => Some(v.iter().filter_map(|s| parse_finite(s)).collect()),
-            Some(Value::F32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
-            Some(Value::F64(v)) => Some(v.clone()),
-            Some(Value::U16(v)) => Some(v.iter().map(|f| *f as f64).collect()),
-            Some(Value::U32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
-            Some(Value::U64(v)) => Some(v.iter().map(|f| *f as f64).collect()),
-            Some(Value::I16(v)) => Some(v.iter().map(|f| *f as f64).collect()),
-            Some(Value::I32(v)) => Some(v.iter().map(|f| *f as f64).collect()),
-            Some(Value::I64(v)) => Some(v.iter().map(|f| *f as f64).collect()),
+        let e = self.get(tag)?;
+        match &e.value {
+            Value::Text(v) if matches!(e.vr, Vr::Ds | Vr::Is) => {
+                Some(v.iter().filter_map(|s| parse_finite(s)).collect())
+            }
+            Value::F32(v) => Some(v.iter().map(|f| *f as f64).collect()),
+            Value::F64(v) => Some(v.clone()),
+            Value::U16(v) => Some(v.iter().map(|f| *f as f64).collect()),
+            Value::U32(v) => Some(v.iter().map(|f| *f as f64).collect()),
+            Value::U64(v) => Some(v.iter().map(|f| *f as f64).collect()),
+            Value::I16(v) => Some(v.iter().map(|f| *f as f64).collect()),
+            Value::I32(v) => Some(v.iter().map(|f| *f as f64).collect()),
+            Value::I64(v) => Some(v.iter().map(|f| *f as f64).collect()),
             _ => None,
         }
     }
@@ -335,6 +362,36 @@ mod tests {
             Value::F32(vec![f32::INFINITY]),
         ));
         assert_eq!(ds.float(tags::RESCALE_SLOPE), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn decoded_person_names_need_pn_accessors() {
+        // Decoded PN data is Value::PersonName, invisible to string().
+        let mut ds = DataSet::new();
+        ds.put_person_name(tags::PATIENT_NAME, vec![PersonName::parse("Doe^Jane")]);
+        assert_eq!(ds.string(tags::PATIENT_NAME), None);
+        assert!(ds.require_string(tags::PATIENT_NAME).is_err());
+        assert_eq!(
+            ds.person_name_string(tags::PATIENT_NAME),
+            Some("Doe^Jane".to_string())
+        );
+        assert_eq!(ds.person_names(tags::PATIENT_NAME).unwrap().len(), 1);
+        // Absent / wrong-type still None.
+        assert_eq!(ds.person_name_string(tags::PATIENT_ID), None);
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "E123");
+        assert_eq!(ds.person_name_string(tags::PATIENT_ID), None);
+    }
+
+    #[test]
+    fn float_ignores_non_ds_is_text() {
+        let mut ds = DataSet::new();
+        ds.put_text(tags::STUDY_DATE, Vr::Da, "20261011");
+        ds.put_text(tags::SERIES_DESCRIPTION, Vr::Lo, "1.5");
+        assert_eq!(ds.float(tags::STUDY_DATE), None);
+        assert_eq!(ds.float(tags::SERIES_DESCRIPTION), None);
+        assert_eq!(ds.float_list(tags::STUDY_DATE), None);
+        ds.put_text(tags::RESCALE_SLOPE, Vr::Ds, "1.25");
+        assert_eq!(ds.float(tags::RESCALE_SLOPE), Some(1.25));
     }
 
     #[test]

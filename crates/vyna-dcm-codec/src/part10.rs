@@ -151,6 +151,15 @@ pub fn read_part10_header(bytes: &[u8]) -> Result<(FileMeta, DataSet)> {
 /// stop was reached: `false` means `bytes` ran out first, so the
 /// headers may be partial (callers feeding a bounded prefix must grow
 /// it and retry rather than index a key-poor record).
+///
+/// Exception: a fully-present file with no Pixel Data element at all
+/// also reports `false` — the flag cannot distinguish "pixel-less" from
+/// "cut exactly at the pixel tag". Callers must treat EOF as complete:
+///
+/// ```ignore
+/// let (meta, ds, complete) = read_part10_header_complete(&prefix)?;
+/// let done = complete || eof_reached; // qrdb's read_header_capped does this
+/// ```
 pub fn read_part10_header_complete(bytes: &[u8]) -> Result<(FileMeta, DataSet, bool)> {
     let (meta, body, meta_len) = read_meta(bytes)?;
     let ts = meta.transfer_syntax()?;

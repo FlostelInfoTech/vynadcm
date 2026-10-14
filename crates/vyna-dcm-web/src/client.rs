@@ -1,5 +1,6 @@
 //! DICOMweb client: QIDO-RS, WADO-RS, STOW-RS (NEMA PS3.18 §8).
 
+use bytes::Bytes;
 use vyna_dcm_codec::{FileMeta, dataset_from_json, read_part10};
 use vyna_dcm_core::DataSet;
 
@@ -40,8 +41,13 @@ impl std::fmt::Debug for Auth {
     }
 }
 
-/// Lowercased `scheme://authority` of an absolute HTTP(S) URL, or
+/// Lowercased `scheme://host[:port]` of an absolute HTTP(S) URL, or
 /// `None` when the URL is relative or not HTTP(S).
+///
+/// Default ports (`:443`/`:80`) normalize away, matching reqwest's
+/// own redirect logic (`port_or_known_default`): spelling the base
+/// `https://h/x` and a BulkDataURI `https://h:443/y` must not count
+/// as cross-origin (auth stripped → 401).
 fn origin_of(url: &str) -> Option<String> {
     let (scheme, rest) = url
         .strip_prefix("https://")
@@ -51,9 +57,24 @@ fn origin_of(url: &str) -> Option<String> {
     if authority.is_empty() {
         return None;
     }
+    // Split off a port only to drop exact default spellings; the
+    // rejoin below reconstructs anything else verbatim (including
+    // IPv6 literals, where the "port" half never equals a default).
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (authority, None),
+    };
+    let default = match scheme {
+        "https" => "443",
+        _ => "80",
+    };
+    let normalized = match port {
+        Some(p) if p != default => format!("{host}:{p}"),
+        _ => host.to_string(),
+    };
     // Lowercasing the whole authority is safe (host is
     // case-insensitive, port/userinfo are matched verbatim anyway).
-    Some(format!("{}://{}", scheme, authority.to_ascii_lowercase()))
+    Some(format!("{}://{}", scheme, normalized.to_ascii_lowercase()))
 }
 
 /// Whether `url` may carry this client's credentials.
@@ -93,7 +114,9 @@ impl DicomWebClient {
     /// (`https://user:pass@host`) are rejected: credentials belong in
     /// [`Auth`], not in a string that reaches `Debug` and
     /// error messages (and that reqwest would turn into surprise
-    /// Basic-auth headers).
+    /// Basic-auth headers). Query strings and fragments are rejected
+    /// too: every call appends path segments, which a `?`/`#` would
+    /// corrupt into query/fragment.
     pub fn new(base_url: impl Into<String>) -> Result<Self> {
         let base = base_url.into();
         let base = base.trim_end_matches('/').to_string();
@@ -110,6 +133,11 @@ impl DicomWebClient {
         if !parsed.username().is_empty() || parsed.password().is_some() {
             return Err(Error::BadRequest(format!(
                 "bad base URL {base:?}: userinfo credentials are rejected, use Auth"
+            )));
+        }
+        if parsed.query().is_some() || parsed.fragment().is_some() {
+            return Err(Error::BadRequest(format!(
+                "bad base URL {base:?}: query/fragment would corrupt appended paths"
             )));
         }
         // reqwest 0.13 `rustls-no-provider` needs the app to install a
@@ -196,8 +224,29 @@ impl DicomWebClient {
 
     // -- QIDO-RS ---------------------------------------------------------
 
+    /// Percent-encode one URL path segment. UIDs interpolate into
+    /// request paths, and a `?` would inject a query while a `#`
+    /// would silently retarget the request — so every UID goes
+    /// through here (`[A-Za-z0-9.-]` pass, the rest `%XX`).
+    #[must_use]
+    pub fn path_segment(s: &str) -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.bytes() {
+            if b.is_ascii_alphanumeric() || b == b'.' || b == b'-' {
+                out.push(b as char);
+            } else {
+                out.push_str(&format!("%{b:02X}"));
+            }
+        }
+        out
+    }
+
     /// Generic QIDO-RS search over `resource` (`studies`,
     /// `studies/{uid}/series`, `studies/{uid}/series/{uid}/instances`, ...).
+    ///
+    /// `resource` interpolates verbatim: callers composing it from UIDs
+    /// must encode each segment with [`path_segment`](Self::path_segment)
+    /// (the typed `search_*` wrappers already do).
     pub async fn qido(&self, resource: &str, query: &[(&str, &str)]) -> Result<Vec<DataSet>> {
         let url = format!("{}/{}", self.base_url, resource.trim_start_matches('/'));
         let resp = self
@@ -221,8 +270,11 @@ impl DicomWebClient {
         study_uid: &str,
         query: &[(&str, &str)],
     ) -> Result<Vec<DataSet>> {
-        self.qido(&format!("studies/{study_uid}/series"), query)
-            .await
+        self.qido(
+            &format!("studies/{}/series", Self::path_segment(study_uid)),
+            query,
+        )
+        .await
     }
 
     /// Search instances of a series.
@@ -233,7 +285,11 @@ impl DicomWebClient {
         query: &[(&str, &str)],
     ) -> Result<Vec<DataSet>> {
         self.qido(
-            &format!("studies/{study_uid}/series/{series_uid}/instances"),
+            &format!(
+                "studies/{}/series/{}/instances",
+                Self::path_segment(study_uid),
+                Self::path_segment(series_uid)
+            ),
             query,
         )
         .await
@@ -254,8 +310,11 @@ impl DicomWebClient {
         accept: Option<&str>,
     ) -> Result<Vec<Part>> {
         let url = format!(
-            "{}/studies/{study_uid}/series/{series_uid}/instances/{instance_uid}",
-            self.base_url
+            "{}/studies/{}/series/{}/instances/{}",
+            self.base_url,
+            Self::path_segment(study_uid),
+            Self::path_segment(series_uid),
+            Self::path_segment(instance_uid)
         );
         let resp = self
             .get(url)
@@ -269,13 +328,50 @@ impl DicomWebClient {
         Self::expect_multipart(resp).await
     }
 
+    /// Retrieve a whole study as one `application/dicom` part per
+    /// instance (`GET /studies/{uid}`, PS3.18 §6.5.3).
+    pub async fn wado_study(&self, study_uid: &str) -> Result<Vec<Part>> {
+        let url = format!(
+            "{}/studies/{}",
+            self.base_url,
+            Self::path_segment(study_uid)
+        );
+        let resp = self
+            .get(url)
+            .header("Accept", "multipart/related; type=\"application/dicom\"")
+            .send()
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
+        Self::expect_multipart(resp).await
+    }
+
+    /// Retrieve a whole series as one `application/dicom` part per
+    /// instance (`GET /studies/{uid}/series/{uid}`, PS3.18 §6.5.4).
+    pub async fn wado_series(&self, study_uid: &str, series_uid: &str) -> Result<Vec<Part>> {
+        let url = format!(
+            "{}/studies/{}/series/{}",
+            self.base_url,
+            Self::path_segment(study_uid),
+            Self::path_segment(series_uid)
+        );
+        let resp = self
+            .get(url)
+            .header("Accept", "multipart/related; type=\"application/dicom\"")
+            .send()
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
+        Self::expect_multipart(resp).await
+    }
+
     /// Retrieve an instance's first `application/dicom` part as raw bytes.
+    ///
+    /// Shared [`Bytes`]: no copy between the response buffer and the caller.
     pub async fn wado_file(
         &self,
         study_uid: &str,
         series_uid: &str,
         instance_uid: &str,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Bytes> {
         let parts = self
             .wado_parts(study_uid, series_uid, instance_uid, None)
             .await?;
@@ -285,7 +381,7 @@ impl DicomWebClient {
     /// First `application/dicom` part body. Media-type match, not
     /// string equality: compliant servers add parameters such as
     /// `transfer-syntax` (PS3.18 §8.6).
-    fn dicom_part_body(parts: Vec<Part>) -> Result<Vec<u8>> {
+    fn dicom_part_body(parts: Vec<Part>) -> Result<Bytes> {
         parts
             .into_iter()
             .find(|p| is_dicom_media_type(&p.content_type))
@@ -330,8 +426,11 @@ impl DicomWebClient {
         instance_uid: &str,
     ) -> Result<serde_json::Value> {
         let url = format!(
-            "{}/studies/{study_uid}/series/{series_uid}/instances/{instance_uid}/metadata",
-            self.base_url
+            "{}/studies/{}/series/{}/instances/{}/metadata",
+            self.base_url,
+            Self::path_segment(study_uid),
+            Self::path_segment(series_uid),
+            Self::path_segment(instance_uid)
         );
         let resp = self
             .get(url)
@@ -365,8 +464,11 @@ impl DicomWebClient {
             .collect::<Vec<_>>()
             .join(",");
         let url = format!(
-            "{}/studies/{study_uid}/series/{series_uid}/instances/{instance_uid}/frames/{list}",
-            self.base_url
+            "{}/studies/{}/series/{}/instances/{}/frames/{list}",
+            self.base_url,
+            Self::path_segment(study_uid),
+            Self::path_segment(series_uid),
+            Self::path_segment(instance_uid)
         );
         let resp = self
             .get(url)
@@ -382,8 +484,18 @@ impl DicomWebClient {
     /// Absolute URIs on another origin are fetched *without* our
     /// credentials: BulkDataURIs are server-supplied and may point
     /// anywhere, so forwarding `Authorization` would leak it (SSRF).
+    /// Absolute URIs carrying their own userinfo (`http://u:p@host`)
+    /// are rejected: reqwest would turn it into a surprise Basic-auth
+    /// header, the exact class base-URL userinfo was rejected for.
     pub async fn wado_bulkdata(&self, uri: &str) -> Result<(String, Vec<u8>)> {
         let url = if uri.starts_with("http://") || uri.starts_with("https://") {
+            let parsed = reqwest::Url::parse(uri)
+                .map_err(|e| Error::BadRequest(format!("bad BulkDataURI: {e}")))?;
+            if !parsed.username().is_empty() || parsed.password().is_some() {
+                return Err(Error::BadRequest(
+                    "BulkDataURI carries its own userinfo credentials".into(),
+                ));
+            }
             uri.to_string()
         } else if uri.starts_with('/') {
             format!("{}{uri}", self.base_url)
@@ -504,7 +616,7 @@ impl DicomWebClient {
             return Err(Error::BadRequest("nothing to store".into()));
         }
         let url = match study_uid {
-            Some(u) => format!("{}/studies/{u}", self.base_url),
+            Some(u) => format!("{}/studies/{}", self.base_url, Self::path_segment(u)),
             None => format!("{}/studies", self.base_url),
         };
         let parts: Vec<Part> = files
@@ -512,7 +624,7 @@ impl DicomWebClient {
             .map(|f| Part::new("application/dicom", f.clone()))
             .collect();
         let boundary = new_boundary();
-        let (content_type, body) = encode_multipart(&parts, &boundary, "application/dicom");
+        let (content_type, body) = encode_multipart(&parts, &boundary, "application/dicom")?;
         let resp = self
             .post(url)
             .header("Content-Type", content_type)
@@ -637,6 +749,7 @@ impl DicomWebClient {
             let boundary = params
                 .get("boundary")
                 .ok_or_else(|| Error::Multipart("missing boundary".into()))?;
+            let body = Bytes::from(body);
             Ok(decode_multipart(&body, boundary)?)
         } else {
             Ok(vec![Part::new(ct, body)])
@@ -931,7 +1044,7 @@ mod tests {
         ];
         assert_eq!(
             DicomWebClient::dicom_part_body(parts).unwrap(),
-            vec![1, 2, 3]
+            Bytes::from_static(&[1, 2, 3])
         );
         let none = vec![Part::new("application/octet-stream", vec![9])];
         assert!(DicomWebClient::dicom_part_body(none).is_err());
@@ -948,10 +1061,44 @@ mod tests {
             "gopher://x",
             "https://user:pass@pacs.example/dw",
             "https://user@pacs.example/dw",
+            "http://h/x?y=1",
+            "http://h/x#frag",
+            "http://h/?limit=5",
         ] {
             let err = DicomWebClient::new(bad).unwrap_err();
             assert!(matches!(err, Error::BadRequest(_)), "{bad}: {err:?}");
         }
+    }
+
+    #[test]
+    fn path_segment_encodes_reserved_chars() {
+        assert_eq!(DicomWebClient::path_segment("1.2.3-4"), "1.2.3-4");
+        assert_eq!(
+            DicomWebClient::path_segment("1.2.3?limit=5"),
+            "1.2.3%3Flimit%3D5"
+        );
+        assert_eq!(DicomWebClient::path_segment("a#b/c d"), "a%23b%2Fc%20d");
+    }
+
+    #[test]
+    fn same_origin_normalizes_default_ports() {
+        assert!(same_origin("https://h:443/y", "https://h/x"));
+        assert!(same_origin("http://h/y", "http://h:80/x"));
+        assert!(same_origin("https://h/y", "https://h/x"));
+        assert!(!same_origin("https://h:8443/y", "https://h/x"));
+        assert!(!same_origin("http://h/y", "https://h/x"));
+        assert!(!same_origin("https://evil/y", "https://h/x"));
+    }
+
+    #[tokio::test]
+    async fn bulkdata_rejects_own_userinfo() {
+        let client = DicomWebClient::new("http://127.0.0.1:1").unwrap();
+        // Rejected client-side before any fetch (no server needed).
+        let err = client
+            .wado_bulkdata("http://spy:s3cret@127.0.0.1:1/bulk/x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
     }
 
     #[tokio::test]
@@ -1037,6 +1184,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_raw_preserves_bulk_links_parsed_drops_them() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Raw-socket stub: one metadata GET answered with a pixel
+        // element that carries only a BulkDataURI (no inline Value).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut tcp, _) = listener.accept().await.unwrap();
+                let mut head = vec![0u8; 65536];
+                let mut have = 0usize;
+                loop {
+                    let n = tcp.read(&mut head[have..]).await.unwrap();
+                    have += n;
+                    if String::from_utf8_lossy(&head[..have]).contains("\r\n\r\n") {
+                        break;
+                    }
+                }
+                let json = r#"[{"00100010":{"vr":"PN","Value":[{"Alphabetic":"Doe^Jane"}]},"7FE00010":{"vr":"OW","BulkDataURI":"http://127.0.0.1/bulk/abc"}}]"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/dicom+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{json}",
+                    json.len()
+                );
+                tcp.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+        let client = DicomWebClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let raw = client.wado_metadata_raw("1", "1", "1").await.unwrap();
+        assert_eq!(
+            raw["7FE00010"]["BulkDataURI"].as_str(),
+            Some("http://127.0.0.1/bulk/abc")
+        );
+        // The parsed form drops the link (bulk arrives empty) — which
+        // is why `--metadata` prints the raw JSON, not this.
+        let parsed = client.wado_metadata("1", "1", "1").await.unwrap();
+        assert!(parsed.bytes(vyna_dcm_core::tags::PIXEL_DATA).is_none());
+    }
+
+    #[tokio::test]
     async fn single_part_wrap_keeps_content_type_params() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -1074,7 +1261,7 @@ mod tests {
             "application/dicom; transfer-syntax=1.2.840.10008.1.2.1"
         );
         assert!(is_dicom_media_type(&parts[0].content_type));
-        assert_eq!(parts[0].body, b"PAYLOAD");
+        assert_eq!(parts[0].body, Bytes::from_static(b"PAYLOAD"));
     }
 
     #[tokio::test]

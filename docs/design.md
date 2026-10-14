@@ -62,7 +62,7 @@ spec adds component contracts, algorithms, sequences, and invariants.
 | `DataSet` | Insertion-ordered map; typed getters return `Option` (never panic); `put_*` builders; `PartialEq` for round-trip asserts |
 | `ENTRIES` / `tags` | 5,239 sorted entries (full PS3.6 2026d + command group); `lookup(Tag)`, `lookup_keyword(&str)`; retired flagged; repeating (`xx`) groups unlisted → `None` |
 | Private dict | 424 creators / 8,898 entries via `lookup_private(creator, group, suffix)` with block + group-wildcard fallbacks; `Tag::{private_block, private_creator_element, private_suffix}` mechanics |
-| `TransferSyntax` | 16 UIDs; `is_encapsulated()`, `is_deflated()`, endianness/VR-explicitness; `Default` = Explicit VR LE |
+| `TransferSyntax` | 16 UIDs; `is_encapsulated()`, `is_deflated()`, endianness/VR-explicitness; two defaults (FR-CORE-05): enum `Default` = Implicit VR LE (PS3.5 §10), new associations prefer Explicit VR LE |
 | `PersonName`, `Da`, `Tm` | `PersonName::parse` is infallible; `Da`/`Tm` validate (`Tm`: `HH[MM[SS[.FFFFFF]]]`, colons optional) |
 
 ### 2.2 `vyna-dcm-codec` — encoding
@@ -196,9 +196,11 @@ spec adds component contracts, algorithms, sequences, and invariants.
   `HttpRequest → HttpResponse` over `&dyn DicomWebStore`; no HTTP
   framework types leak into the core. Unknown routes → 404.
 - `DicomWebStore` is sync and `Send + Sync`: `search` (QIDO scope +
-  filters + limit/offset), `instance_metadata` (+ bulk blobs),
-  `instance_frames` (1-based), `store_instance` (Part-10 in, IDs out),
-  `put_bulk` / `bulk_data` (opaque blob ids for `BulkDataURI`).
+  filters + limit/offset), `instance_file` / `study_files` /
+  `series_files` (retrieve), `instance_metadata` (+ bulk blobs),
+  `instance_frames` (1-based, `Result`: undecodable is `Err`),
+  `store_instance` (Part-10 in, IDs out), `put_bulk` / `bulk_data`
+  (opaque blob ids for `BulkDataURI`).
 - `MemoryStore`: `Mutex`-guarded vectors; replace-on-re-store by SOP
   Instance UID; bulk ids are unpredictable UUIDs with oldest-first
   eviction past 10k blobs / 1 GiB.
@@ -363,16 +365,20 @@ Each crate except `iod` has `error.rs` (`thiserror::Error` +
 - `net`: `Io`, `BadPdu`, `UnexpectedPdu { expected, got }`,
   `Rejected`, `Aborted`, `Released`, `NoPresentationContext`,
   `UnknownContext`, `BadCommand`, `DimseStatus`, `Timeout`,
-  `MessageTooLarge { limit }`, `BadAeTitle`, `Tls`,
-  `UnknownMoveDestination` (plus `Codec`/`Core` passthroughs).
+  `MessageTooLarge { limit }`, `TooManyMatches`, `MatchesTooLarge`,
+  `TooManyResponses`, `TooManyStashed`, `StashedTooLarge`,
+  `BadAeTitle`, `Tls`, `UnknownMoveDestination` (plus
+  `Codec`/`Core` passthroughs).
 - `web`: `Http`, `Status`, `Multipart`, `Json`, `BadRequest` (plus
   `Codec`/`Core` passthroughs).
-- `ecg`: `Waveform`, `Samples` (ragged leads / bad rate), `Missing`
-  (plus `Codec`/`Core` passthroughs).
-- `pdf`: `EmptyDocument`, `DocumentTooLarge`, `Missing`,
-  `NoDocumentBytes`.
-- `deid`: `BurnedInAnnotation`.
-- `atna`: `BadUrl`, `TlsDisabled`, `Transport`, `Tls`.
+- `ecg`: `Waveform`, `Samples` (ragged leads / bad rate), `Missing`,
+  `InvalidMeta` (plus `Codec`/`Core` passthroughs).
+- `pdf`: `EmptyDocument`, `NotPdf`, `DocumentTooLarge`, `Missing`,
+  `NoDocumentBytes`, `InvalidMeta`.
+- `deid`: `BurnedInAnnotation`, `InvalidReplacementName`,
+  `InvalidReplacementId`.
+- `atna`: `BadUrl`, `TlsDisabled`, `Io` (kept `io::ErrorKind`),
+  `Transport`, `Tls`.
 
 Errors carry human-readable context (offsets, tags, UIDs) and never
 expose internal buffers.
@@ -386,7 +392,7 @@ expose internal buffers.
 - `codec`/`core`/`ecg` are sync with no I/O: safe to call from
   `spawn_blocking` or any executor.
 - Timeouts: per-read `read_timeout` (SCU default 30 s in tools,
-  300 s SCP-side); no global association timer in v0.4.
+  300 s SCP-side); no global association timer in v0.5.
 
 ## 7. TLS design (PS3.15 + HTTPS)
 

@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+use bytes::Bytes;
+
 use crate::{Error, Result};
 
 /// One body part.
@@ -17,19 +19,20 @@ pub struct Part {
     pub content_location: Option<String>,
     /// All part headers in order.
     pub headers: Vec<(String, String)>,
-    /// Raw body bytes.
-    pub body: Vec<u8>,
+    /// Raw body bytes (shared: cloning a part does not copy them —
+    /// [`decode_multipart`] slices the request buffer zero-copy).
+    pub body: Bytes,
 }
 
 impl Part {
     /// Build a part with a content type and body.
-    pub fn new(content_type: impl Into<String>, body: Vec<u8>) -> Self {
+    pub fn new(content_type: impl Into<String>, body: impl Into<Bytes>) -> Self {
         let content_type = content_type.into();
         Self {
             headers: vec![("Content-Type".into(), content_type.clone())],
             content_type,
             content_location: None,
-            body,
+            body: body.into(),
         }
     }
 
@@ -51,8 +54,35 @@ pub fn new_boundary() -> String {
 }
 
 /// Encode parts; returns the `Content-Type` header value and the body.
-#[must_use]
-pub fn encode_multipart(parts: &[Part], boundary: &str, root_type: &str) -> (String, Vec<u8>) {
+///
+/// `boundary`, `root_type`, and every part header name/value are
+/// rejected when they carry `\r`/`\n` (header/framing injection —
+/// this is public API an embedder may feed with dataset-derived
+/// values); `boundary`/`root_type` must also avoid `"` (they emit
+/// inside quotes).
+pub fn encode_multipart(
+    parts: &[Part],
+    boundary: &str,
+    root_type: &str,
+) -> Result<(String, Vec<u8>)> {
+    for (what, v) in [("boundary", boundary), ("root type", root_type)] {
+        if v.contains(['\r', '\n']) {
+            return Err(Error::Multipart(format!("{what} contains CR/LF")));
+        }
+        if v.contains('"') {
+            return Err(Error::Multipart(format!("{what} contains `\"`")));
+        }
+    }
+    for part in parts {
+        for (name, value) in &part.headers {
+            if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+                return Err(Error::Multipart("part header contains CR/LF".into()));
+            }
+        }
+        if part.content_type.contains(['\r', '\n']) {
+            return Err(Error::Multipart("part Content-Type contains CR/LF".into()));
+        }
+    }
     let content_type = format!("multipart/related; type=\"{root_type}\"; boundary=\"{boundary}\"");
     let mut body = Vec::new();
     for part in parts {
@@ -74,7 +104,7 @@ pub fn encode_multipart(parts: &[Part], boundary: &str, root_type: &str) -> (Str
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
-    (content_type, body)
+    Ok((content_type, body))
 }
 
 /// Maximum parts accepted by [`decode_multipart`]: delimiter marks
@@ -83,9 +113,13 @@ pub fn encode_multipart(parts: &[Part], boundary: &str, root_type: &str) -> (Str
 const MAX_PARTS: usize = 100_000;
 
 /// Decode a multipart body framed by `boundary` (without quotes/dashes).
-pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
+///
+/// Zero-copy: part bodies are [`Bytes`] slices of `body`, so a 1 GiB
+/// STOW upload is not duplicated per part before storing.
+pub fn decode_multipart(body: &Bytes, boundary: &str) -> Result<Vec<Part>> {
+    let bytes: &[u8] = body;
     let needle = format!("--{boundary}").into_bytes();
-    let marks = find_marks(body, &needle)?;
+    let marks = find_marks(bytes, &needle)?;
     if marks.is_empty() {
         return Err(Error::Multipart("no boundary delimiters found".into()));
     }
@@ -95,7 +129,7 @@ pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
     // Anything past the first closing mark is epilogue, ignored.
     let Some(close_idx) = marks
         .iter()
-        .position(|m| body[m + needle.len()..].starts_with(b"--"))
+        .position(|m| bytes[m + needle.len()..].starts_with(b"--"))
     else {
         return Err(Error::Multipart("missing closing delimiter".into()));
     };
@@ -103,7 +137,7 @@ pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
     let mut parts = Vec::new();
     for w in marks.windows(2) {
         let (start, end) = (w[0], w[1]);
-        let mut chunk = &body[start + needle.len()..end];
+        let mut chunk = &bytes[start + needle.len()..end];
         if chunk.starts_with(b"--") {
             break; // closing delimiter reached early
         }
@@ -122,7 +156,8 @@ pub fn decode_multipart(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
             None => (&[][..], trim_trailing_crlf(chunk)),
         };
         let headers = parse_headers(head)?;
-        parts.push(part_from_headers(headers, payload.to_vec()));
+        // `payload` borrows `body`: re-slice instead of copying.
+        parts.push(part_from_headers(headers, body.slice_ref(payload)));
     }
     Ok(parts)
 }
@@ -212,7 +247,7 @@ fn parse_headers(head: &[u8]) -> Result<Vec<(String, String)>> {
     Ok(out)
 }
 
-fn part_from_headers(headers: Vec<(String, String)>, body: Vec<u8>) -> Part {
+fn part_from_headers(headers: Vec<(String, String)>, body: Bytes) -> Part {
     let content_type = headers
         .iter()
         .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
@@ -232,18 +267,92 @@ fn part_from_headers(headers: Vec<(String, String)>, body: Vec<u8>) -> Part {
 
 /// Split a `Content-Type` header into mime type + lowercase parameters
 /// (quotes stripped).
+///
+/// Quote-aware: `;` and `=` inside `"..."` are value bytes, not
+/// separators, so `boundary="a;b"` and `type="a=b"` parse whole
+/// (RFC 2045 quoted-string; `\"` unescapes to `"`).
 #[must_use]
 pub fn parse_content_type(header: &str) -> (String, HashMap<String, String>) {
-    let mut parts = header.split(';');
-    let mime = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+    let mut parts = split_quoted(header, ';').into_iter();
+    let mime = parts.next().unwrap_or_default().trim().to_ascii_lowercase();
     let mut params = HashMap::new();
     for p in parts {
-        if let Some((k, v)) = p.split_once('=') {
-            let v = v.trim().trim_matches('"').to_string();
-            params.insert(k.trim().to_ascii_lowercase(), v);
+        if let Some((k, v)) = split_once_unquoted(&p, '=') {
+            params.insert(k.trim().to_ascii_lowercase(), unquote(v.trim()));
         }
     }
     (mime, params)
+}
+
+/// Split on `delim` bytes outside `"..."` (handles `\"` escapes).
+fn split_quoted(s: &str, delim: char) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut escape = false;
+    for c in s.chars() {
+        if escape {
+            cur.push(c);
+            escape = false;
+        } else if c == '\\' && quoted {
+            cur.push(c);
+            escape = true;
+        } else if c == '"' {
+            cur.push(c);
+            quoted = !quoted;
+        } else if c == delim && !quoted {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(c);
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// First `delim` outside `"..."`, or `None`.
+fn split_once_unquoted(s: &str, delim: char) -> Option<(String, String)> {
+    let mut quoted = false;
+    let mut escape = false;
+    for (i, c) in s.char_indices() {
+        if escape {
+            escape = false;
+        } else if c == '\\' && quoted {
+            escape = true;
+        } else if c == '"' {
+            quoted = !quoted;
+        } else if c == delim && !quoted {
+            return Some((s[..i].to_string(), s[i + delim.len_utf8()..].to_string()));
+        }
+    }
+    None
+}
+
+/// Strip one layer of surrounding quotes, unescaping `\"`/`\\`.
+fn unquote(v: &str) -> String {
+    let inner = v
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(v);
+    if !inner.contains('\\') {
+        return inner.to_string();
+    }
+    let mut out = String::with_capacity(inner.len());
+    let mut escape = false;
+    for c in inner.chars() {
+        if escape {
+            out.push(c);
+            escape = false;
+        } else if c == '\\' {
+            escape = true;
+        } else {
+            out.push(c);
+        }
+    }
+    if escape {
+        out.push('\\');
+    }
+    out
 }
 
 /// Whether a part Content-Type names `application/dicom`, ignoring
@@ -306,19 +415,35 @@ mod tests {
             Part::new("application/dicom", vec![0, 1, 2, 3, 255, 254]),
             Part::new("application/pdf", b"%PDF-1.4".to_vec()).with_location("/bulk/1"),
         ];
-        let (ct, body) = encode_multipart(&parts, "BOUNDARY42", "application/dicom");
+        let (ct, body) = encode_multipart(&parts, "BOUNDARY42", "application/dicom").unwrap();
         assert!(ct.contains("multipart/related"), "{ct}");
-        let back = decode_multipart(&body, "BOUNDARY42").unwrap();
+        let back = decode_multipart(&Bytes::from(body), "BOUNDARY42").unwrap();
         assert_eq!(back, parts);
+    }
+
+    #[test]
+    fn decode_shares_the_request_buffer() {
+        let wire = Bytes::from_static(
+            b"--B\r\nContent-Type: application/octet-stream\r\n\r\nPAYLOAD\r\n--B--\r\n",
+        );
+        let parts = decode_multipart(&wire, "B").unwrap();
+        assert_eq!(parts[0].body, Bytes::from_static(b"PAYLOAD"));
+        // Zero-copy pin: the part body must point inside the
+        // request buffer, not at a fresh copy.
+        let base = wire.as_ptr() as usize;
+        let p = parts[0].body.as_ptr() as usize;
+        assert!(p >= base && p + parts[0].body.len() <= base + wire.len());
     }
 
     #[test]
     fn tolerates_boundary_like_bytes_inside_body() {
         // Boundary text inside the body but NOT at a line start.
-        let body = b"--B\r\nContent-Type: application/octet-stream\r\n\r\nxx--Byy\r\n--B--\r\n";
-        let parts = decode_multipart(body, "B").unwrap();
+        let body = Bytes::from_static(
+            b"--B\r\nContent-Type: application/octet-stream\r\n\r\nxx--Byy\r\n--B--\r\n",
+        );
+        let parts = decode_multipart(&body, "B").unwrap();
         assert_eq!(parts.len(), 1);
-        assert_eq!(parts[0].body, b"xx--Byy");
+        assert_eq!(parts[0].body, Bytes::from_static(b"xx--Byy"));
     }
 
     #[test]
@@ -332,20 +457,71 @@ mod tests {
 
     #[test]
     fn rejects_missing_boundary() {
-        assert!(decode_multipart(b"no delimiters here", "B").is_err());
+        assert!(decode_multipart(&Bytes::from_static(b"no delimiters here"), "B").is_err());
+    }
+
+    #[test]
+    fn content_type_params_are_quote_aware() {
+        let (mime, p) = parse_content_type(
+            "multipart/related; boundary=\"a;b\"; type=\"a=b\"; note=\"q\\\"q\"",
+        );
+        assert_eq!(mime, "multipart/related");
+        assert_eq!(p["boundary"], "a;b");
+        assert_eq!(p["type"], "a=b");
+        assert_eq!(p["note"], "q\"q");
+        // Unquoted values behave as before.
+        let (_, p) = parse_content_type("text/plain; charset=utf-8");
+        assert_eq!(p["charset"], "utf-8");
+    }
+
+    #[test]
+    fn encode_rejects_crlf_and_quoted_breakout() {
+        let part = Part::new("application/dicom", vec![1]);
+        assert!(encode_multipart(std::slice::from_ref(&part), "B", "application/dicom").is_ok());
+        // CRLF in any framing input is framing injection.
+        assert!(
+            encode_multipart(
+                std::slice::from_ref(&part),
+                "B\r\nX: y",
+                "application/dicom"
+            )
+            .is_err()
+        );
+        assert!(encode_multipart(std::slice::from_ref(&part), "B", "a\r\nb").is_err());
+        let evil = Part::new("text/plain\r\nX-Injected: 1", vec![1]);
+        assert!(encode_multipart(&[evil], "B", "text/plain").is_err());
+        let mut evil_name = Part::new("text/plain", vec![1]);
+        evil_name
+            .headers
+            .push(("X-Evil\r\nInjected".into(), "1".into()));
+        assert!(encode_multipart(&[evil_name], "B", "text/plain").is_err());
+        // Quotes would break out of the quoted Content-Type params.
+        assert!(
+            encode_multipart(
+                std::slice::from_ref(&part),
+                "B\"; x=\"",
+                "application/dicom"
+            )
+            .is_err()
+        );
+        assert!(encode_multipart(std::slice::from_ref(&part), "B", "a\"b").is_err());
     }
 
     #[test]
     fn rejects_unclosed_body() {
         // Truncated after the first boundary: no closing delimiter.
-        let cut = b"--B\r\nContent-Type: application/octet-stream\r\n\r\nxx";
-        assert!(decode_multipart(cut, "B").is_err());
+        let cut = Bytes::from_static(b"--B\r\nContent-Type: application/octet-stream\r\n\r\nxx");
+        assert!(decode_multipart(&cut, "B").is_err());
         // Even a complete-looking part without the close is refused.
-        let cut = b"--B\r\nContent-Type: text/plain\r\n\r\nxx\r\n--B\r\nContent-Type: text/plain\r\n\r\nyy";
-        assert!(decode_multipart(cut, "B").is_err());
+        let cut = Bytes::from_static(
+            b"--B\r\nContent-Type: text/plain\r\n\r\nxx\r\n--B\r\nContent-Type: text/plain\r\n\r\nyy",
+        );
+        assert!(decode_multipart(&cut, "B").is_err());
         // Epilogue past the closing delimiter stays ignored.
-        let ok = b"--B\r\nContent-Type: text/plain\r\n\r\nxx\r\n--B--\r\ntrailing junk";
-        assert_eq!(decode_multipart(ok, "B").unwrap().len(), 1);
+        let ok = Bytes::from_static(
+            b"--B\r\nContent-Type: text/plain\r\n\r\nxx\r\n--B--\r\ntrailing junk",
+        );
+        assert_eq!(decode_multipart(&ok, "B").unwrap().len(), 1);
     }
 
     #[test]
@@ -355,7 +531,7 @@ mod tests {
             body.extend_from_slice(b"--B\r\n\r\nx\r\n");
         }
         body.extend_from_slice(b"--B--\r\n");
-        let err = decode_multipart(&body, "B").unwrap_err();
+        let err = decode_multipart(&Bytes::from(body), "B").unwrap_err();
         assert!(format!("{err:?}").contains("too many parts"), "{err:?}");
     }
 
@@ -366,7 +542,7 @@ mod tests {
             body.extend_from_slice(format!("X-H{i}: v\r\n").as_bytes());
         }
         body.extend_from_slice(b"\r\nx\r\n--B--\r\n");
-        let err = decode_multipart(&body, "B").unwrap_err();
+        let err = decode_multipart(&Bytes::from(body), "B").unwrap_err();
         assert!(
             format!("{err:?}").contains("too many part headers"),
             "{err:?}"

@@ -413,7 +413,8 @@ fn pack_sample(
                 "signed sample {value} does not fit in {bits} bits"
             )));
         }
-    } else if value > 0xFFFF || (bits <= 8 && value > 0xFF) {
+    } else if value > (1i32 << bits) - 1 {
+        // bits <= 16 (validated by callers), so the shift cannot overflow.
         return Err(PixelCodecError::Geometry(format!(
             "sample {value} does not fit in {bits} bits"
         )));
@@ -621,6 +622,11 @@ unsafe extern "C" fn mem_skip(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_OFF_T {
         if !state.writable {
             state.pos = state.pos.min(state.data.len());
         }
+    } else {
+        // Backward skips are real moves (via `seek_relative`): ignoring
+        // them desyncs the port's accounting from `pos`.
+        let step = usize::try_from(nb.unsigned_abs()).unwrap_or(usize::MAX);
+        state.pos = state.pos.saturating_sub(step);
     }
     // `pos` never exceeds a `Vec` length (`<= isize::MAX`), so the
     // narrowing to `i64` is exact on every platform.
@@ -635,13 +641,15 @@ unsafe extern "C" fn mem_seek(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_BOOL {
         return 0;
     };
     let state = unsafe { &mut *data.cast::<MemState>() };
-    state.pos = if state.writable {
-        off
-    } else {
-        // Reads past EOF already fail in `mem_read`; clamping keeps
-        // `pos` a valid index instead of a wrapped/truncated one.
-        off.min(state.data.len())
-    };
+    if !state.writable && off > state.data.len() {
+        // Report failure like `Stream::skip` does: clamping to EOF and
+        // returning success would leave `m_byte_offset` past
+        // `m_stream_length`, tripping the port's length assert.
+        // Seeking exactly to EOF stays success.
+        state.pos = state.data.len();
+        return 0;
+    }
+    state.pos = off;
     1
 }
 
@@ -649,6 +657,63 @@ unsafe extern "C" fn mem_seek(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_BOOL {
 mod tests {
     use super::*;
     use crate::jpeg::mean_abs_diff;
+
+    #[test]
+    fn hostile_numbps_never_panics() {
+        // Fuzz-found codestream that drove `numbps` to -1 and panicked
+        // on `MAX + 1` in debug builds. Either outcome is fine; the
+        // test failing means a panic (overflow checks are on here).
+        let bytes = include_bytes!("../tests/data/j2k-numbps-fuzz.bin");
+        let frags = FragmentSequence {
+            basic_offset_table: vec![],
+            fragments: vec![bytes.to_vec()],
+        };
+        for bits in [8u16, 16] {
+            let _ = Jpeg2000Codec::default().decode_frame(
+                TransferSyntax::Jpeg2000Lossless,
+                &frags,
+                32,
+                32,
+                1,
+                bits,
+            );
+        }
+    }
+
+    #[test]
+    fn unsigned_samples_must_fit_dataset_depth() {
+        // prec-16 values into a 12-bit dataset are a geometry error,
+        // not silent acceptance (foreign prec > bits streams).
+        assert!(pack_sample(5000, 16, false, 12).is_err());
+        assert!(pack_sample(4095, 16, false, 12).is_ok());
+        assert!(pack_sample(255, 8, false, 8).is_ok());
+        assert!(pack_sample(256, 9, false, 8).is_err());
+        assert!(pack_sample(65535, 16, false, 16).is_ok());
+    }
+
+    #[test]
+    fn mem_seek_past_eof_fails_and_skip_moves_backward() {
+        let mut st = MemState {
+            data: vec![1u8; 8],
+            out: Rc::new(RefCell::new(Vec::new())),
+            pos: 4,
+            writable: false,
+        };
+        let p = (&mut st as *mut MemState).cast::<c_void>();
+        unsafe {
+            // Seek exactly to EOF: success.
+            assert_eq!(mem_seek(8, p), 1);
+            assert_eq!(st.pos, 8);
+            // Seek past EOF on a reader: failure (pos clamps to EOF).
+            assert_eq!(mem_seek(99, p), 0);
+            assert_eq!(st.pos, 8);
+            // Backward skip moves pos (was a silent no-op success).
+            assert_eq!(mem_skip(-3, p), 5);
+            assert_eq!(st.pos, 5);
+            assert_eq!(mem_skip(-99, p), 0);
+            assert_eq!(st.pos, 0);
+        }
+    }
 
     #[test]
     fn mem_read_zero_length_is_success() {
@@ -679,7 +744,9 @@ mod tests {
 
     #[test]
     fn stream_callbacks_clamp_and_cap() {
-        // Reader: seeks/skips past EOF clamp to the input length.
+        // Reader: skips past EOF clamp to the input length; seeks past
+        // EOF fail (clamp-success would desync the port's offset
+        // accounting and trip its length assert).
         let mut st = MemState {
             data: vec![0u8; 16],
             out: Rc::new(RefCell::new(Vec::new())),
@@ -688,15 +755,16 @@ mod tests {
         };
         let p = (&mut st as *mut MemState).cast::<c_void>();
         unsafe {
-            assert_eq!(mem_seek(100, p), 1);
+            assert_eq!(mem_seek(100, p), 0);
             assert_eq!(st.pos, 16);
             st.pos = 0;
             assert_eq!(mem_skip(100, p), 16);
             assert_eq!(st.pos, 16);
             assert_eq!(mem_seek(-1, p), 0);
             assert_eq!(st.pos, 16);
-            // Negative skips leave the position alone.
-            assert_eq!(mem_skip(-5, p), 16);
+            // Negative skips move backward (were a silent no-op).
+            assert_eq!(mem_skip(-5, p), 11);
+            assert_eq!(st.pos, 11);
         }
         // Writer: a wild forward jump fails the write instead of
         // zero-filling gigabytes; a small gap still works.

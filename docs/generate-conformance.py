@@ -241,6 +241,41 @@ AUDIT_TIMEOUT = must_find(
     (ATNA / "syslog.rs").read_text(),
     "syslog DEFAULT_TIMEOUT",
 ).group(1)
+STASH_N = human_count(rust_const(NET / "association.rs", "MAX_STASHED_EVENTS"))
+STASH_BYTES = human_bytes(rust_const(NET / "association.rs", "MAX_STASHED_BYTES"))
+COMMIT_REFS = human_count(rust_const(NET / "qrdb.rs", "MAX_COMMIT_REFS"))
+TLS_HANDSHAKE_SECS = must_find(
+    r"connect_timeout: Duration::from_secs\((\d+)\)",
+    (NET / "association.rs").read_text(),
+    "connect_timeout default",
+).group(1)
+assert "connect_timeout" in (NET / "tls.rs").read_text(), (
+    "conformance: TLS handshake budget moved"
+)
+QIDO_QUERY_BYTES = human_bytes(rust_const(WEB / "server.rs", "MAX_QIDO_QUERY_BYTES"))
+INFLIGHT_BYTES = human_bytes(rust_const(WEB / "hyper_server.rs", "MAX_INFLIGHT_BODY_BYTES"))
+SCP_ASSOC_N = human_count(rust_const(BINS / "common.rs", "MAX_SCP_ASSOCIATIONS"))
+
+# -- SCU proposal posture ------------------------------------------------------
+
+m_syn = re.search(
+    r"pub fn default_syntaxes\(\) -> Vec<TransferSyntax> \{(.*?)\n    \}",
+    common_src,
+    re.S,
+)
+assert m_syn, "conformance: cannot locate default_syntaxes"
+syn_variants = re.findall(r"TransferSyntax::(\w+)", m_syn.group(1))
+assert syn_variants, "conformance: default_syntaxes parsed empty"
+SYNTAX_DISPLAY = {
+    "ExplicitVrLittleEndian": "Explicit VR Little Endian",
+    "ImplicitVrLittleEndian": "Implicit VR Little Endian",
+    "ExplicitVrBigEndian": "Explicit VR Big Endian",
+}
+for v in syn_variants:
+    assert v in SYNTAX_DISPLAY, (
+        f"conformance: new proposed syntax {v}; extend SYNTAX_DISPLAY"
+    )
+PROPOSED_SYNTAXES = " and ".join(SYNTAX_DISPLAY[v] for v in syn_variants)
 
 # -- negotiation posture -----------------------------------------------------
 
@@ -459,8 +494,7 @@ for i, (name, _k, about, services, sops, notes) in enumerate(scu_tools, 1):
     else:
         add("- SOP Classes: taken from the input files' SOP Class UIDs")
         add("  (any storage SOP Class the peer accepts).")
-    add("- Transfer syntaxes proposed: Explicit VR Little Endian and")
-    add("  Implicit VR Little Endian.")
+    add(f"- Transfer syntaxes proposed: {PROPOSED_SYNTAXES}.")
     for n in notes:
         if "storage SOP classes for C-GET" in n:
             continue  # now enumerated above
@@ -491,8 +525,8 @@ add("  each with the offered transfer syntaxes; the SCP accepts at most")
 add("  one syntax per context from its accepted list.")
 add(f"- Maximum PDU: tools offer {MAX_PDU} (`max_pdu`); the largest")
 add(f"  accepted incoming PDU is {MAX_INCOMING_H} (`max_incoming_pdu`).")
-add("- Timeouts: SCU tools default to a 30 s per-read timeout, SCP tools")
-add("  to 300 s (`--timeout-secs`).")
+add(f"- Timeouts: SCU tools default to a {SCU_TIMEOUT} s per-read timeout,")
+add(f"  SCP tools to {SCP_TIMEOUT} s (`--timeout-secs`).")
 add("- The SCU proposes no Role Selection and no User Identity; the")
 add("  SCP accepts (echoes) any roles the peer proposes. No other")
 add("  extended negotiation (asynchronous operations, SOP Class")
@@ -609,6 +643,14 @@ add(f"  {BULK_N} bulk blobs / {BULK_BYTES} and {INST_N} instances /")
 add(f"  {INST_BYTES}.")
 add(f"- ATNA syslog: UDP frames {UDP_FRAME} bytes (larger audits need TCP")
 add(f"  or TLS); {AUDIT_TIMEOUT} s connect/write timeout.")
+add(f"- Association stash: {STASH_N} stray datasets / {STASH_BYTES} aggregate")
+add("  (past that: the operation aborts the association).")
+add(f"- Storage commitment: {COMMIT_REFS} referenced SOPs per request.")
+add(f"- Connection setup: TCP connect and TLS handshake each {TLS_HANDSHAKE_SECS} s.")
+add(f"- DICOMweb server: QIDO query strings {QIDO_QUERY_BYTES}, aggregate")
+add(f"  in-flight request bodies {INFLIGHT_BYTES}.")
+add(f"- SCP tools: {SCP_ASSOC_N} concurrent associations per tool (past")
+add("  that: the peer is dropped).")
 add("")
 add("## Annex A — SOP Classes")
 add("")

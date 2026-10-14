@@ -100,8 +100,8 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
         Value::I32(v) => write_numbers(out, &pad, v.iter().map(ToString::to_string)),
         Value::U64(v) => write_numbers(out, &pad, v.iter().map(ToString::to_string)),
         Value::I64(v) => write_numbers(out, &pad, v.iter().map(ToString::to_string)),
-        Value::F32(v) => write_numbers(out, &pad, v.iter().map(ToString::to_string)),
-        Value::F64(v) => write_numbers(out, &pad, v.iter().map(ToString::to_string)),
+        Value::F32(v) => write_numbers(out, &pad, v.iter().map(|f| xsd_float(f64::from(*f)))),
+        Value::F64(v) => write_numbers(out, &pad, v.iter().map(|f| xsd_float(*f))),
         Value::Bytes(b) => {
             let _ = writeln!(out, "{pad}<InlineBinary>{}</InlineBinary>", B64.encode(b));
         }
@@ -120,6 +120,20 @@ fn write_value(out: &mut String, value: &Value, indent: usize) {
                 B64.encode(f.joined())
             );
         }
+    }
+}
+
+/// XSD float lexical form: `INF`/`-INF`/`NaN` for non-finites
+/// (Rust's `inf`/`-inf`/`NaN` spellings are outside the schema space).
+fn xsd_float(f: f64) -> String {
+    if f.is_finite() {
+        f.to_string()
+    } else if f.is_nan() {
+        "NaN".to_string()
+    } else if f.is_sign_positive() {
+        "INF".to_string()
+    } else {
+        "-INF".to_string()
     }
 }
 
@@ -697,6 +711,31 @@ where
 mod tests {
     use super::*;
     use vyna_dcm_core::tags;
+
+    #[test]
+    fn non_finite_floats_use_xsd_spellings() {
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::f32(
+            tags::SELECTOR_FL_VALUE,
+            vec![f32::INFINITY, f32::NEG_INFINITY, f32::NAN],
+        ));
+        let xml = dataset_to_xml(&ds);
+        assert!(xml.contains(">INF<"), "{xml}");
+        assert!(xml.contains(">-INF<"), "{xml}");
+        assert!(xml.contains(">NaN<"), "{xml}");
+        assert!(!xml.contains(">inf<"), "{xml}");
+        // Import still reads them (Rust parses INF case-insensitively).
+        let back = dataset_from_xml(&xml).unwrap();
+        match &back.get(tags::SELECTOR_FL_VALUE).unwrap().value {
+            Value::F32(v) => {
+                assert_eq!(v.len(), 3);
+                assert!(v[0].is_infinite() && v[0].is_sign_positive());
+                assert!(v[1].is_infinite() && v[1].is_sign_negative());
+                assert!(v[2].is_nan());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 
     fn mixed() -> DataSet {
         DataSet::new()

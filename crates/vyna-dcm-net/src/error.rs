@@ -99,6 +99,15 @@ pub enum Error {
         limit: u64,
     },
 
+    /// An SCU multi-response loop exceeded its pending-response cap:
+    /// the association was aborted (draining would let a rogue peer
+    /// hold the call forever), so it is NOT reusable afterwards.
+    #[error("pending responses exceeded {limit}; association aborted")]
+    TooManyResponses {
+        /// Pending-response cap.
+        limit: u32,
+    },
+
     /// The pushback queue exceeded [`MAX_STASHED_EVENTS`](crate::MAX_STASHED_EVENTS):
     /// the peer kept sending mid-operation instead of one C-CANCEL or
     /// release. The operation fails and the association aborts.

@@ -135,10 +135,28 @@ fn encode_element(
             ))
         })?;
         encode_bot(out, f, bot_len, little);
+        // PS3.5 §8.2: every encapsulated item holds an even number of
+        // bytes. With an empty BOT the writer pads odd fragments; with
+        // a table, padding would shift offsets the writer cannot
+        // recompute, so the caller must re-fragment instead.
+        let bot_empty = f.basic_offset_table.is_empty();
         for frag in &f.fragments {
+            if frag.len() % 2 == 1 && !bot_empty {
+                return Err(unencodable(
+                    "odd-length fragment with a non-empty basic offset table; re-fragment first"
+                        .into(),
+                ));
+            }
+            let wire_len = frag
+                .len()
+                .checked_add(frag.len() % 2)
+                .ok_or_else(|| unencodable("fragment length overflows".into()))?;
             put_tag(out, delimiter::ITEM, little);
-            put_u32(out, u32_len(frag.len(), "fragment")?, little);
+            put_u32(out, u32_len(wire_len, "fragment")?, little);
             out.extend_from_slice(frag);
+            if wire_len != frag.len() {
+                out.push(0x00);
+            }
         }
         put_tag(out, delimiter::SEQUENCE_DELIMITATION, little);
         put_u32(out, 0, little);
@@ -316,6 +334,13 @@ fn encode_primitive(
         Value::PersonName(names) => {
             if vr != Vr::Pn {
                 return Err(unencodable(format!("person names with {vr}")));
+            }
+            // A backslash inside one name would decode as two names
+            // (arity corruption); hand-built structs can hold one.
+            for name in names {
+                if name.to_dicom_string().contains('\\') {
+                    return Err(unencodable("backslash inside person name".into()));
+                }
             }
             let mut raw = Vec::new();
             for (i, name) in names.iter().enumerate() {
@@ -500,6 +525,16 @@ mod tests {
     use crate::decode_dataset;
     use vyna_dcm_core::{DataElement, PersonName, tags};
 
+    #[test]
+    fn person_name_backslash_is_unencodable() {
+        // A backslash inside one name would decode as two names.
+        let mut bad = PersonName::parse("Doe^Jane");
+        bad.alphabetic.family = "A\\B".to_string();
+        let ds = DataSet::new().with(DataElement::person_name(tags::PATIENT_NAME, vec![bad]));
+        let err = encode_dataset(&ds, TransferSyntax::ExplicitVrLittleEndian).unwrap_err();
+        assert!(err.to_string().contains("backslash"), "{err}");
+    }
+
     fn kitchen_sink() -> DataSet {
         DataSet::new()
             .with(DataElement::uid(tags::SOP_INSTANCE_UID, "1.2.3.4.5"))
@@ -597,6 +632,38 @@ mod tests {
         let bytes = encode_dataset(&ds, TransferSyntax::RleLossless).unwrap();
         let back = decode_dataset(&bytes, TransferSyntax::RleLossless).unwrap();
         assert_eq!(back, ds);
+    }
+
+    #[test]
+    fn odd_fragments_pad_to_even_on_wire() {
+        // Empty BOT: the writer pads the odd fragment (PS3.5 §8.2).
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::new(
+            tags::PIXEL_DATA,
+            Vr::Ob,
+            Value::Fragments(FragmentSequence {
+                basic_offset_table: vec![],
+                fragments: vec![vec![1u8, 2, 3, 4, 5]],
+            }),
+        ));
+        let bytes = encode_dataset(&ds, TransferSyntax::RleLossless).unwrap();
+        // Element header (12) + empty BOT item (8) + item tag (4):
+        // the fragment length field sits at byte 24.
+        assert_eq!(u32::from_le_bytes(bytes[24..28].try_into().unwrap()), 6);
+        assert_eq!(bytes.len(), 12 + 8 + 4 + 4 + 6 + 8);
+        // Non-empty BOT + odd fragment: offsets would shift, so the
+        // caller must re-fragment instead of silently mis-writing.
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::new(
+            tags::PIXEL_DATA,
+            Vr::Ob,
+            Value::Fragments(FragmentSequence {
+                basic_offset_table: vec![0],
+                fragments: vec![vec![1u8, 2, 3]],
+            }),
+        ));
+        let err = encode_dataset(&ds, TransferSyntax::RleLossless).unwrap_err();
+        assert!(err.to_string().contains("re-fragment"), "{err}");
     }
 
     #[test]

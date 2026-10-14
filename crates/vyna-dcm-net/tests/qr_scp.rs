@@ -290,6 +290,115 @@ async fn move_delivers_to_destination() {
 }
 
 #[tokio::test]
+async fn empty_move_plan_succeeds_without_dialing() {
+    let dir = qr_dir();
+    // Route DEST at a closed port: if the SCP dialed, this fails.
+    let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_port = dead.local_addr().unwrap().port();
+    drop(dead);
+    let mut map = HashMap::new();
+    map.insert("DEST".to_string(), ("127.0.0.1".to_string(), dead_port));
+    let mut scp_opts = ScpOptions::default();
+    scp_opts.move_config = Some(ScpMoveConfig {
+        directory: Arc::new(HashMapDirectory { map }),
+        assoc_options: opts(),
+        calling_ae: AeTitle::new("FINDSCP").unwrap(),
+    });
+    let addr = serve_qr(QrIndex::scan(&dir).unwrap(), scp_opts).await;
+    let mut assoc = connect(&addr, &[sop_class::STUDY_ROOT_MOVE]).await;
+    // Query matches nothing: SUCCESS with zero counts, no outbound dial.
+    let result = assoc
+        .move_to(
+            sop_class::STUDY_ROOT_MOVE,
+            &study_query("NOBODY"),
+            "DEST",
+            0,
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.status, 0x0000);
+    assert_eq!((result.completed, result.failed, result.warning), (0, 0, 0));
+    assoc.release().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn move_outbound_death_fails_fast_with_processing_failure() {
+    use vyna_dcm_net::pdu::{AcceptedContext, AssociateAc, Pdu, read_pdu, write_pdu};
+    let dir = qr_dir();
+    // Destination: completes the association handshake, then A-ABORTs
+    // on the first P-DATA (simulates transport death mid-MOVE).
+    let dest_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dest_addr = dest_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut tcp, _) = dest_listener.accept().await.unwrap();
+        let rq = match read_pdu(&mut tcp, 64 * 1024 * 1024).await.unwrap() {
+            Pdu::AssociateRq(rq) => rq,
+            other => panic!("expected RQ, got {other:?}"),
+        };
+        let ac = AssociateAc {
+            application_context: rq.application_context.clone(),
+            presentation_contexts: rq
+                .presentation_contexts
+                .iter()
+                .map(|p| AcceptedContext {
+                    id: p.id,
+                    result: 0,
+                    transfer_syntax: p.transfer_syntaxes.first().cloned(),
+                })
+                .collect(),
+            max_pdu_len: 16384,
+            implementation_class_uid: "1.2.9".into(),
+            implementation_version: None,
+            async_ops: None,
+            role_selection: vec![],
+            user_identity_response: None,
+        };
+        write_pdu(&mut tcp, &Pdu::AssociateAc(ac)).await.unwrap();
+        // First P-DATA (a C-STORE-RQ): abort instead of answering.
+        let first = read_pdu(&mut tcp, 64 * 1024 * 1024).await.unwrap();
+        assert!(matches!(first, Pdu::Data(_)), "{first:?}");
+        write_pdu(
+            &mut tcp,
+            &Pdu::Abort {
+                source: 2,
+                reason: 0,
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let mut map = HashMap::new();
+    map.insert(
+        "DEST".to_string(),
+        ("127.0.0.1".to_string(), dest_addr.port()),
+    );
+    let mut scp_opts = ScpOptions::default();
+    scp_opts.move_config = Some(ScpMoveConfig {
+        directory: Arc::new(HashMapDirectory { map }),
+        assoc_options: opts(),
+        calling_ae: AeTitle::new("FINDSCP").unwrap(),
+    });
+    let addr = serve_qr(QrIndex::scan(&dir).unwrap(), scp_opts).await;
+    let mut assoc = connect(&addr, &[sop_class::STUDY_ROOT_MOVE]).await;
+    // Two instances would move; the dead transport must fail the whole
+    // MOVE with PROCESSING_FAILURE (not per-instance B000), promptly:
+    // well under one 10 s read_timeout, let alone two.
+    let t0 = std::time::Instant::now();
+    let result = assoc
+        .move_to(sop_class::STUDY_ROOT_MOVE, &study_query("P1"), "DEST", 0)
+        .await
+        .unwrap();
+    assert_eq!(result.status, 0x0110);
+    assert!(
+        t0.elapsed() < Duration::from_secs(10),
+        "MOVE hung on dead socket"
+    );
+    assoc.release().await.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
 async fn send_flag_mismatch_is_rejected() {
     use vyna_dcm_net::Error;
     let dir = qr_dir();

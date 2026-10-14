@@ -81,7 +81,7 @@ impl Value {
         match self {
             Value::Empty => true,
             Value::Text(v) => v.is_empty() || v.iter().all(String::is_empty),
-            Value::PersonName(v) => v.is_empty(),
+            Value::PersonName(v) => v.is_empty() || v.iter().all(PersonName::is_empty),
             Value::Tags(v) => v.is_empty(),
             Value::U16(v) => v.is_empty(),
             Value::I16(v) => v.is_empty(),

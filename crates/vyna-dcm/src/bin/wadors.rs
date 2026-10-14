@@ -9,7 +9,6 @@ mod webcommon;
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use vyna_dcm::dataset_to_json;
 use webcommon::WebArgs;
 
 /// WADO-RS retrieve tool.
@@ -94,7 +93,12 @@ async fn run_async(args: &Args) -> Result<(), String> {
             .ok_or("--output is required with --bulkdata")?;
         let (content_type, body) = client.wado_bulkdata(uri).await.map_err(|e| e.to_string())?;
         iocommon::write_atomic(output, &body).map_err(|e| e.to_string())?;
-        println!("{} ({} bytes)", output.display(), content_type);
+        println!(
+            "{} ({} bytes, {})",
+            output.display(),
+            body.len(),
+            content_type
+        );
         return Ok(());
     }
     let (Some(study), Some(series), Some(instance)) = (
@@ -105,14 +109,14 @@ async fn run_async(args: &Args) -> Result<(), String> {
         return Err("need STUDY with --series and --instance (or --bulkdata URI)".to_string());
     };
     if args.metadata {
+        // Raw JSON, not parsed-and-reserialized: parsing drops
+        // `BulkDataURI` links (bulk elements arrive empty), leaving
+        // `--bulkdata` with no discoverable input from this tool.
         let meta = client
-            .wado_metadata(study, series, instance)
+            .wado_metadata_raw(study, series, instance)
             .await
             .map_err(|e| e.to_string())?;
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&dataset_to_json(&meta)).unwrap()
-        );
+        println!("{}", serde_json::to_string_pretty(&meta).unwrap());
         return Ok(());
     }
     if let Some(frames) = &args.frames {
@@ -143,15 +147,15 @@ async fn run_async(args: &Args) -> Result<(), String> {
 
 /// One part lands exactly at `output`; several fan out to
 /// `STEM_N.EXT`.
-fn write_parts(output: &Path, parts: &[Vec<u8>]) -> Result<(), String> {
+fn write_parts(output: &Path, parts: &[impl AsRef<[u8]>]) -> Result<(), String> {
     if parts.is_empty() {
         // Zero parts with exit 0 would look like success while
         // writing nothing; the server shorted the frame list.
         return Err("server returned no frame data".to_string());
     }
     if parts.len() == 1 {
-        iocommon::write_atomic(output, &parts[0]).map_err(|e| e.to_string())?;
-        println!("{} ({} bytes)", output.display(), parts[0].len());
+        iocommon::write_atomic(output, parts[0].as_ref()).map_err(|e| e.to_string())?;
+        println!("{} ({} bytes)", output.display(), parts[0].as_ref().len());
         return Ok(());
     }
     let stem = output
@@ -165,8 +169,8 @@ fn write_parts(output: &Path, parts: &[Vec<u8>]) -> Result<(), String> {
             .map(|e| format!(".{}", e.to_string_lossy()))
             .unwrap_or_default();
         named.set_file_name(format!("{stem}_{}{ext}", i + 1));
-        iocommon::write_atomic(&named, part).map_err(|e| e.to_string())?;
-        println!("{} ({} bytes)", named.display(), part.len());
+        iocommon::write_atomic(&named, part.as_ref()).map_err(|e| e.to_string())?;
+        println!("{} ({} bytes)", named.display(), part.as_ref().len());
     }
     Ok(())
 }
@@ -189,7 +193,8 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wadors-parts-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("f.bin");
-        let err = write_parts(&out, &[]).unwrap_err();
+        let empty: Vec<Vec<u8>> = Vec::new();
+        let err = write_parts(&out, &empty).unwrap_err();
         assert!(err.contains("no frame data"), "{err}");
         assert!(!out.exists());
         let _ = std::fs::remove_dir_all(&dir);

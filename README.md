@@ -6,7 +6,7 @@ DICOM dependencies.
 
 No DICOM code is borrowed: the data model, codecs, DIMSE networking,
 DICOMweb, and ECG mapping are all implemented in this workspace
-(~24k lines, excluding generated tables and the openjp2 fork).
+(~43k lines, excluding generated tables and the openjp2 fork).
 External crates are used only for generic infrastructure
 (async runtime, HTTP, TLS, crypto, CLI parsing).
 

@@ -81,7 +81,7 @@ fn run(args: &Args) -> i32 {
             && ds_uid.trim_end_matches(['\0', ' ']) != meta_uid.trim_end_matches(['\0', ' '])
         {
             println!(
-                "[error] ({tag}) MediaStorageMismatch []: file meta {what} {meta_uid} differs from dataset {ds_uid}"
+                "[error] {tag} MediaStorageMismatch []: file meta {what} {meta_uid} differs from dataset {ds_uid}"
             );
             errors += 1;
         }

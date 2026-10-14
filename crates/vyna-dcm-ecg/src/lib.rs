@@ -25,7 +25,10 @@ pub mod model;
 pub mod waveform;
 
 pub use error::{Error, Result};
-pub use model::{EcgLead, EcgRecording, STANDARD_12_LEAD, SampleInterpretation, mdc_code_for_lead};
+pub use model::{
+    ChannelSourceCode, EcgLead, EcgRecording, STANDARD_12_LEAD, SampleInterpretation,
+    mdc_code_for_lead,
+};
 pub use waveform::{
     EcgInstanceMeta, SOP_12_LEAD_ECG, SOP_GENERAL_ECG, file_meta_for_dataset,
     recording_from_waveform_item, recording_to_dataset, recording_to_waveform_item,

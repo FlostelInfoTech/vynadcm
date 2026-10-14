@@ -68,7 +68,8 @@ impl Tm {
     /// Parse `HH[MM[SS[.FFFFFF]]]` with optional colons.
     #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
-        let t = s.trim().trim_end_matches(':');
+        // No trailing-colon tolerance: `13:45:` is not a TM value.
+        let t = s.trim();
         let (main, frac) = match t.split_once('.') {
             Some((m, f)) => (m, Some(f)),
             None => (t, None),
@@ -85,7 +86,13 @@ impl Tm {
         }
         if main.contains(':') {
             let parts: Vec<&str> = main.split(':').collect();
-            if parts.len() > 3 || parts.iter().any(|p| p.len() != 2) {
+            // Groups must be two digits each: length alone would let
+            // `1a:2b` parse as hour 12, dropping the garbage.
+            if parts.len() > 3
+                || parts
+                    .iter()
+                    .any(|p| p.len() != 2 || !p.bytes().all(|b| b.is_ascii_digit()))
+            {
                 return None;
             }
         } else if !matches!(digits.len(), 2 | 4 | 6) || digits.len() != main.len() {
@@ -165,8 +172,13 @@ pub fn is_valid_dt(s: &str) -> bool {
         _ => (t, ""),
     };
     if !suffix.is_empty() {
-        let z: String = suffix[1..].chars().filter(|c| c.is_ascii_digit()).collect();
-        if z.len() != 4 {
+        let body = &suffix[1..];
+        let z: String = body.chars().filter(|c| c.is_ascii_digit()).collect();
+        // Shape first: exactly `ZZXX` or `ZZ:XX`, so `+xx0800` or
+        // `+0:8:0:0` cannot smuggle digits through the filter.
+        let shaped = (body.len() == 4 && z.len() == 4)
+            || (body.len() == 5 && body.as_bytes()[2] == b':' && z.len() == 4);
+        if !shaped {
             return false;
         }
         let zh: u32 = z[0..2].parse().unwrap_or(99);
@@ -188,6 +200,10 @@ pub fn is_valid_dt(s: &str) -> bool {
     if let Some(f) = frac
         && (f.is_empty() || f.len() > 6 || !f.bytes().all(|b| b.is_ascii_digit()))
     {
+        return false;
+    }
+    if frac.is_some() && date_time.len() <= 8 {
+        // A fraction needs seconds: `20261011.5` has no time portion.
         return false;
     }
     // Validate the date/time prefixes that are present.
@@ -376,5 +392,36 @@ mod tests {
         assert!(!is_valid_dt("202610111"));
         assert!(is_valid_dt("202610"));
         assert!(is_valid_dt("2026101113"));
+    }
+
+    #[test]
+    fn tm_rejects_garbage_colon_groups_and_trailing_colons() {
+        // Digit-bearing garbage inside colon groups parsed as hour 12.
+        assert_eq!(Tm::parse("1a:2b"), None);
+        assert_eq!(Tm::parse("12:ab"), None);
+        assert_eq!(Tm::parse("ab:12"), None);
+        // Trailing colons are not a TM form.
+        assert_eq!(Tm::parse("13:45:"), None);
+        assert_eq!(Tm::parse("13::"), None);
+        assert_eq!(Tm::parse(":"), None);
+        // Sanity: canonical forms still parse.
+        assert!(Tm::parse("13:45").is_some());
+        assert!(Tm::parse("13:45:23").is_some());
+        assert!(Tm::parse("134523").is_some());
+    }
+
+    #[test]
+    fn dt_rejects_fraction_without_time_and_garbage_suffix() {
+        // `.FFFFFF` needs seconds.
+        assert!(!is_valid_dt("20261011.5"));
+        assert!(!is_valid_dt("2026.5"));
+        assert!(!is_valid_dt("202610.5"));
+        assert!(is_valid_dt("20261011134523.5"));
+        // Suffix garbage must not smuggle digits through the filter.
+        assert!(!is_valid_dt("20261011134523+xx0800"));
+        assert!(!is_valid_dt("20261011134523+0:8:0:0"));
+        assert!(!is_valid_dt("20261011134523+080"));
+        assert!(is_valid_dt("20261011134523+0800"));
+        assert!(is_valid_dt("20261011134523+08:00"));
     }
 }

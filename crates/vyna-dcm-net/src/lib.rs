@@ -53,4 +53,4 @@ pub use association::{
 };
 pub use dimse::{Command, DimseMessage, command_field, priority, status};
 pub use error::{Error, Result};
-pub use scu::{MAX_FIND_BYTES, MAX_FIND_MATCHES, MoveResult};
+pub use scu::{MAX_FIND_BYTES, MAX_FIND_MATCHES, MAX_PENDING_RESPONSES, MoveResult};

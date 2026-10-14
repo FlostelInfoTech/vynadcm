@@ -27,5 +27,8 @@ pub mod hyper_server;
 pub mod multipart;
 pub mod server;
 
+/// Shared byte buffers ([`Part`](multipart::Part) bodies, stored
+/// files, responses): re-exported so embedders need no extra dep.
+pub use bytes::Bytes;
 pub use client::{Auth, DicomWebClient, StowResponse, WadoUriRequest};
 pub use error::{Error, Result};

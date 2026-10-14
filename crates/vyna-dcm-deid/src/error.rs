@@ -12,6 +12,10 @@ pub enum Error {
     /// group, too many components/groups, or backslash).
     #[error("invalid replacement name: {0}")]
     InvalidReplacementName(String),
+    /// Replacement ID is not a valid single text value (over 16
+    /// bytes, backslash, or control characters).
+    #[error("invalid replacement ID: {0}")]
+    InvalidReplacementId(String),
 }
 
 /// De-identification result.
