@@ -13,7 +13,8 @@ fn recording() -> EcgRecording {
     let leads = STANDARD_12_LEAD
         .iter()
         .map(|(label, code)| {
-            let mut lead = EcgLead::new(*label, (0..200).map(|t| t % 37 - 18).collect(), 0.001);
+            let mut lead =
+                EcgLead::new(*label, (0..200).map(|t| t % 37 - 18).collect(), 0.001).unwrap();
             lead.mdc_code = Some((*code).to_string());
             lead
         })

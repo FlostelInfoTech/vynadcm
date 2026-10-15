@@ -31,6 +31,33 @@ impl TlsConnector {
     ) -> Result<Self> {
         let mut roots = RootCertStore::empty();
         roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        Self::with_roots(server_name, roots, extra_ca_pem, client_identity)
+    }
+
+    /// Build trusting *only* the given private CA PEM (no WebPKI
+    /// roots), and optional mutual-TLS client identity. Hospital
+    /// PACS fleets with an internal CA should prefer this: WebPKI
+    /// trust lets any public-CA-issued certificate for the server
+    /// name impersonate the peer.
+    pub fn new_private_ca(
+        server_name: impl Into<String>,
+        ca_pem: &[u8],
+        client_identity: Option<(&[u8], &[u8])>,
+    ) -> Result<Self> {
+        Self::with_roots(
+            server_name,
+            RootCertStore::empty(),
+            Some(ca_pem),
+            client_identity,
+        )
+    }
+
+    fn with_roots(
+        server_name: impl Into<String>,
+        mut roots: RootCertStore,
+        extra_ca_pem: Option<&[u8]>,
+        client_identity: Option<(&[u8], &[u8])>,
+    ) -> Result<Self> {
         if let Some(pem) = extra_ca_pem {
             for cert in rustls_pemfile::certs(&mut BufReader::new(pem)) {
                 let cert = cert.map_err(|e| Error::Tls(e.to_string()))?;
@@ -87,9 +114,14 @@ impl TlsConnector {
 
     /// Connect + handshake to `addr` in one step (10 s budget per
     /// phase, matching [`AssociationOptions::default`](crate::AssociationOptions)).
-    pub async fn connect_to(
+    ///
+    /// Any [`ToSocketAddrs`](tokio::net::ToSocketAddrs) form works —
+    /// prefer `(host, port)` tuples over pre-joined `"host:port"`
+    /// strings so IPv6 literals resolve correctly (as in
+    /// [`Association::request`](crate::Association::request)).
+    pub async fn connect_to<A: tokio::net::ToSocketAddrs>(
         &self,
-        addr: &str,
+        addr: A,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         self.connect_to_timeout(addr, crate::AssociationOptions::default().connect_timeout)
             .await
@@ -98,9 +130,9 @@ impl TlsConnector {
     /// Connect + handshake to `addr` with an explicit budget,
     /// applied to the TCP connect and the TLS handshake each (a
     /// hanging SYN or a silent peer must not stall the caller forever).
-    pub async fn connect_to_timeout(
+    pub async fn connect_to_timeout<A: tokio::net::ToSocketAddrs>(
         &self,
-        addr: &str,
+        addr: A,
         connect_timeout: std::time::Duration,
     ) -> Result<tokio_rustls::client::TlsStream<TcpStream>> {
         let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
@@ -302,5 +334,100 @@ mod tests {
             crate::status::SUCCESS
         );
         assoc.release().await.unwrap();
+    }
+
+    /// Serve `n` TLS handshakes on `listener`, then stop. Returns the
+    /// bound address. Handshake outcomes are ignored: the client side
+    /// asserts.
+    async fn serve_handshakes(
+        acceptor: TlsAcceptor,
+        listener: tokio::net::TcpListener,
+        n: usize,
+    ) -> std::net::SocketAddr {
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            for _ in 0..n {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let _ = acceptor
+                    .accept_timeout(tcp, std::time::Duration::from_secs(10))
+                    .await;
+            }
+        });
+        addr
+    }
+
+    fn self_signed(names: Vec<String>) -> (Vec<u8>, Vec<u8>) {
+        let certified = rcgen::generate_simple_self_signed(names).unwrap();
+        (
+            certified.cert.pem().into_bytes(),
+            certified.signing_key.serialize_pem().into_bytes(),
+        )
+    }
+
+    #[tokio::test]
+    async fn wrong_server_name_fails_verification() {
+        // The server presents a valid chain for "localhost"; asking
+        // for any other name must fail the handshake.
+        let (cert_pem, key_pem) = self_signed(vec!["localhost".into(), "127.0.0.1".into()]);
+        let acceptor = TlsAcceptor::new(&cert_pem, &key_pem, None).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = serve_handshakes(acceptor, listener, 1).await;
+        let connector = TlsConnector::new("wrong.invalid", Some(&cert_pem), None).unwrap();
+        let err = connector
+            .connect_to_timeout((addr.ip(), addr.port()), std::time::Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn connect_to_accepts_host_port_tuple() {
+        // Tuple form (like Association::request): IPv6 literals
+        // cannot be pre-joined as "host:port" strings.
+        let (cert_pem, key_pem) = self_signed(vec!["localhost".into(), "127.0.0.1".into()]);
+        let acceptor = TlsAcceptor::new(&cert_pem, &key_pem, None).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = serve_handshakes(acceptor, listener, 1).await;
+        let connector = TlsConnector::new("localhost", Some(&cert_pem), None).unwrap();
+        connector
+            .connect_to_timeout((addr.ip(), addr.port()), std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        // IPv6 loopback when the sandbox has it.
+        let Ok(v6) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let (cert_pem, key_pem) = self_signed(vec!["localhost".into(), "::1".into()]);
+        let acceptor = TlsAcceptor::new(&cert_pem, &key_pem, None).unwrap();
+        let addr = serve_handshakes(acceptor, v6, 1).await;
+        let connector = TlsConnector::new("localhost", Some(&cert_pem), None).unwrap();
+        connector
+            .connect_to_timeout((addr.ip(), addr.port()), std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn private_ca_mode_trusts_only_private_ca() {
+        let (cert_pem, key_pem) = self_signed(vec!["localhost".into(), "127.0.0.1".into()]);
+        let (other_pem, _) = self_signed(vec!["localhost".into()]);
+        let acceptor = TlsAcceptor::new(&cert_pem, &key_pem, None).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = serve_handshakes(acceptor, listener, 2).await;
+        // The private CA verifies the server without any WebPKI roots.
+        let connector = TlsConnector::new_private_ca("localhost", &cert_pem, None).unwrap();
+        connector
+            .connect_to_timeout((addr.ip(), addr.port()), std::time::Duration::from_secs(10))
+            .await
+            .unwrap();
+        // A different private CA does not.
+        let connector = TlsConnector::new_private_ca("localhost", &other_pem, None).unwrap();
+        let err = connector
+            .connect_to_timeout((addr.ip(), addr.port()), std::time::Duration::from_secs(10))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
     }
 }

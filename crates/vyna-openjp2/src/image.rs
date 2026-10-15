@@ -159,6 +159,11 @@ impl opj_image_comp {
       }
     }
     let dest = self.data_mut().expect("We just allocated this data");
+    // A short/long caller slice must fail, never panic in
+    // `copy_from_slice` (hostile SIZ grids reach this path).
+    if dest.len() != data.len() {
+      return false;
+    }
     dest.copy_from_slice(data);
     true
   }
@@ -820,5 +825,36 @@ pub fn opj_image_tile_create(
     Box::into_raw(image)
   } else {
     core::ptr::null_mut()
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn one_comp(w: u32, h: u32) -> Box<opj_image> {
+    let parms = [opj_image_comptparm {
+      dx: 1,
+      dy: 1,
+      w,
+      h,
+      x0: 0,
+      y0: 0,
+      prec: 8,
+      bpp: 8,
+      sgnd: 0,
+    }];
+    opj_image::create(&parms, OPJ_CLRSPC_GRAY).unwrap()
+  }
+
+  #[test]
+  fn set_data_rejects_length_mismatch() {
+    let mut image = one_comp(2, 2);
+    let comps = image.comps_mut().unwrap();
+    assert!(comps[0].set_data(&[1, 2, 3, 4]));
+    // Short and long slices fail instead of panicking in
+    // `copy_from_slice` (hostile SIZ grids reach this path).
+    assert!(!comps[0].set_data(&[1, 2, 3]));
+    assert!(!comps[0].set_data(&[1, 2, 3, 4, 5]));
   }
 }

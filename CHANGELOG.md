@@ -95,6 +95,74 @@ the workspace crate version (`Cargo.toml`).
   `Result`; `DicomWebClient::wado_file` returns `Bytes`;
   `EcgLead` gains `source_code`; General ECG channel cap is 24
   (was 12, contradicting PS3.3 A.34.4.4.3).
+- Round-3 (codec): M1 ISO-2022-JP encoder finalizes shift state, emitting trailing ESC(B (multi-valued Japanese text no longer merges into mojibake).
+- Round-3 (core): m-core1 DS float parsing enforces the DS grammar (rejects `1_0`, `12.`, `1e`, ...; breaking: `float()` returns `None` for those).
+- Round-3 (codec): m-core2 Default/Unsupported charset encodes Latin-1 like decode (was UTF-8 bytes decoding back as mojibake; breaking: chars past U+00FF now encode as `?`).
+- Round-3 (codec): m-core3 ISO-2022-KR treats ESC(B as an ASCII-designation no-op (was U+FFFD plus literal "(B").
+- Round-3 (codec): m-core4 duplicate tags error in binary and XML decode (was silent last-win; breaking: malformed files now fail; JSON dups collapse inside the JSON parser before our code sees them).
+- Round-3 (codec): m-core5 implicit-VR OB/OW context tags re-resolve once a late Bits Allocated sibling arrives (were frozen as OW in out-of-order files).
+- Round-3 (codec): m-core6 explicit-VR reserved bytes must be 0x0000 (were ignored; breaking: nonzero files now fail).
+- Round-3 (core): m-core7 `PersonName::try_parse` rejects control characters (breaking: NUL/newline/DEL input now errors).
+- Round-3 (core): m-core8 civil date math saturates on extreme i64 (was overflow panic in debug, wrap in release).
+- Round-3 (codec): m-core9 PN encode rejects `=`/`^` inside components, not just backslash (breaking: hand-built names with separators now fail).
+- Round-3 (codec): m-core10 JSON/XML InlineBinary refused under text VRs LT/ST/UT/UC/UR (was `Bytes` the encoder rejects; breaking: such imports now error).
+- Round-3 (codec): m-core11 fragments under a native syntax report `BadValue` (was `UnsupportedTransferSyntax`; breaking: error variant changed).
+- Round-3 (codec): m-core12 `MissingDictionaryVr` documented as unreachable-by-design (unknown tags fall back to UN).
+- Round-3 (codec): m-core13 `inject_png` probes PNG dimensions/budget before full decode (gigapixel claims fail fast).
+- Round-3 (codec): m-core14 `ds_format` renders sub-1 ratios with precision instead of DS "0" (clamped at 1e-14).
+- Round-3 (codec): m-core15 DICOMDIR rejects `..`/separator file IDs and overlong record-type overrides; `relative_path` drops traversal pieces (breaking: hostile inputs now fail/sanitize).
+- Round-3 (codec): m-core16 directory offsets use `checked_add` before the u32 check (32-bit overflow).
+- Round-3 (openjp2): m-core17 `set_data` returns false on length mismatch (was panic).
+- Round-3 (openjp2): m-core18 memory skips past bounds fail instead of clamping, and `get_bytes_left` saturates (was cursor desync/panic).
+- Round-3 (net): m-net1 PDU reads are resumable, so the ZERO-wait C-CANCEL poll preserves partial bytes instead of desyncing on segmented messages.
+- Round-3 (net): m-net2 `find_all` shares the `max_pending_responses` drain cap (aborts past it; was unbounded drain).
+- Round-3 (net): m-net3 all association send paths use a 30 s per-PDU write timeout (was unbounded await on stalled peers; new `AssociationOptions::write_timeout`).
+- Round-3 (net): m-net4 SCU `adopt_ac` validates the AC like SCP negotiation (application context, duplicate/unproposed IDs, only-proposed transfer syntax; was silent narrowing).
+- Round-3 (net): m-net5 `release()` answers a simultaneous peer RELEASE-RQ with RELEASE-RSP as clean completion (PS3.8 collision; was `UnexpectedPdu`).
+- Round-3 (net): m-net6 the initial ASSOCIATE-RQ wait uses a 30 s ARTIM-style timer (was the 300 s read timeout; new `AcceptorOptions::associate_timeout`).
+- Round-3 (net): m-net7 one cumulative `max_message_duration` (default 1 h) bounds each `recv` reassembly (per-PDU resets allowed indefinite slow-drip).
+- Round-3 (net): m-net8 sends honor tiny peer-declared max-PDU values down to 1-byte PDVs (was a 64-byte floor that emitted oversize PDUs).
+- Round-3 (net): m-net9 `TlsConnector::connect_to` takes any `ToSocketAddrs` (tuple form handles IPv6 literals; `&str` callers unaffected).
+- Round-3 (net): m-net10 new `TlsConnector::new_private_ca` trusts only the given private CA (no WebPKI roots).
+- Round-3 (net): m-net11 P-DATA-TF decode caps PDVs at 4096 and each associate item level at 1024 items (byte cap alone allowed ~5x heap amplification).
+- Round-3 (net): m-net12 command-set reassembly has a dedicated 64 KiB budget (`MAX_COMMAND_BYTES`; was the 1 GiB dataset budget).
+- Round-3 (net): m-net13 the SCP SOP-class guard rejects requests with missing UIDs (only C-CANCEL-RQ may omit them; breaking: UID-less requests now fail).
+- Round-3 (net): m-net14 the C-STORE/FIND/MOVE/GET-RQ constructors validate priority 0|1|2 and `send` re-checks it (breaking: constructors now return `Result`).
+- Round-3 (net): m-net15 C-MOVE/C-GET finals preserve handler-returned warnings (were coerced to SUCCESS).
+- Round-3 (net): m-net16 new `accept_limited` holds a semaphore permit per association so library embedders can cap concurrency (`TooManyAssociations` when full).
+- Round-3 (net): m-net17 `request_over` rejects empty proposals and duplicate context IDs locally (was malformed-RQ-on-the-wire then opaque reject).
+- Round-3 (net): m-net18 responses and C-CANCEL-RQ no longer emit Priority (0000,0700) (PS3.7 request-only element).
+- Round-3 (net): m-net19 new negative test pins TLS hostname verification (wrong server name fails the handshake).
+- Round-3 (web): M2 QIDO matching is allocation-capped (64 KiB/value, 1M wildcard steps, 256 KiB/element scan) and borrowed with no whole-element clone (oversized inputs are non-matches, not OOM).
+- Round-3 (web): m-web1 STOW total-failure/malformed 400s return DICOM JSON with FailedSOPSequence refs (breaking: was plain text; reason strings no longer render).
+- Round-3 (web): m-web2 WADO frame-count cap trips during parse, before the duplicate check (breaking: over-cap message is now "too many frames").
+- Round-3 (web): m-web3 DS/IS range alt with an unparsable bound falls back to literal match (exact `1e-3` now matches).
+- Round-3 (web): m-web4 dispatch caps paths at 256 KiB (414) and 32 segments (404) without building the oversized vector.
+- Round-3 (web): m-web5 QIDO clones datasets minus bulk elements (no transient pixel duplication under paging).
+- Round-3 (web): m-web6 instance_frames snapshots under the lock and decodes after releasing it.
+- Round-3 (web): m-web7 STOW RetrieveURL lists every distinct stored study (breaking: Value may hold more than one URL).
+- Round-3 (web): m-web8 HttpResponse::multipart returns crate Error::Multipart (breaking: was Result<Self, String>).
+- Round-3 (web): m-web9 new fallible try_test_file caps dims at 1024x1024 / 8 MiB pixels (breaking: test_file panics on giant dims instead of allocating ~8 GiB).
+- Round-3 (web): m-web10 content negotiation honors q=0 as not acceptable (RFC 7231).
+- Round-3 (web): m-web11 server percent-decodes path segments symmetrically with the client encoder (%2F fails closed).
+- Round-3 (web): m-web12 non-STOW routes answer without buffering the request body (auth check stays first).
+- Round-3 (web): m-web13 response bodies reserve against the shared in-flight budget, failing fast with 503 past the cap.
+- Round-3 (web): m-web14 with_timeout is infallible by construction (per-request budget, no engine rebuild).
+- Round-3 (web): m-web15 new with_extra_ca_pem/with_private_ca_pem/with_client_identity_pem TLS builders (net-crate parity).
+- Round-3 (web): m-web16 new Error::Timeout/Connect/Tls variants classify transport failures (timeouts retryable; status detail preserved).
+- Round-3 (web): m-web17 over-wire integration tests for authenticated clients, wado_study/wado_series, the STOW-409 client path, and cross-origin bulkdata auth-strip.
+- Round-3 (ecg): m-ecg1 channel-source code text counts toward the UTF-8 declaration (was Latin-1 mojibake for non-ASCII source triples).
+- Round-3 (ecg): m-ecg2 Waveform Data VR must match bits allocated (16-bit-as-OB / 8-bit-as-OW rejected; breaking: crossed files now fail).
+- Round-3 (ecg): m-ecg3 Waveform Bits Stored is read and cross-checked (0 / > allocated rejected; breaking: bad stored widths now fail).
+- Round-3 (ecg): m-ecg4 channel Type 1 label/sensitivity/correction/baseline/units are required, not silently defaulted (breaking: non-conformant items now fail).
+- Round-3 (ecg): m-ecg5 new `EcgInstanceMeta::series_number` replaces the hardcoded "1" (Type 2: empty stays present-but-empty).
+- Round-3 (ecg): m-ecg6 Modality follows the SOP UID; only ECG SOPs accepted, new `SOP_AMBULATORY_ECG` (breaking: non-ECG UIDs now fail instead of stamping "ECG").
+- Round-3 (ecg): m-ecg7 `EcgLead::new`/`from_i16` return `Result`, `EcgRecording::new` checks lead floats (breaking: non-finite sensitivity/correction/baseline now error).
+- Round-3 (ecg): m-ecg8 the 1-byte pad tolerance applies to 8-bit data only (breaking: 16-bit overlength now fails).
+- Round-3 (pdf): m-pdf1 corrupt much-too-short Encapsulated Document Length is ignored, not silently truncated (only len / len+1 strip).
+- Round-3 (pdf): m-pdf2 extraction requires OB VR on Encapsulated Document (breaking: OW/UN elements now fail).
+- Round-3 (pdf): m-pdf3 file-meta SOP UIDs read Missing when absent, InvalidMeta when present-but-unusable (was always Missing).
+- Round-3 (iod): m-iod1 new negative tests pin Waveform Sequence, ECG Type 1 datetimes, and Encapsulated Document/MIME Type T1 enforcement.
 
 ## [0.5.0] — 2026-10-13
 

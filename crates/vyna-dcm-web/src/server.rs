@@ -13,6 +13,7 @@ use vyna_dcm_codec::{
 };
 use vyna_dcm_core::{DataSet, Tag, TransferSyntax, Value, Vr, lookup, lookup_keyword, tags};
 
+use crate::Error;
 use crate::multipart::{
     Part, decode_multipart, encode_multipart, is_dicom_media_type, new_boundary, parse_content_type,
 };
@@ -107,11 +108,12 @@ impl HttpResponse {
 
     /// `multipart/related` response.
     ///
-    /// Fails when a part header carries CR/LF (framing injection)
-    /// — embedder-supplied parts are not trusted.
-    pub fn multipart(parts: &[Part], root_type: &str) -> std::result::Result<Self, String> {
-        let (content_type, body) =
-            encode_multipart(parts, &new_boundary(), root_type).map_err(|e| e.to_string())?;
+    /// Fails with [`Error::Multipart`] when a part header carries
+    /// CR/LF (framing injection) — embedder-supplied parts are not
+    /// trusted.
+    pub fn multipart(parts: &[Part], root_type: &str) -> crate::Result<Self> {
+        let (content_type, body) = encode_multipart(parts, &new_boundary(), root_type)
+            .map_err(|e| Error::Multipart(e.to_string()))?;
         Ok(Self {
             status: 200,
             headers: vec![("content-type".into(), content_type)],
@@ -371,9 +373,9 @@ impl DicomWebStore for MemoryStore {
             if out.len() >= limit {
                 break;
             }
-            let mut ds = inst.dataset.clone();
-            strip_bulk(&mut ds);
-            out.push(ds);
+            // Bulk never clones: strip-before-clone, so a paged QIDO
+            // over big-pixel instances holds no pixel transient.
+            out.push(clone_without_bulk(&inst.dataset));
             seen += 1;
         }
         out
@@ -429,19 +431,24 @@ impl DicomWebStore for MemoryStore {
         instance: &str,
         frames: &[u32],
     ) -> std::result::Result<Option<Vec<Vec<u8>>>, String> {
-        let inner = self.lock();
-        let Some(inst) = inner
-            .instances
-            .iter()
-            .find(|i| i.study == study && i.series == series && i.instance == instance)
-        else {
+        // Snapshot under the lock, decode after it: pixel decode is
+        // CPU-bound and must not serialize the whole store.
+        let snap = {
+            let inner = self.lock();
+            inner
+                .instances
+                .iter()
+                .find(|i| i.study == study && i.series == series && i.instance == instance)
+                .map(|i| (i.dataset.clone(), i.transfer_syntax))
+        };
+        let Some((dataset, transfer_syntax)) = snap else {
             return Ok(None);
         };
-        let pixels = decode_pixels(&inst.dataset, inst.transfer_syntax)
+        let pixels = decode_pixels(&dataset, transfer_syntax)
             .map_err(|e| format!("cannot decode pixels: {e}"))?;
         // Absent frame count means single-frame; present-but-garbage
         // is undecodable (500), not a license to serve all frames.
-        let count: usize = match inst.dataset.string(tags::NUMBER_OF_FRAMES) {
+        let count: usize = match dataset.string(tags::NUMBER_OF_FRAMES) {
             None => 1,
             Some(s) => match s.parse() {
                 Ok(n) if n >= 1 => n,
@@ -621,10 +628,62 @@ pub fn strip_bulk(ds: &mut DataSet) {
     }
 }
 
+/// Clone a dataset minus bulk elements (QIDO responses): cloning
+/// first and stripping after would transiently duplicate megabytes
+/// of pixel data per match (a whole-store transient under paging).
+fn clone_without_bulk(ds: &DataSet) -> DataSet {
+    let mut out = DataSet::new();
+    for (tag, el) in ds.iter() {
+        if BULK_TAGS.contains(&tag) {
+            continue;
+        }
+        out.insert(el.clone());
+    }
+    out
+}
+
+/// Maximum bytes of one stored value scanned by a single QIDO
+/// comparison. Stored values are attacker-shaped (1 GiB STOW
+/// uploads), so an uncapped `value` would turn every `?<Tag>=*`
+/// query into a multi-GB `Vec<char>` per instance (OOM-abort). Past
+/// the budget the value is a non-match; 64 KiB is orders of
+/// magnitude past real key values.
+const MAX_MATCH_VALUE_BYTES: usize = 64 * 1024;
+
+/// Maximum pattern bytes scanned by one wildcard comparison (the
+/// whole QIDO query string is already capped at
+/// [`MAX_QIDO_QUERY_BYTES`]; this bounds one comma-separated
+/// alternative defensively).
+const MAX_MATCH_PATTERN_BYTES: usize = 64 * 1024;
+
+/// Maximum matcher steps per wildcard comparison. Backtracking is
+/// quadratic in the worst case, so a star-heavy pattern against a
+/// long value bails out (non-match) instead of burning CPU; real
+/// key matches finish in hundreds of steps.
+const MAX_WILDCARD_STEPS: u64 = 1_000_000;
+
+/// Maximum total value bytes scanned per element per pattern
+/// alternative: a huge-VM element must not burn unbounded CPU per
+/// query. Past the budget the remaining values are non-matches.
+const MAX_MATCH_SCAN_BYTES: usize = 256 * 1024;
+
+/// Decode the char at byte index `i` (which must sit on a char
+/// boundary) plus the next boundary.
+fn char_at(s: &str, i: usize) -> (char, usize) {
+    let c = s[i..].chars().next().unwrap_or('\0');
+    (c, i + c.len_utf8())
+}
+
 /// PS3.4 wildcard match: `*` spans any run (empty included),
 /// `?` matches exactly one character. Matching runs on `char`s so
-/// multibyte values stay on character boundaries.
+/// multibyte values stay on character boundaries, but without
+/// building `Vec<char>` copies: byte indices walk the borrowed
+/// strings. Oversized inputs and step-budget exhaustion report
+/// non-match (see the `MAX_MATCH_*` budgets).
 fn wildcard_match(value: &str, pattern: &str, case_insensitive: bool) -> bool {
+    if value.len() > MAX_MATCH_VALUE_BYTES || pattern.len() > MAX_MATCH_PATTERN_BYTES {
+        return false;
+    }
     let fold = |c: char| {
         if case_insensitive {
             c.to_ascii_lowercase()
@@ -632,55 +691,130 @@ fn wildcard_match(value: &str, pattern: &str, case_insensitive: bool) -> bool {
             c
         }
     };
-    let v: Vec<char> = value.chars().map(fold).collect();
-    let p: Vec<char> = pattern.chars().map(fold).collect();
     let (mut vi, mut pi) = (0usize, 0usize);
     let (mut star, mut mark) = (None::<usize>, 0usize);
-    while vi < v.len() {
-        if pi < p.len() && (p[pi] == '?' || p[pi] == v[vi]) {
-            vi += 1;
-            pi += 1;
-        } else if pi < p.len() && p[pi] == '*' {
-            star = Some(pi);
-            mark = vi;
-            pi += 1;
-        } else if let Some(s) = star {
-            pi = s + 1;
-            mark += 1;
+    let mut steps = 0u64;
+    while vi < value.len() {
+        steps += 1;
+        if steps > MAX_WILDCARD_STEPS {
+            return false;
+        }
+        let (vc, vnext) = char_at(value, vi);
+        if pi < pattern.len() {
+            let (pc, pnext) = char_at(pattern, pi);
+            let pc = fold(pc);
+            if pc == '?' || pc == fold(vc) {
+                vi = vnext;
+                pi = pnext;
+                continue;
+            }
+            if pc == '*' {
+                // Collapse the run: consecutive `*` backtrack
+                // identically to one, so a star-heavy pattern costs
+                // one state instead of one backtrack level per star.
+                let mut q = pnext;
+                while q < pattern.len() && pattern.as_bytes()[q] == b'*' {
+                    q += 1;
+                }
+                star = Some(q);
+                mark = vi;
+                pi = q;
+                continue;
+            }
+        }
+        if let Some(s) = star {
+            pi = s;
+            let (_, mnext) = char_at(value, mark);
+            mark = mnext;
             vi = mark;
         } else {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '*' {
-        pi += 1;
+    // Trailing stars (a lone run may remain past the loop).
+    while pi < pattern.len() {
+        steps += 1;
+        if steps > MAX_WILDCARD_STEPS {
+            return false;
+        }
+        let (pc, pnext) = char_at(pattern, pi);
+        if pc != '*' {
+            return false;
+        }
+        pi = pnext;
     }
-    pi == p.len()
+    true
+}
+
+/// Visit each string form of `value` until `f` hits or the scan
+/// budgets exhaust. Text borrows straight out of the dataset;
+/// names, tags, and numerics format on demand one at a time — the
+/// old code cloned the whole `Vec<String>` (megabytes per instance)
+/// before comparing. Oversized values are non-matches; past
+/// [`MAX_MATCH_SCAN_BYTES`] the rest are too.
+fn any_value_str(value: &Value, mut f: impl FnMut(&str) -> bool) -> bool {
+    let mut scanned = 0usize;
+    // `Ok(hit)` keeps or stops the scan; `Err(())` means the total
+    // budget is out (stop, report no hit).
+    let mut visit = |s: &str, scanned: &mut usize| -> std::result::Result<bool, ()> {
+        if s.len() > MAX_MATCH_VALUE_BYTES {
+            return Ok(false);
+        }
+        *scanned = scanned.saturating_add(s.len());
+        if *scanned > MAX_MATCH_SCAN_BYTES {
+            return Err(());
+        }
+        Ok(f(s))
+    };
+    macro_rules! scan_borrowed {
+        ($vec:expr) => {
+            for s in $vec {
+                match visit(s, &mut scanned) {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(()) => return false,
+                }
+            }
+        };
+    }
+    macro_rules! scan_owned {
+        ($vec:expr, |$x:ident| $fmt:expr) => {
+            for $x in $vec {
+                let owned = $fmt;
+                match visit(&owned, &mut scanned) {
+                    Ok(true) => return true,
+                    Ok(false) => {}
+                    Err(()) => return false,
+                }
+            }
+        };
+    }
+    match value {
+        Value::Text(v) => scan_borrowed!(v),
+        Value::PersonName(n) => scan_owned!(n, |p| p.to_dicom_string()),
+        Value::U16(v) => scan_owned!(v, |x| x.to_string()),
+        Value::U32(v) => scan_owned!(v, |x| x.to_string()),
+        Value::I16(v) => scan_owned!(v, |x| x.to_string()),
+        Value::I32(v) => scan_owned!(v, |x| x.to_string()),
+        Value::U64(v) => scan_owned!(v, |x| x.to_string()),
+        Value::I64(v) => scan_owned!(v, |x| x.to_string()),
+        Value::F32(v) => scan_owned!(v, |x| x.to_string()),
+        Value::F64(v) => scan_owned!(v, |x| x.to_string()),
+        Value::Tags(v) => scan_owned!(v, |t| format!("{:04X}{:04X}", t.group(), t.element())),
+        _ => return false,
+    }
+    false
 }
 
 /// Case-insensitive keyword/tag matching for one QIDO filter.
+///
+/// Values are visited borrowed-and-lazy ([`any_value_str`]): no
+/// whole-element clone before comparing.
 fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
     if pattern.is_empty() {
         return true; // universal match / return key
     }
     let Some(el) = ds.get(tag) else { return false };
-    let values: Vec<String> = match &el.value {
-        Value::Text(v) => v.clone(),
-        Value::PersonName(n) => n.iter().map(|p| p.to_dicom_string()).collect(),
-        Value::U16(v) => v.iter().map(ToString::to_string).collect(),
-        Value::U32(v) => v.iter().map(ToString::to_string).collect(),
-        Value::I16(v) => v.iter().map(ToString::to_string).collect(),
-        Value::I32(v) => v.iter().map(ToString::to_string).collect(),
-        Value::U64(v) => v.iter().map(ToString::to_string).collect(),
-        Value::I64(v) => v.iter().map(ToString::to_string).collect(),
-        Value::F32(v) => v.iter().map(ToString::to_string).collect(),
-        Value::F64(v) => v.iter().map(ToString::to_string).collect(),
-        Value::Tags(v) => v
-            .iter()
-            .map(|t| format!("{:04X}{:04X}", t.group(), t.element()))
-            .collect(),
-        _ => return false,
-    };
     // Comma-separated list = OR; for DA/TM/DT/DS/IS, `a-b` is an
     // inclusive range (numeric for DS/IS, lexicographic for the
     // fixed-width datetimes); `*`/`?` anywhere = wildcard match;
@@ -703,7 +837,7 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
                 // d is a byte index of ASCII '-', so both slices land
                 // on char boundaries.
                 let (lo, hi) = (&alt[..d], &alt[d + 1..]);
-                let hit = if matches!(el.vr, Vr::Ds | Vr::Is) {
+                if matches!(el.vr, Vr::Ds | Vr::Is) {
                     let bound = |s: &str, open: f64| {
                         if s.is_empty() {
                             Some(open)
@@ -711,40 +845,45 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
                             s.parse().ok()
                         }
                     };
-                    match (bound(lo, f64::NEG_INFINITY), bound(hi, f64::INFINITY)) {
-                        (Some(lo), Some(hi)) => values
-                            .iter()
-                            .any(|v| v.parse::<f64>().is_ok_and(|v| v >= lo && v <= hi)),
-                        _ => false,
+                    if let (Some(lo), Some(hi)) =
+                        (bound(lo, f64::NEG_INFINITY), bound(hi, f64::INFINITY))
+                    {
+                        if any_value_str(&el.value, |v| {
+                            v.parse::<f64>().is_ok_and(|v| v >= lo && v <= hi)
+                        }) {
+                            return true;
+                        }
+                        continue;
                     }
-                } else {
-                    values.iter().any(|v| {
-                        (lo.is_empty() || v.as_str() >= lo) && (hi.is_empty() || v.as_str() <= hi)
-                    })
-                };
-                if hit {
+                    // Unparsable bound ("1e-3", "abc-def"): not a
+                    // range — fall through to literal/wildcard below
+                    // so exact queries still match.
+                } else if any_value_str(&el.value, |v| {
+                    (lo.is_empty() || v >= lo) && (hi.is_empty() || v <= hi)
+                }) {
                     return true;
+                } else {
+                    continue;
                 }
-                continue;
             }
-            // Lone leading '-' (a negative literal): fall through to
-            // prefix/exact below.
+            // Lone leading '-' (a negative literal), or an unparsable
+            // DS/IS bound: fall through to wildcard/exact below.
         }
         // PS3.4 wildcards: `*` matches any run (empty included) and
         // `?` any single character, anywhere in the pattern — not just
         // a trailing `*`. PN matching stays case-insensitive.
         if alt.contains(['*', '?']) {
             let ci = el.vr == Vr::Pn;
-            if values.iter().any(|v| wildcard_match(v, alt, ci)) {
+            if any_value_str(&el.value, |v| wildcard_match(v, alt, ci)) {
                 return true;
             }
             continue;
         }
         if el.vr == Vr::Pn {
-            if values.iter().any(|v| v.eq_ignore_ascii_case(alt)) {
+            if any_value_str(&el.value, |v| v.eq_ignore_ascii_case(alt)) {
                 return true;
             }
-        } else if values.iter().any(|v| v == alt) {
+        } else if any_value_str(&el.value, |v| v == alt) {
             return true;
         }
     }
@@ -753,19 +892,36 @@ fn match_attribute(ds: &DataSet, tag: Tag, pattern: &str) -> bool {
 
 /// True when the request's `Accept` header allows one of `kinds`.
 /// Missing header means anything goes; matching is case-insensitive
-/// over bare media types (`;` parameters ignored) with `*/*` and
-/// `type/*` wildcards honored.
+/// over bare media types (other `;` parameters ignored) with `*/*`
+/// and `type/*` wildcards honored. A media range with `q=0` (RFC
+/// 7231 §5.3.2: "not acceptable") never allows, even when the type
+/// matches.
 fn accepts(req: &HttpRequest, kinds: &[&str]) -> bool {
     let Some(accept) = req.headers.get("accept") else {
         return true;
     };
     accept.split(',').any(|item| {
-        let mime = item
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim()
-            .to_ascii_lowercase();
+        let mut parts = item.split(';');
+        let mime = parts.next().unwrap_or("").trim().to_ascii_lowercase();
+        let refused = parts.any(|p| {
+            let p = p.trim();
+            let Some(q) = p
+                .strip_prefix("q=")
+                .or_else(|| p.strip_prefix("Q="))
+                .map(str::trim)
+            else {
+                return false;
+            };
+            // RFC 7231 weight: `0`, `0.0`, `0.00`, `0.000` all mean
+            // "not acceptable". Anything else (including garbage)
+            // leaves the range acceptable.
+            q.bytes().all(|b| b == b'0' || b == b'.')
+                && !q.is_empty()
+                && q.parse::<f32>().is_ok_and(|w| w == 0.0)
+        });
+        if refused {
+            return false;
+        }
         if mime == "*/*" {
             return true;
         }
@@ -776,6 +932,44 @@ fn accepts(req: &HttpRequest, kinds: &[&str]) -> bool {
                     .is_some_and(|t| k.split('/').next() == Some(t))
         })
     })
+}
+
+/// Maximum request-path bytes routed by [`dispatch`]. The longest
+/// legitimate path is a 10k-entry WADO frame list (~50 KiB); past
+/// this the request is `414` without further parsing. Direct
+/// `dispatch` embedders have no URI cap of their own, so this is
+/// enforced here rather than at the HTTP front end.
+const MAX_PATH_BYTES: usize = 256 * 1024;
+
+/// Maximum path segments collected by [`dispatch`]. The deepest
+/// route (`.../instances/{i}/frames/{list}`) has 8; past this the
+/// path cannot match any route, so it is `404` without building the
+/// segment vector (a million-slash path must not allocate a
+/// million-entry `Vec`).
+const MAX_PATH_SEGMENTS: usize = 32;
+
+/// Strip the deployment path prefix carried by `public_base` (e.g.
+/// `https://host/dicomweb`) from `path`, on a segment boundary only
+/// (so `/dicomweb2/studies` never collapses onto `/studies`).
+/// Shared by [`dispatch`] and the hyper front end's pre-body route
+/// check so the two can never drift apart.
+pub(crate) fn strip_base_prefix<'a>(public_base: &str, path: &'a str) -> &'a str {
+    let base = public_base.trim_end_matches('/');
+    let prefix = base
+        .split_once("://")
+        .and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..]))
+        .unwrap_or("");
+    if prefix.is_empty() {
+        path
+    } else if path == prefix {
+        "/"
+    } else if let Some(rest) = path.strip_prefix(prefix)
+        && rest.starts_with('/')
+    {
+        rest
+    } else {
+        path
+    }
 }
 
 /// Route one request against a store. `public_base` is the externally
@@ -796,24 +990,19 @@ fn accepts(req: &HttpRequest, kinds: &[&str]) -> bool {
 /// `application/dicom+json`.
 pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpRequest) -> HttpResponse {
     let base = public_base.trim_end_matches('/');
-    let prefix = base
-        .split_once("://")
-        .and_then(|(_, rest)| rest.find('/').map(|i| &rest[i..]))
-        .unwrap_or("");
-    // Strip the deployment prefix on a segment boundary only, so
-    // `/dicomweb2/studies` never collapses onto `/studies`.
-    let path = if prefix.is_empty() {
-        req.path.as_str()
-    } else if req.path == prefix {
-        "/"
-    } else if let Some(rest) = req.path.strip_prefix(prefix)
-        && rest.starts_with('/')
-    {
-        rest
-    } else {
-        req.path.as_str()
-    };
-    let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if req.path.len() > MAX_PATH_BYTES {
+        return HttpResponse::text(414, "URI too long");
+    }
+    let path = strip_base_prefix(public_base, &req.path);
+    // Count-then-collect: paths past MAX_PATH_SEGMENTS 404 without
+    // ever building the oversized vector.
+    let mut segs: Vec<&str> = Vec::new();
+    for seg in path.split('/').filter(|s| !s.is_empty()) {
+        if segs.len() >= MAX_PATH_SEGMENTS {
+            return HttpResponse::text(404, "unknown DICOMweb resource");
+        }
+        segs.push(seg);
+    }
     match (req.method.as_str(), segs.as_slice()) {
         ("GET", ["studies"]) => qido(
             store,
@@ -886,7 +1075,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                     &[Part::new("application/dicom", file)],
                     "application/dicom",
                 )
-                .unwrap_or_else(|e| HttpResponse::text(500, e)),
+                .unwrap_or_else(|e| HttpResponse::text(500, e.to_string())),
                 None => HttpResponse::text(404, "instance not found"),
             }
         }
@@ -967,12 +1156,18 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
             // invalid — frames are 1-based). Duplicates are also a 400:
             // each entry embeds a full frame, so `1,1,...` would turn a
             // KB URL into a GB response (direct `dispatch` embedders
-            // have no URI cap of their own).
+            // have no URI cap of their own). The count cap trips
+            // *during* the parse (before the duplicate check), so a
+            // million-entry list never builds a million-entry `Vec` +
+            // `HashSet` first.
             let mut frames = Vec::new();
             let mut seen = HashSet::new();
             for f in list.split(',') {
                 match f.parse::<u32>() {
                     Ok(n) if n >= 1 => {
+                        if frames.len() >= MAX_WADO_FRAMES {
+                            return HttpResponse::text(400, "too many frames");
+                        }
                         if !seen.insert(n) {
                             return HttpResponse::text(400, "duplicate frame number");
                         }
@@ -981,7 +1176,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                     _ => return HttpResponse::text(400, "bad frame list"),
                 }
             }
-            if frames.is_empty() || frames.len() > MAX_WADO_FRAMES {
+            if frames.is_empty() {
                 return HttpResponse::text(400, "bad frame list");
             }
             match store.instance_frames(study, series, instance, &frames) {
@@ -991,7 +1186,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
                         .map(|b| Part::new("application/octet-stream", b))
                         .collect();
                     HttpResponse::multipart(&parts, "application/octet-stream")
-                        .unwrap_or_else(|e| HttpResponse::text(500, e))
+                        .unwrap_or_else(|e| HttpResponse::text(500, e.to_string()))
                 }
                 Ok(None) => HttpResponse::text(404, "instance or frames not found"),
                 Err(e) => HttpResponse::text(500, e),
@@ -1035,7 +1230,7 @@ fn retrieve_files(files: Vec<Bytes>, what: &str) -> HttpResponse {
         .map(|f| Part::new("application/dicom", f))
         .collect();
     HttpResponse::multipart(&parts, "application/dicom")
-        .unwrap_or_else(|e| HttpResponse::text(500, e))
+        .unwrap_or_else(|e| HttpResponse::text(500, e.to_string()))
 }
 
 fn qido<S: DicomWebStore>(
@@ -1169,17 +1364,17 @@ fn stow<S: DicomWebStore>(
         .unwrap_or("");
     let (mime, params) = parse_content_type(ct);
     if mime != "multipart/related" {
-        return HttpResponse::text(400, "STOW needs multipart/related");
+        return stow_total_failure(&[]);
     }
     let Some(boundary) = params.get("boundary") else {
-        return HttpResponse::text(400, "STOW multipart without boundary");
+        return stow_total_failure(&[]);
     };
     if boundary.is_empty() {
-        return HttpResponse::text(400, "STOW multipart with empty boundary");
+        return stow_total_failure(&[]);
     }
     let parts = match decode_multipart(&req.body, boundary) {
         Ok(p) => p,
-        Err(e) => return HttpResponse::text(400, e.to_string()),
+        Err(_) => return stow_total_failure(&[]),
     };
     let mut stored: Vec<StoredIds> = Vec::new();
     let mut failures: Vec<(Option<String>, Option<String>, String)> = Vec::new();
@@ -1201,47 +1396,22 @@ fn stow<S: DicomWebStore>(
         }
     }
     if stored.is_empty() {
-        // Non-DICOM parts skip without failure entries, so zero
-        // failures means zero DICOM parts — not an empty reason.
-        if failures.is_empty() {
-            return HttpResponse::text(400, "no application/dicom parts in STOW request");
-        }
-        let reasons: Vec<&str> = failures.iter().map(|(_, _, r)| r.as_str()).collect();
-        return HttpResponse::text(400, format!("nothing stored: {}", reasons.join("; ")));
+        // Total failure (or zero DICOM parts, when `failures` is
+        // empty): 400 in DICOM JSON like every other STOW body —
+        // never a joined free-text reason list (unbounded growth:
+        // 100k parts × long reasons).
+        return stow_total_failure(&failures);
     }
     if !failures.is_empty() {
         // Partial failure: 409 with one FailedSOPSequence item per
         // failed instance (UIDs best-effort: an unparseable part has
         // none to report).
-        let items: Vec<serde_json::Value> = failures
-            .iter()
-            .map(|(class, inst, _)| {
-                let mut item = serde_json::Map::new();
-                if let Some(uid) = class {
-                    item.insert(
-                        "00081150".to_string(),
-                        serde_json::json!({"vr": "UI", "Value": [uid]}),
-                    );
-                }
-                if let Some(uid) = inst {
-                    item.insert(
-                        "00081155".to_string(),
-                        serde_json::json!({"vr": "UI", "Value": [uid]}),
-                    );
-                }
-                item.insert(
-                    "00081197".to_string(),
-                    serde_json::json!({"vr": "US", "Value": [STOW_FAILURE_PROCESSING]}),
-                );
-                serde_json::Value::Object(item)
-            })
-            .collect();
         return HttpResponse::json(
             409,
             &serde_json::json!({
-                "00081198": {"vr": "SQ", "Value": items},
+                "00081198": {"vr": "SQ", "Value": failed_sop_items(&failures)},
                 "00081199": {"vr": "SQ", "Value": referenced_sop_items(&stored)},
-                "00081190": {"vr": "UR", "Value": [format!("{base}/studies/{}", stored[0].study)]},
+                "00081190": {"vr": "UR", "Value": stow_retrieve_urls(base, &stored)},
             }),
         );
     }
@@ -1249,9 +1419,68 @@ fn stow<S: DicomWebStore>(
         200,
         &serde_json::json!({
             "00081199": {"vr": "SQ", "Value": referenced_sop_items(&stored)},
-            "00081190": {"vr": "UR", "Value": [format!("{base}/studies/{}", stored[0].study)]}
+            "00081190": {"vr": "UR", "Value": stow_retrieve_urls(base, &stored)}
         }),
     )
+}
+
+/// STOW total failure / malformed upload: 400 in DICOM JSON (the
+/// `:1160` contract covers failure bodies alike), carrying the
+/// `FailedSOPSequence` refs when any part yielded UIDs. The per-part
+/// reason strings never render: only UIDs plus the fixed
+/// `STOW_FAILURE_PROCESSING` code, so the body stays bounded.
+fn stow_total_failure(failures: &[(Option<String>, Option<String>, String)]) -> HttpResponse {
+    HttpResponse::json(
+        400,
+        &serde_json::json!({
+            "00081198": {"vr": "SQ", "Value": failed_sop_items(failures)},
+        }),
+    )
+}
+
+/// One `FailedSOPSequence` item per failed instance (PS3.18 Store
+/// Instances Response): best-effort class/instance refs plus the
+/// failure-reason code.
+fn failed_sop_items(
+    failures: &[(Option<String>, Option<String>, String)],
+) -> Vec<serde_json::Value> {
+    failures
+        .iter()
+        .map(|(class, inst, _)| {
+            let mut item = serde_json::Map::new();
+            if let Some(uid) = class {
+                item.insert(
+                    "00081150".to_string(),
+                    serde_json::json!({"vr": "UI", "Value": [uid]}),
+                );
+            }
+            if let Some(uid) = inst {
+                item.insert(
+                    "00081155".to_string(),
+                    serde_json::json!({"vr": "UI", "Value": [uid]}),
+                );
+            }
+            item.insert(
+                "00081197".to_string(),
+                serde_json::json!({"vr": "US", "Value": [STOW_FAILURE_PROCESSING]}),
+            );
+            serde_json::Value::Object(item)
+        })
+        .collect()
+}
+
+/// One RetrieveURL per distinct stored study, first-seen order: a
+/// multi-study STOW must reference every study it stored, not just
+/// the first part's.
+fn stow_retrieve_urls(base: &str, stored: &[StoredIds]) -> Vec<serde_json::Value> {
+    let mut seen = HashSet::new();
+    let mut urls = Vec::new();
+    for ids in stored {
+        if seen.insert(ids.study.clone()) {
+            urls.push(serde_json::json!(format!("{base}/studies/{}", ids.study)));
+        }
+    }
+    urls
 }
 
 /// One `ReferencedSOPSequence` item per stored instance (PS3.18
@@ -1284,9 +1513,36 @@ fn sop_uids_of(body: &[u8]) -> (Option<String>, Option<String>) {
     )
 }
 
-/// Build a Part-10 test file (also used by doc examples).
+/// Maximum test-image pixels per side ([`try_test_file`]): `u16`
+/// dims multiply to ~8 GiB of pixel bytes, which a test helper must
+/// never allocate.
+const MAX_TEST_FILE_SIDE: usize = 1024;
+
+/// Maximum test-image pixel bytes ([`try_test_file`]).
+const MAX_TEST_FILE_PIXELS: usize = 8 * 1024 * 1024;
+
+/// Build a Part-10 test file, refusing dims that would allocate
+/// more than [`MAX_TEST_FILE_PIXELS`] bytes instead of OOMing the
+/// test runner.
 #[doc(hidden)]
-pub fn test_file(study: &str, series: &str, instance: &str, rows: u16, cols: u16) -> Vec<u8> {
+pub fn try_test_file(
+    study: &str,
+    series: &str,
+    instance: &str,
+    rows: u16,
+    cols: u16,
+) -> std::result::Result<Vec<u8>, String> {
+    let (rows_n, cols_n) = (rows as usize, cols as usize);
+    let len = rows_n
+        .checked_mul(cols_n)
+        .and_then(|n| n.checked_mul(2))
+        .ok_or_else(|| "test_file dims overflow address space".to_string())?;
+    if rows_n > MAX_TEST_FILE_SIDE || cols_n > MAX_TEST_FILE_SIDE || len > MAX_TEST_FILE_PIXELS {
+        return Err(format!(
+            "test_file dims {rows}x{cols} exceed the test cap \
+             ({MAX_TEST_FILE_SIDE}x{MAX_TEST_FILE_SIDE}, {MAX_TEST_FILE_PIXELS} pixel bytes)"
+        ));
+    }
     let mut ds = DataSet::new();
     ds.put_uid(tags::SOP_CLASS_UID, vyna_dcm_core::sop_class::CT_IMAGE);
     ds.put_uid(tags::SOP_INSTANCE_UID, instance);
@@ -1302,18 +1558,22 @@ pub fn test_file(study: &str, series: &str, instance: &str, rows: u16, cols: u16
     ds.put_u16_single(tags::BITS_STORED, 12);
     ds.put_u16_single(tags::HIGH_BIT, 11);
     ds.put_u16_single(tags::PIXEL_REPRESENTATION, 0);
-    // Checked: the u16 triple can overflow 32-bit usize.
-    let len = (rows as usize)
-        .checked_mul(cols as usize)
-        .and_then(|n| n.checked_mul(2))
-        .expect("test_file dims overflow address space");
     ds.put_bytes(tags::PIXEL_DATA, Vr::Ow, vec![0u8; len]);
     let meta = FileMeta::new(
         vyna_dcm_core::sop_class::CT_IMAGE,
         instance,
         TransferSyntax::ExplicitVrLittleEndian,
     );
-    write_part10(&meta, &ds).unwrap()
+    write_part10(&meta, &ds).map_err(|e| e.to_string())
+}
+
+/// Build a Part-10 test file (also used by doc examples).
+///
+/// Panics on oversize dims or encode failure; fallible callers want
+/// [`try_test_file`].
+#[doc(hidden)]
+pub fn test_file(study: &str, series: &str, instance: &str, rows: u16, cols: u16) -> Vec<u8> {
+    try_test_file(study, series, instance, rows, cols).expect("test_file dims within test cap")
 }
 
 #[cfg(test)]
@@ -2291,7 +2551,7 @@ mod tests {
     }
 
     #[test]
-    fn stow_without_dicom_parts_names_the_problem() {
+    fn stow_without_dicom_parts_is_json_failure() {
         let store = stored();
         let (ct, body) = encode_multipart(
             &[Part::new("application/octet-stream", b"hello".to_vec())],
@@ -2301,10 +2561,18 @@ mod tests {
         .unwrap();
         let r = dispatch(&store, "http://x/wado", &stow_req("/studies", &ct, body));
         assert_eq!(r.status, 400);
-        assert_eq!(
-            String::from_utf8_lossy(&r.body).as_ref(),
-            "no application/dicom parts in STOW request"
+        // DICOM JSON per the STOW contract, not free text: an empty
+        // FailedSOPSequence (no DICOM part yielded any refs).
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v == "application/dicom+json"),
+            "{:?}",
+            r.headers
         );
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["00081198"]["vr"], serde_json::json!("SQ"));
+        assert!(v["00081198"]["Value"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -2461,5 +2729,333 @@ mod tests {
         let r = dispatch(&store, "http://x/wado", &get("/studies?limit=99999"));
         let hits: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(hits.as_array().unwrap().len(), 1000);
+    }
+
+    #[test]
+    fn wildcard_match_caps_oversized_inputs() {
+        // Oversized value: non-match, never a multi-GB char vector.
+        let huge = "A".repeat(MAX_MATCH_VALUE_BYTES + 1);
+        assert!(!wildcard_match(&huge, "*", false));
+        assert!(!wildcard_match(&huge, &huge, false));
+        // Boundary: exactly at the cap still compares.
+        let edge = "A".repeat(MAX_MATCH_VALUE_BYTES);
+        assert!(wildcard_match(&edge, "*", false));
+        // Oversized pattern: non-match.
+        let big_pat = format!("*{}*", "B".repeat(MAX_MATCH_PATTERN_BYTES));
+        assert!(!wildcard_match("B", &big_pat, false));
+        // Star-heavy pattern collapses: 10k stars cost one state.
+        let stars = "*".repeat(10_000);
+        assert!(wildcard_match("anything", &stars, false));
+        assert!(wildcard_match("", &stars, false));
+        // Multibyte stays on char boundaries: `?` is one char, and
+        // a value split mid-char never matches mid-char.
+        assert!(wildcard_match("héllo", "h?llo", false));
+        assert!(!wildcard_match("héllo", "h??o", false));
+        assert!(wildcard_match("日本語", "日本?", false));
+    }
+
+    #[test]
+    fn wildcard_match_star_heavy_cpu_is_bounded() {
+        // Alternating star/char runs defeat star collapsing and send
+        // naive backtracking quadratic: 2000 segments against a 64 KiB
+        // non-matching value must still return promptly (step budget
+        // bails to non-match) instead of hanging the QIDO handler.
+        let value = "a".repeat(64 * 1024);
+        let mut pattern = "*a".repeat(2000);
+        pattern.push('!');
+        let t0 = std::time::Instant::now();
+        assert!(!wildcard_match(&value, &pattern, false));
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "star-heavy match took {:?}",
+            t0.elapsed()
+        );
+        // Legit segmented patterns still match under the budget.
+        assert!(wildcard_match("xxaxxaxxa", "*a*a*a", false));
+        assert!(!wildcard_match("xxaxxaxxa", "*a*a*a!", false));
+    }
+
+    #[test]
+    fn match_attribute_skips_huge_values_borrowed() {
+        let mut ds = DataSet::new();
+        // One oversized component is a non-match for itself, while a
+        // later normal component still matches (lazy per-value scan,
+        // no whole-element clone).
+        ds.insert(vyna_dcm_core::DataElement::new(
+            tags::PATIENT_ID,
+            Vr::Lo,
+            Value::Text(vec!["X".repeat(MAX_MATCH_VALUE_BYTES + 1), "W123".into()]),
+        ));
+        assert!(match_attribute(&ds, tags::PATIENT_ID, "W123"));
+        assert!(match_attribute(&ds, tags::PATIENT_ID, "W*"));
+        assert!(!match_attribute(&ds, tags::PATIENT_ID, "X*"));
+        // Huge-VM numerics scan under the total budget: the early
+        // values still match without formatting millions first.
+        let mut many = vec![7u16; 200_000];
+        many[0] = 42;
+        ds.insert(vyna_dcm_core::DataElement::new(
+            tags::SELECTOR_US_VALUE,
+            Vr::Us,
+            Value::U16(many),
+        ));
+        assert!(match_attribute(&ds, tags::SELECTOR_US_VALUE, "42"));
+    }
+
+    #[test]
+    fn ds_is_unparsable_bound_falls_back_to_literal() {
+        let mut ds = DataSet::new();
+        ds.put_text(tags::SERIES_NUMBER, Vr::Is, "1e-3");
+        // Looks like a range ("1e"-"3") but the bound is unparsable:
+        // the exact query must still match.
+        assert!(match_attribute(&ds, tags::SERIES_NUMBER, "1e-3"));
+        assert!(!match_attribute(&ds, tags::SERIES_NUMBER, "1e-4"));
+        let mut ds = DataSet::new();
+        ds.put_text(tags::SLICE_THICKNESS, Vr::Ds, "ABC-DEF");
+        assert!(match_attribute(&ds, tags::SLICE_THICKNESS, "ABC-DEF"));
+        // Real ranges keep range semantics (no literal fallback on a
+        // parsed-but-missing range).
+        let mut ds = DataSet::new();
+        ds.put_text(tags::SERIES_NUMBER, Vr::Is, "7");
+        assert!(match_attribute(&ds, tags::SERIES_NUMBER, "1-10"));
+        assert!(!match_attribute(&ds, tags::SERIES_NUMBER, "10-20"));
+        assert!(match_attribute(&ds, tags::SERIES_NUMBER, "-5-10"));
+    }
+
+    #[test]
+    fn wado_frame_cap_trips_during_parse() {
+        let store = stored();
+        let inst = "/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/";
+        // Past the cap trips mid-parse with its own message (the old
+        // code built the full Vec+HashSet, then 400'd as "bad frame
+        // list" — same status, unbounded transient).
+        let flood = (1..=MAX_WADO_FRAMES + 1)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let r = dispatch(&store, "http://x/wado", &get(&format!("{inst}{flood}")));
+        assert_eq!(r.status, 400);
+        assert_eq!(String::from_utf8_lossy(&r.body).as_ref(), "too many frames");
+        // Cap trips before the duplicate check: entry #10001 is a dup
+        // of frame 1, yet the answer is the cap, not "duplicate".
+        let dup_tail = (1..=MAX_WADO_FRAMES)
+            .map(|n| n.to_string())
+            .chain(std::iter::once("1".to_string()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let r = dispatch(&store, "http://x/wado", &get(&format!("{inst}{dup_tail}")));
+        assert_eq!(r.status, 400);
+        assert_eq!(String::from_utf8_lossy(&r.body).as_ref(), "too many frames");
+        // Duplicates under the cap still report as duplicates.
+        let r = dispatch(&store, "http://x/wado", &get(&format!("{inst}1,2,1")));
+        assert_eq!(r.status, 400);
+        assert_eq!(
+            String::from_utf8_lossy(&r.body).as_ref(),
+            "duplicate frame number"
+        );
+    }
+
+    #[test]
+    fn dispatch_caps_path_shape() {
+        let store = stored();
+        // A million-slash path 404s without building the vector.
+        let segs = ["seg"; 100].join("/");
+        let r = dispatch(&store, "http://x", &get(&format!("/{segs}")));
+        assert_eq!(r.status, 404);
+        let exact: String = format!("/{}/studies", ["s"; MAX_PATH_SEGMENTS].join("/"));
+        let r = dispatch(&store, "http://x", &get(&exact));
+        assert_eq!(r.status, 404);
+        // Past the byte cap is 414 before any routing work.
+        let long = format!("/studies/{}", "9".repeat(MAX_PATH_BYTES));
+        let r = dispatch(&store, "http://x", &get(&long));
+        assert_eq!(r.status, 414);
+        // Real routes (including the 8-segment frames route) pass.
+        assert_eq!(dispatch(&store, "http://x", &get("/studies")).status, 200);
+        let r = dispatch(
+            &store,
+            "http://x",
+            &get("/studies/1.2.3/series/1.2.3.1/instances/1.2.3.1.1/frames/1"),
+        );
+        assert_eq!(r.status, 200);
+    }
+
+    #[test]
+    fn accepts_honors_q_zero() {
+        let store = stored();
+        // q=0 means "not acceptable" (RFC 7231 §5.3.2), in every
+        // spelling — even when the type matches.
+        for accept in [
+            "application/dicom+json;q=0",
+            "application/dicom+json; q=0.0",
+            "application/dicom+json;Q=0.000",
+            "*/*;q=0",
+            "text/html, application/dicom+json;q=0",
+        ] {
+            let r = dispatch(&store, "http://x/wado", &get_accept("/studies", accept));
+            assert_eq!(r.status, 406, "{accept}");
+        }
+        // Nonzero q (and q-less ranges) still allow.
+        for accept in [
+            "application/dicom+json;q=0.5",
+            "application/dicom+json;q=1",
+            "application/dicom+json",
+            "text/html, application/dicom+json;q=0.1",
+            "application/*",
+        ] {
+            let r = dispatch(&store, "http://x/wado", &get_accept("/studies", accept));
+            assert_eq!(r.status, 200, "{accept}");
+        }
+    }
+
+    #[test]
+    fn multipart_reports_typed_error() {
+        let good = HttpResponse::multipart(
+            &[Part::new("application/dicom", vec![1])],
+            "application/dicom",
+        );
+        assert!(good.is_ok());
+        // CR/LF framing injection surfaces as Error::Multipart (not a
+        // stringly Result<Self, String>).
+        let evil = HttpResponse::multipart(
+            &[Part::new("application/dicom\r\nX-Injected: yes", vec![1])],
+            "application/dicom",
+        );
+        match evil {
+            Err(crate::Error::Multipart(_)) => {}
+            other => panic!("expected Error::Multipart, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stow_total_failure_is_json_with_refs() {
+        let store = stored();
+        // All-DICOM-but-unparseable: 400 in DICOM JSON carrying the
+        // FailedSOPSequence refs (garbage part: reason-only item).
+        let (ct, body) = encode_multipart(
+            &[Part::new("application/dicom", b"not a dicom file".to_vec())],
+            "b400",
+            "application/dicom",
+        )
+        .unwrap();
+        let r = dispatch(&store, "http://x/wado", &stow_req("/studies", &ct, body));
+        assert_eq!(r.status, 400);
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k == "content-type" && v == "application/dicom+json"),
+            "{:?}",
+            r.headers
+        );
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let failed = v["00081198"]["Value"].as_array().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0]["00081197"]["Value"][0], serde_json::json!(0x0110));
+        // Malformed uploads are JSON 400s too (empty sequence: no UIDs
+        // could be recovered).
+        for (ct, body) in [
+            ("application/json".to_string(), b"{}".to_vec()),
+            ("multipart/related".to_string(), b"x".to_vec()),
+        ] {
+            let r = dispatch(&store, "http://x/wado", &stow_req("/studies", &ct, body));
+            assert_eq!(r.status, 400);
+            let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+            assert!(v["00081198"]["Value"].as_array().unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn stow_retrieve_url_lists_every_study() {
+        let store = stored();
+        let (ct, body) = encode_multipart(
+            &[
+                Part::new(
+                    "application/dicom",
+                    test_file("4.4.1", "4.4.1.1", "4.4.1.1.1", 2, 2),
+                ),
+                Part::new(
+                    "application/dicom",
+                    test_file("4.4.2", "4.4.2.1", "4.4.2.1.1", 2, 2),
+                ),
+                // Same study twice: one URL, not two.
+                Part::new(
+                    "application/dicom",
+                    test_file("4.4.1", "4.4.1.2", "4.4.1.2.1", 2, 2),
+                ),
+            ],
+            "bmulti",
+            "application/dicom",
+        )
+        .unwrap();
+        let r = dispatch(&store, "http://x/wado", &stow_req("/studies", &ct, body));
+        assert_eq!(r.status, 200, "{}", String::from_utf8_lossy(&r.body));
+        let v: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+        let urls = v["00081190"]["Value"].as_array().unwrap();
+        assert_eq!(urls.len(), 2, "{v}");
+        assert_eq!(urls[0], serde_json::json!("http://x/wado/studies/4.4.1"));
+        assert_eq!(urls[1], serde_json::json!("http://x/wado/studies/4.4.2"));
+    }
+
+    #[test]
+    fn try_test_file_refuses_giant_dims() {
+        // u16::MAX dims would allocate ~8 GiB: refused in-process,
+        // without allocating.
+        let err = try_test_file("1.1", "1.1.1", "1.1.1.1", 65535, 65535).unwrap_err();
+        assert!(err.contains("exceed"), "{err}");
+        let err = try_test_file("1.1", "1.1.1", "1.1.1.1", 2048, 2048).unwrap_err();
+        assert!(err.contains("exceed"), "{err}");
+        // In-cap dims still build.
+        assert!(try_test_file("1.1", "1.1.1", "1.1.1.1", 1024, 1024).is_ok());
+        assert!(try_test_file("1.1", "1.1.1", "1.1.1.1", 2, 2).is_ok());
+    }
+
+    #[test]
+    fn clone_without_bulk_drops_only_bulk() {
+        let mut ds = DataSet::new();
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "W123");
+        ds.put_bytes(tags::PIXEL_DATA, Vr::Ow, vec![1u8; 16]);
+        ds.put_bytes(tags::ENCAPSULATED_DOCUMENT, Vr::Ob, b"%PDF".to_vec());
+        let slim = clone_without_bulk(&ds);
+        assert_eq!(slim.string(tags::PATIENT_ID), Some("W123"));
+        assert!(!slim.contains(tags::PIXEL_DATA));
+        assert!(!slim.contains(tags::ENCAPSULATED_DOCUMENT));
+        // The source keeps its bulk (QIDO must not mutate the store).
+        assert!(ds.contains(tags::PIXEL_DATA));
+    }
+
+    #[test]
+    fn instance_frames_decodes_alongside_store_use() {
+        use std::sync::Arc;
+        // instance_frames snapshots under the lock and decodes after
+        // it: concurrent readers/writers proceed instead of
+        // serializing on a held mutex. (A hold-across-decode
+        // regression still passes functionally — this pins the
+        // concurrent shape so the refactor stays covered.)
+        let store = Arc::new(stored());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let s = store.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..25 {
+                    let frames = s
+                        .instance_frames("1.2.3", "1.2.3.1", "1.2.3.1.1", &[1])
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(frames.len(), 1);
+                    let hits = s.search(
+                        &QidoScope {
+                            level: "STUDY",
+                            study: None,
+                            series: None,
+                        },
+                        &[],
+                        10,
+                        0,
+                    );
+                    assert_eq!(hits.len(), 1);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 }

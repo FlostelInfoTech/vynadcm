@@ -49,7 +49,7 @@ pub mod worklist;
 pub use ae::AeTitle;
 pub use association::{
     Association, AssociationInfo, AssociationOptions, AsyncReadWrite, DimseEvent,
-    MAX_STASHED_BYTES, MAX_STASHED_EVENTS, NegotiatedContext,
+    MAX_COMMAND_BYTES, MAX_STASHED_BYTES, MAX_STASHED_EVENTS, NegotiatedContext,
 };
 pub use dimse::{Command, DimseMessage, command_field, priority, status};
 pub use error::{Error, Result};

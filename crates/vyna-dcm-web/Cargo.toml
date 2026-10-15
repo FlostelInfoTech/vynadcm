@@ -13,7 +13,7 @@ categories = ["web-programming", "multimedia"]
 
 [features]
 default = ["server"]
-server = ["hyper", "hyper-util", "http-body-util", "tokio"]
+server = ["hyper", "hyper-util", "http-body", "http-body-util", "tokio"]
 
 [dependencies]
 vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.5" }
@@ -25,12 +25,15 @@ serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
+rustls-pemfile.workspace = true
 rustls-platform-verifier.workspace = true
+webpki-roots.workspace = true
 tokio = { workspace = true, features = ["rt", "net", "macros", "sync", "time"], optional = true }
 tracing.workspace = true
 uuid.workspace = true
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body = { version = "1", optional = true }
 http-body-util = { version = "0.1", optional = true }
 
 [dev-dependencies]

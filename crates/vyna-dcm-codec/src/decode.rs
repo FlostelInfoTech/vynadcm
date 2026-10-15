@@ -211,6 +211,9 @@ fn decode_elements(
     // (three rule tags sort before (0028,0103)): resolved as US for
     // now, flipped to SS below if the sibling arrives as 1.
     let mut deferred_ss = Vec::new();
+    // Same for `OB-or-OW` context tags met before their Bits
+    // Allocated sibling (out-of-order implicit-VR files).
+    let mut deferred_ow = Vec::new();
     while r.pos < end {
         let elem_offset = r.pos;
         let tag = r.tag()?;
@@ -241,6 +244,27 @@ fn decode_elements(
         {
             deferred_ss.push(tag);
         }
+        if !r.explicit && matches!(vr, Vr::Ob | Vr::Ow) {
+            // Exhaustive on purpose (see `ContextVrRule` docs): a new
+            // mechanism must decide here whether it defers.
+            let sibling_missing = match context_vr_rule(tag) {
+                Some(ContextVrRule::BitsAllocated) => ds.get(tags::BITS_ALLOCATED).is_none(),
+                Some(ContextVrRule::WaveformBitsAllocated) => {
+                    ds.get(tags::WAVEFORM_BITS_ALLOCATED).is_none()
+                }
+                Some(ContextVrRule::PixelRepresentation) | None => false,
+            };
+            if sibling_missing {
+                deferred_ow.push(tag);
+            }
+        }
+        if ds.contains(tag) {
+            return Err(Error::BadValue {
+                tag,
+                vr,
+                message: "duplicate element (each tag must occur once)".into(),
+            });
+        }
         ds.insert(DataElement::new(tag, vr, value));
     }
     // Same-level fix-up: the sibling arrived late as signed, so the
@@ -257,6 +281,15 @@ fn decode_elements(
             }
         }
     }
+    // Same-level fix-up for OB/OW: the sibling arrived late (or not
+    // at all, in which case the default stands). The value stays
+    // opaque bytes either way; only the VR changes.
+    for tag in deferred_ow {
+        let want = resolve_ambiguous(tag, &ds);
+        if let Some(e) = ds.get_mut(tag) {
+            e.vr = want;
+        }
+    }
     Ok(ds)
 }
 
@@ -269,7 +302,17 @@ fn read_header(r: &mut Reader<'_>, tag: Tag, offset: usize, ds: &DataSet) -> Res
             offset,
         })?;
         let len = if vr.uses_long_form() {
-            r.take(2, "reserved bytes")?;
+            let reserved = r.take(2, "reserved bytes")?;
+            if reserved != [0x00, 0x00] {
+                return Err(Error::BadValue {
+                    tag,
+                    vr,
+                    message: format!(
+                        "explicit-VR reserved bytes must be 0x0000, got {:02X}{:02X}",
+                        reserved[0], reserved[1]
+                    ),
+                });
+            }
             r.u32("long-form length")?
         } else {
             r.u16("short-form length")? as u32
@@ -580,6 +623,13 @@ fn read_until_item_delimiter(
         }
         let (vr, len) = read_header(r, tag, at, &ds)?;
         let value = read_value(r, tag, vr, len, at, depth, capture, &mut *charset)?;
+        if ds.contains(tag) {
+            return Err(Error::BadValue {
+                tag,
+                vr,
+                message: "duplicate element (each tag must occur once)".into(),
+            });
+        }
         ds.insert(DataElement::new(tag, vr, value));
     }
 }
@@ -963,6 +1013,52 @@ mod tests {
         bytes.extend([0xE0, 0x7F, 0x10, 0x00, 0x04, 0x00, 0x00, 0x00, 1, 2, 3, 4]); // PixelData
         let ds = decode_dataset(&bytes, TransferSyntax::ImplicitVrLittleEndian).unwrap();
         assert_eq!(ds.vr_of(tags::PIXEL_DATA), Some(Vr::Ob));
+    }
+
+    #[test]
+    fn out_of_order_ob_ow_resolves_after_bits_allocated() {
+        // Implicit-VR files need not be in tag order: an OB/OW
+        // context tag met before its Bits Allocated sibling must be
+        // re-resolved once the sibling arrives (not frozen as OW).
+        let mut bytes = vec![];
+        bytes.extend([0xE0, 0x7F, 0x10, 0x00, 0x04, 0x00, 0x00, 0x00, 1, 2, 3, 4]); // PixelData
+        bytes.extend([0x28, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x08, 0x00]); // BitsAllocated=8
+        let ds = implicit_le(&bytes).unwrap();
+        assert_eq!(ds.vr_of(tags::PIXEL_DATA), Some(Vr::Ob));
+        assert_eq!(ds.bytes(tags::PIXEL_DATA), Some([1, 2, 3, 4].as_slice()));
+        // Same for the waveform mechanism (sibling 5400,1004).
+        let mut bytes = vec![];
+        bytes.extend([0x00, 0x54, 0x10, 0x10, 0x02, 0x00, 0x00, 0x00, 5, 6]); // WaveformData
+        bytes.extend([0x00, 0x54, 0x04, 0x10, 0x02, 0x00, 0x00, 0x00, 0x08, 0x00]); // WBitsAlloc=8
+        let ds = implicit_le(&bytes).unwrap();
+        assert_eq!(ds.vr_of(tags::WAVEFORM_DATA), Some(Vr::Ob));
+        // No sibling at all: the OW default stands.
+        let ds = implicit_le(&bytes[..10]).unwrap();
+        assert_eq!(ds.vr_of(tags::WAVEFORM_DATA), Some(Vr::Ow));
+    }
+
+    #[test]
+    fn rejects_duplicate_elements() {
+        // Each tag must occur once; last-win would silently drop data.
+        let el = [0x28, 0x00, 0x10, 0x00, b'U', b'S', 0x02, 0x00, 0x00, 0x02];
+        let bytes: Vec<u8> = el.iter().chain(el.iter()).copied().collect();
+        let err = explicit_le(&bytes).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+        // Same for implicit VR (tag + u32 length, no VR on wire).
+        let el = [0x28, 0x00, 0x10, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02];
+        let bytes: Vec<u8> = el.iter().chain(el.iter()).copied().collect();
+        let err = implicit_le(&bytes).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn rejects_nonzero_explicit_reserved_bytes() {
+        // Long-form VRs carry two reserved bytes that must be 0x0000.
+        let bytes = [
+            0x08, 0x00, 0x40, 0x11, b'S', b'Q', 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let err = explicit_le(&bytes).unwrap_err();
+        assert!(err.to_string().contains("reserved"), "{err}");
     }
 
     #[test]

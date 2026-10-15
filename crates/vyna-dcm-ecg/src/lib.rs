@@ -12,7 +12,7 @@
 //! ```
 //! use vyna_dcm_ecg::{EcgLead, EcgRecording, recording_to_waveform_item};
 //!
-//! let leads = vec![EcgLead::new("II", vec![0; 500], 0.001)];
+//! let leads = vec![EcgLead::new("II", vec![0; 500], 0.001).unwrap()];
 //! let rec = EcgRecording::new(leads, 500.0).unwrap();
 //! let item = recording_to_waveform_item(&rec).unwrap();
 //! assert_eq!(item.string(vyna_dcm_core::tags::SAMPLING_FREQUENCY), Some("500"));
@@ -30,6 +30,6 @@ pub use model::{
     mdc_code_for_lead,
 };
 pub use waveform::{
-    EcgInstanceMeta, SOP_12_LEAD_ECG, SOP_GENERAL_ECG, file_meta_for_dataset,
+    EcgInstanceMeta, SOP_12_LEAD_ECG, SOP_AMBULATORY_ECG, SOP_GENERAL_ECG, file_meta_for_dataset,
     recording_from_waveform_item, recording_to_dataset, recording_to_waveform_item,
 };

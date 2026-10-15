@@ -28,18 +28,21 @@ pub const MAX_CONN_SECS: u64 = 300;
 /// connections past this are dropped at accept.
 pub const MAX_CONNECTIONS: usize = 1024;
 
-/// Default aggregate cap for in-flight request bodies across one
-/// [`serve_forever`] listener (4 GiB): the per-connection
-/// [`MAX_BODY_LEN`] alone still allows 1024 x 1 GiB of buffered
-/// uploads. Past it, new body bytes fail fast with `503` instead of
-/// OOMing the server; embedders serving from tight boxes can share a
-/// smaller [`InflightBudget`] via [`serve_connection_with_budget`].
+/// Default aggregate cap for in-flight request *and* response
+/// bodies across one [`serve_forever`] listener (4 GiB): the
+/// per-connection [`MAX_BODY_LEN`] alone still allows 1024 x 1 GiB
+/// of buffered uploads — and unbounded concurrent RetrieveStudy
+/// responses on the way out. Past it, new bytes fail fast with `503`
+/// instead of OOMing the server; embedders serving from tight boxes
+/// can share a smaller [`InflightBudget`] via
+/// [`serve_connection_with_budget`].
 pub const MAX_INFLIGHT_BODY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Shared budget for in-flight request bodies: one of these per
-/// listener (see [`MAX_INFLIGHT_BODY_BYTES`]), cloned into every
-/// connection task. Reservations release on drop, so a slow client
-/// only pins what it has actually sent.
+/// Shared budget for in-flight request and response bodies: one of
+/// these per listener (see [`MAX_INFLIGHT_BODY_BYTES`]), cloned into
+/// every connection task. Request reservations release when the
+/// upload finishes; response reservations release when the body
+/// leaves the socket (see [`CappedBody`).
 #[derive(Debug)]
 pub struct InflightBudget {
     used: std::sync::Mutex<u64>,
@@ -301,13 +304,153 @@ fn body_over_cap(accumulated: usize, next: usize) -> bool {
     accumulated.saturating_add(next) > MAX_BODY_LEN
 }
 
+/// Whether this method+path is a body-accepting route (STOW): the
+/// front end buffers the up-to-1 GiB body only for these. Every other
+/// route answers without reading the body, so a huge upload to an
+/// unknown route (or a GET with a junk body) never buffers. Uses the
+/// same prefix strip as [`dispatch`](crate::server::dispatch) so the
+/// pre-check can never disagree with the router about STOW paths.
+fn route_expects_body(method: &hyper::Method, path: &str, public_base: &str) -> bool {
+    if *method != hyper::Method::POST {
+        return false;
+    }
+    let stripped = crate::server::strip_base_prefix(public_base, path);
+    let mut segs = stripped.split('/').filter(|s| !s.is_empty());
+    matches!(
+        (segs.next(), segs.next(), segs.next()),
+        (Some("studies"), None, _) | (Some("studies"), Some(_), None)
+    )
+}
+
+/// Percent-decode one path segment, symmetric with
+/// [`DicomWebClient::path_segment`](crate::DicomWebClient::path_segment):
+/// `%XX` unescapes, `+` stays a plus (plus-as-space is query-only),
+/// malformed `%` stays literal.
+fn decode_path_segment(seg: &str) -> String {
+    let mut out = Vec::with_capacity(seg.len());
+    let b = seg.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex_val(b[i + 1]), hex_val(b[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decode a request path segment by segment (never whole-string: a
+/// decoded `%2F` must fail closed as a separator at routing, not
+/// smuggle into a segment).
+fn decode_request_path(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    let mut first = true;
+    for seg in path.split('/') {
+        if !first {
+            out.push('/');
+        }
+        first = false;
+        out.push_str(&decode_path_segment(seg));
+    }
+    out
+}
+
+/// Response body holding its [`InflightBudget`] reservation until the
+/// bytes leave the socket: the guard drops (releasing the budget)
+/// only when hyper finishes sending and drops the body. This is the
+/// response-side analog of the request-body budget — same budget,
+/// both directions.
+struct CappedBody {
+    inner: Full<Bytes>,
+    _guard: Option<InflightGuard>,
+}
+
+impl http_body::Body for CappedBody {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>>
+    {
+        std::pin::Pin::new(&mut self.get_mut().inner).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
+/// Build the wire response, reserving `body` against the shared
+/// budget first: past the cap the request fails fast with 503
+/// instead of buffering unbounded aggregate response bytes.
+fn capped_response(
+    budget: &Arc<InflightBudget>,
+    status: u16,
+    headers: &[(String, String)],
+    body: Bytes,
+) -> std::result::Result<Response<CappedBody>, hyper::Error> {
+    let plain = |status: hyper::StatusCode, body: &'static [u8]| {
+        let mut resp = Response::new(CappedBody {
+            inner: Full::new(Bytes::from_static(body)),
+            _guard: None,
+        });
+        *resp.status_mut() = status;
+        resp
+    };
+    let mut guard = InflightGuard {
+        budget: budget.clone(),
+        bytes: 0,
+    };
+    if !guard.reserve(body.len() as u64) {
+        return Ok(plain(
+            hyper::StatusCode::SERVICE_UNAVAILABLE,
+            b"server busy: too many large responses in flight",
+        ));
+    }
+    let mut builder = Response::builder().status(status);
+    for (k, v) in headers {
+        builder = builder.header(k, v);
+    }
+    match builder.body(CappedBody {
+        inner: Full::new(body),
+        _guard: Some(guard),
+    }) {
+        Ok(resp) => Ok(resp),
+        Err(_) => Ok(plain(
+            hyper::StatusCode::INTERNAL_SERVER_ERROR,
+            b"internal error",
+        )),
+    }
+}
+
 async fn handle_one<S: DicomWebStore + 'static>(
     store: Arc<S>,
     public_base: String,
     req: Request<hyper::body::Incoming>,
     auth: ServerAuth,
     budget: Arc<InflightBudget>,
-) -> std::result::Result<Response<Full<Bytes>>, hyper::Error> {
+) -> std::result::Result<Response<CappedBody>, hyper::Error> {
     let (parts, body) = req.into_parts();
     let mut headers = std::collections::HashMap::new();
     for (name, value) in parts.headers.iter() {
@@ -316,52 +459,64 @@ async fn handle_one<S: DicomWebStore + 'static>(
         }
     }
     if !authorized(&headers, &auth) {
-        let mut resp = Response::new(Full::new(Bytes::from_static(b"unauthorized")));
-        *resp.status_mut() = hyper::StatusCode::UNAUTHORIZED;
-        resp.headers_mut().insert(
-            hyper::header::WWW_AUTHENTICATE,
-            hyper::header::HeaderValue::from_static("Bearer"),
+        return capped_response(
+            &budget,
+            401,
+            &[("www-authenticate".to_string(), "Bearer".to_string())],
+            Bytes::from_static(b"unauthorized"),
         );
-        return Ok(resp);
     }
-    // Stream the body with an early cap: collecting first and
-    // checking after would let a huge STOW eat memory before the
-    // limit ever applied. BytesMut freezes into the request body
-    // without a further copy. Each chunk also reserves against the
-    // listener-wide in-flight budget (released when this response
-    // completes); past it the upload fails fast with 503.
-    let mut raw_body = BytesMut::new();
-    let mut guard = InflightGuard { budget, bytes: 0 };
-    let mut body = body;
-    while let Some(frame) = body.frame().await {
-        let frame = frame?;
-        if let Some(data) = frame.data_ref() {
-            if body_over_cap(raw_body.len(), data.len()) {
-                let mut resp =
-                    Response::new(Full::new(Bytes::from_static(b"request body too large")));
-                *resp.status_mut() = hyper::StatusCode::PAYLOAD_TOO_LARGE;
-                return Ok(resp);
-            }
-            if !guard.reserve(data.len() as u64) {
-                let mut resp = Response::new(Full::new(Bytes::from_static(
-                    b"server busy: too many large uploads in flight",
-                )));
-                *resp.status_mut() = hyper::StatusCode::SERVICE_UNAVAILABLE;
-                return Ok(resp);
-            }
-            raw_body.extend_from_slice(data);
-        }
-    }
-    let raw_body = raw_body.freeze();
     let path_query = parts
         .uri
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let (path, query) = match path_query.split_once('?') {
-        Some((p, q)) => (p.to_string(), q.to_string()),
-        None => (path_query.to_string(), String::new()),
+    let (raw_path, query) = match path_query.split_once('?') {
+        Some((p, q)) => (p, q.to_string()),
+        None => (path_query, String::new()),
     };
+    let path = decode_request_path(raw_path);
+    // Route before buffering: only STOW accepts a body, so only STOW
+    // routes pay for one. Anything else answers without reading the
+    // body at all (hyper closes the connection after the response
+    // when a junk body goes unread — correct, just no keep-alive).
+    let mut raw_body = BytesMut::new();
+    let mut guard = InflightGuard {
+        budget: budget.clone(),
+        bytes: 0,
+    };
+    if route_expects_body(&parts.method, &path, &public_base) {
+        // Stream the body with an early cap: collecting first and
+        // checking after would let a huge STOW eat memory before the
+        // limit ever applied. BytesMut freezes into the request body
+        // without a further copy. Each chunk also reserves against
+        // the listener-wide in-flight budget; past it the upload
+        // fails fast with 503.
+        let mut body = body;
+        while let Some(frame) = body.frame().await {
+            let frame = frame?;
+            if let Some(data) = frame.data_ref() {
+                if body_over_cap(raw_body.len(), data.len()) {
+                    return capped_response(
+                        &budget,
+                        413,
+                        &[("content-type".to_string(), "text/plain".to_string())],
+                        Bytes::from_static(b"request body too large"),
+                    );
+                }
+                if !guard.reserve(data.len() as u64) {
+                    return capped_response(
+                        &budget,
+                        503,
+                        &[("content-type".to_string(), "text/plain".to_string())],
+                        Bytes::from_static(b"server busy: too many large uploads in flight"),
+                    );
+                }
+                raw_body.extend_from_slice(data);
+            }
+        }
+    }
+    let raw_body = raw_body.freeze();
     let hreq = HttpRequest {
         method: parts.method.to_string(),
         path,
@@ -375,18 +530,10 @@ async fn handle_one<S: DicomWebStore + 'static>(
     let hresp = tokio::task::spawn_blocking(move || dispatch(store.as_ref(), &public_base, &hreq))
         .await
         .unwrap_or_else(|_| crate::server::HttpResponse::text(500, "dispatch panicked"));
-    let mut builder = Response::builder().status(hresp.status);
-    for (k, v) in &hresp.headers {
-        builder = builder.header(k, v);
-    }
-    match builder.body(Full::new(hresp.body)) {
-        Ok(resp) => Ok(resp),
-        Err(_) => {
-            let mut resp = Response::new(Full::new(Bytes::from_static(b"internal error")));
-            *resp.status_mut() = hyper::StatusCode::INTERNAL_SERVER_ERROR;
-            Ok(resp)
-        }
-    }
+    // Release the request bytes before reserving the response: the
+    // two never double-count against the shared budget.
+    drop(guard);
+    capped_response(&budget, hresp.status, &hresp.headers, hresp.body)
 }
 
 #[cfg(test)]
@@ -815,5 +962,216 @@ mod tests {
             .parse()
             .unwrap_or(0);
         assert_eq!(status, 413, "{line}");
+    }
+
+    #[test]
+    fn path_segments_decode_symmetrically() {
+        // Client encode → server decode round-trips (the server side
+        // of `DicomWebClient::path_segment`).
+        for raw in ["1.2.9", "a?b#c d", "100%", "a+b", "Ü", "ünïcodé"] {
+            let enc = DicomWebClient::path_segment(raw);
+            assert_eq!(decode_path_segment(&enc), raw, "{raw}");
+        }
+        // `+` stays a plus in paths (plus-as-space is query-only).
+        assert_eq!(decode_path_segment("a+b"), "a+b");
+        // Malformed `%` stays literal, never panics or drops bytes.
+        assert_eq!(decode_path_segment("a%2"), "a%2");
+        assert_eq!(decode_path_segment("a%zz"), "a%zz");
+        assert_eq!(decode_path_segment("%"), "%");
+        assert_eq!(decode_path_segment("100%%"), "100%%");
+        // Whole-path decode preserves separators.
+        assert_eq!(
+            decode_request_path("/studies/1.2.9%41/series"),
+            "/studies/1.2.9A/series"
+        );
+        assert_eq!(decode_request_path("/"), "/");
+    }
+
+    #[tokio::test]
+    async fn encoded_uid_routes_over_wire() {
+        let store = Arc::new(MemoryStore::new());
+        store
+            .store_instance(
+                Bytes::from(test_file("1.2.9", "1.2.9.1", "1.2.9.1.1", 4, 4)),
+                None,
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let s = store.clone();
+                tokio::spawn(async move {
+                    serve_connection(s, format!("http://127.0.0.1:{port}"), tcp)
+                        .await
+                        .ok();
+                });
+            }
+        });
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn fetch(port: u16, head: &[u8]) -> String {
+            let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            tcp.write_all(head).await.unwrap();
+            let mut body = Vec::new();
+            tcp.read_to_end(&mut body).await.unwrap();
+            String::from_utf8_lossy(&body).into_owned()
+        }
+        // Strict encoders escape even dots: %2E-encoded UIDs reach
+        // the store decoded (was: no match).
+        let text = fetch(
+            port,
+            b"GET /studies/1%2E2%2E9/series HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("1.2.9.1"), "{text}");
+        // %2F decodes to a separator and fails closed (404 — never a
+        // segment smuggle into another route).
+        let text = fetch(
+            port,
+            b"GET /studies/1.2.9%2FA/series HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+        )
+        .await;
+        assert!(text.starts_with("HTTP/1.1 404"), "{text}");
+    }
+
+    #[test]
+    fn stow_routes_expect_bodies_only() {
+        use hyper::Method;
+        assert!(route_expects_body(&Method::POST, "/studies", "http://x"));
+        assert!(route_expects_body(
+            &Method::POST,
+            "/studies/1.2.3",
+            "http://x"
+        ));
+        assert!(!route_expects_body(
+            &Method::POST,
+            "/studies/1.2.3/series",
+            "http://x"
+        ));
+        assert!(!route_expects_body(&Method::POST, "/nope", "http://x"));
+        assert!(!route_expects_body(&Method::GET, "/studies", "http://x"));
+        assert!(!route_expects_body(&Method::DELETE, "/studies", "http://x"));
+        // Prefixed deployments agree with dispatch (segment-boundary
+        // strip, never a prefix-collapse).
+        assert!(route_expects_body(
+            &Method::POST,
+            "/dicomweb/studies",
+            "http://x/dicomweb"
+        ));
+        assert!(route_expects_body(
+            &Method::POST,
+            "/dicomweb/studies/1.2.3",
+            "http://x/dicomweb"
+        ));
+        assert!(!route_expects_body(
+            &Method::POST,
+            "/dicomweb2/studies",
+            "http://x/dicomweb"
+        ));
+    }
+
+    #[tokio::test]
+    async fn unknown_post_answers_without_body() {
+        // Route-before-buffering: a POST to an unknown route declares
+        // a 100 MB body but sends none — the 405 must arrive without
+        // the server waiting on the missing bytes (the old code
+        // buffered first and hung here).
+        let store = Arc::new(MemoryStore::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            serve_connection(store, format!("http://127.0.0.1:{port}"), tcp)
+                .await
+                .ok();
+        });
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut tcp = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tcp.write_all(
+            b"POST /nope HTTP/1.1\r\nhost: x\r\ncontent-length: 104857600\r\nconnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+        // No body follows: the server must still answer promptly.
+        let status = tokio::time::timeout(Duration::from_secs(10), async {
+            let mut buf = vec![0u8; 1024];
+            let n = tcp.read(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf[..n])
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or("0")
+                .parse::<u16>()
+                .unwrap_or(0)
+        })
+        .await
+        .expect("server waited on the un-sent body");
+        assert_eq!(status, 405);
+    }
+
+    #[tokio::test]
+    async fn saturated_response_budget_is_503() {
+        // An 8-byte shared budget cannot hold any real response: the
+        // QIDO answer fails fast with 503 (was: unbounded aggregate
+        // response buffering).
+        let store = Arc::new(MemoryStore::new());
+        store
+            .store_instance(
+                Bytes::from(test_file("1.2.9", "1.2.9.1", "1.2.9.1.1", 4, 4)),
+                None,
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let budget = Arc::new(InflightBudget::new(8));
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    break;
+                };
+                let (s, b) = (store.clone(), budget.clone());
+                tokio::spawn(async move {
+                    serve_connection_with_budget(
+                        s,
+                        format!("http://127.0.0.1:{port}"),
+                        tcp,
+                        ServerAuth::default(),
+                        b,
+                    )
+                    .await
+                    .ok();
+                });
+            }
+        });
+        let head = b"GET /studies HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
+        assert_eq!(raw_status(port, head, &[]).await, 503);
+        // A generous budget still serves.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let store = Arc::new(MemoryStore::new());
+        store
+            .store_instance(
+                Bytes::from(test_file("1.2.9", "1.2.9.1", "1.2.9.1.1", 4, 4)),
+                None,
+            )
+            .unwrap();
+        tokio::spawn(async move {
+            let Ok((tcp, _)) = listener.accept().await else {
+                return;
+            };
+            serve_connection(store, format!("http://127.0.0.1:{port}"), tcp)
+                .await
+                .ok();
+        });
+        assert_eq!(raw_status(port, head, &[]).await, 200);
     }
 }

@@ -18,7 +18,7 @@ members = [
 edition = "2024"
 rust-version = "1.99"
 license = "MIT"
-authors = ["alex.fanshao@flostel.com"]
+authors = ["Alex SHAO Fan <alex.shaofan@flostel.com>"]
 repository = "https://github.com/FlostelInfoTech/vynadcm"
 
 [workspace.dependencies]

@@ -244,25 +244,47 @@ fn days_in_month(year: u16, month: u8) -> u8 {
 }
 
 /// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+///
+/// Saturating: extreme inputs clamp toward `i64::MIN`/`MAX` instead
+/// of overflowing (a debug panic, a silent wrap in release).
 #[must_use]
 pub fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if month > 2 { month - 3 } else { month + 9 };
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146097 + doe - 719468
+    let y = if month <= 2 {
+        year.saturating_sub(1)
+    } else {
+        year
+    };
+    let era = if y >= 0 { y } else { y.saturating_sub(399) } / 400;
+    let yoe = y.saturating_sub(era.saturating_mul(400));
+    let mp = if month > 2 {
+        month.saturating_sub(3)
+    } else {
+        month.saturating_add(9)
+    };
+    let doy = (153i64.saturating_mul(mp).saturating_add(2) / 5)
+        .saturating_add(day)
+        .saturating_sub(1);
+    let doe = yoe
+        .saturating_mul(365)
+        .saturating_add(yoe / 4)
+        .saturating_sub(yoe / 100)
+        .saturating_add(doy);
+    era.saturating_mul(146097)
+        .saturating_add(doe)
+        .saturating_sub(719468)
 }
 
 /// Civil date for days since 1970-01-01: `(year, month, day)`.
+///
+/// Saturating (see [`days_from_civil`]): only the unbounded terms
+/// need it (`doe`/`yoe`/`doy`/`mp` stay tiny by construction).
 #[must_use]
 pub fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719468;
+    let z = z.saturating_add(719468);
     let era = z.div_euclid(146097);
     let doe = z.rem_euclid(146097);
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
+    let y = yoe.saturating_add(era.saturating_mul(400));
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
     let d = doy - (153 * mp + 2) / 5 + 1;
@@ -329,6 +351,23 @@ mod tests {
             let (y, m, d) = civil_from_days(days);
             assert_eq!(days_from_civil(y, m, d), days);
         }
+    }
+
+    #[test]
+    fn civil_math_saturates_on_extreme_inputs() {
+        // Debug builds panic on overflow: extreme inputs must clamp
+        // instead of panicking (or wrapping in release).
+        for extreme in [i64::MIN, i64::MIN + 1, i64::MAX - 1, i64::MAX] {
+            let _ = days_from_civil(extreme, extreme, extreme);
+            let _ = days_from_civil(2026, extreme, 1);
+            let _ = days_from_civil(extreme, 6, 15);
+            let _ = civil_from_days(extreme);
+        }
+        // Clamped results keep their sign (no wrap-around).
+        assert!(days_from_civil(i64::MAX, 6, 15) > 0);
+        assert!(days_from_civil(i64::MIN, 6, 15) < 0);
+        assert!(civil_from_days(i64::MAX).0 > 0);
+        assert!(civil_from_days(i64::MIN).0 < 0);
     }
 
     #[test]

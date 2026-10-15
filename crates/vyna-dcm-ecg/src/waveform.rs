@@ -16,12 +16,26 @@ use crate::{
 pub const SOP_12_LEAD_ECG: &str = "1.2.840.10008.5.1.4.1.1.9.1.1";
 /// General ECG Waveform Storage SOP Class.
 pub const SOP_GENERAL_ECG: &str = "1.2.840.10008.5.1.4.1.1.9.1.2";
+/// Ambulatory ECG Waveform Storage SOP Class.
+pub const SOP_AMBULATORY_ECG: &str = "1.2.840.10008.5.1.4.1.1.9.1.3";
+
+/// Modality for a waveform SOP Class UID. Only the ECG family is
+/// supported here; anything else is rejected rather than stamped with
+/// a wrong `ECG`.
+fn modality_for_sop_class(uid: &str) -> Result<&'static str> {
+    match uid {
+        SOP_12_LEAD_ECG | SOP_GENERAL_ECG | SOP_AMBULATORY_ECG => Ok("ECG"),
+        _ => Err(Error::InvalidMeta(format!(
+            "unsupported waveform SOP Class {uid:?} (want 12-lead, General, or Ambulatory ECG)"
+        ))),
+    }
+}
 
 /// Identifying metadata for a complete ECG SOP instance.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct EcgInstanceMeta {
-    /// SOP Class UID (12-lead or General ECG).
+    /// SOP Class UID (12-lead, General, or Ambulatory ECG).
     pub sop_class_uid: String,
     /// SOP Instance UID (generated when empty).
     pub sop_instance_uid: String,
@@ -64,6 +78,8 @@ pub struct EcgInstanceMeta {
     pub model: String,
     /// Series description.
     pub series_description: Option<String>,
+    /// Series number (Type 2: written even when empty).
+    pub series_number: String,
     /// Instance number.
     pub instance_number: String,
 }
@@ -96,6 +112,7 @@ impl EcgInstanceMeta {
             manufacturer: "Vyna".into(),
             model: "VynaECG".into(),
             series_description: None,
+            series_number: "1".into(),
             instance_number: "1".into(),
         }
     }
@@ -126,6 +143,7 @@ impl EcgInstanceMeta {
             .any(|s| !s.is_ascii())
             || !self.manufacturer.is_ascii()
             || !self.model.is_ascii()
+            || !self.series_number.is_ascii()
             || !self.instance_number.is_ascii()
             // Caller-supplied acquisition-context items are written
             // verbatim: their text counts toward the charset decision
@@ -160,6 +178,9 @@ fn recording_needs_utf8(rec: &EcgRecording) -> bool {
             !l.label.is_ascii()
                 || !l.units.is_ascii()
                 || l.mdc_code.as_ref().is_some_and(|s| !s.is_ascii())
+                || l.source_code.as_ref().is_some_and(|s| {
+                    !s.value.is_ascii() || !s.scheme.is_ascii() || !s.meaning.is_ascii()
+                })
         })
 }
 
@@ -507,43 +528,90 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
             defs.len()
         )));
     }
-    let raw = waveform_bytes(item)?;
+    let raw = waveform_bytes(item, bits)?;
     let bytes_per_sample = bits as usize / 8;
     // u64 math: channels/samples come from the wire and their product
     // overflows 32-bit usize.
     let want = channels as u64 * samples as u64 * bytes_per_sample as u64;
-    // Accept one trailing pad byte: odd-sized 8-bit waveforms carry a
-    // wire pad that must not fail the round trip (its value is
-    // unchecked — encoders must write 0x00 — and it is never indexed).
     let len = raw.len() as u64;
-    if len != want && len != want + 1 {
-        return Err(Error::Waveform(format!(
-            "waveform data {} bytes, want {want}",
-            raw.len(),
-        )));
+    if bits == 16 {
+        // 16-bit OW data is always even-length: no wire pad applies,
+        // so any overlength byte is garbage, not padding.
+        if len != want {
+            return Err(Error::Waveform(format!(
+                "waveform data {} bytes, want {want}",
+                raw.len(),
+            )));
+        }
+    } else {
+        // Accept one trailing pad byte: odd-sized 8-bit waveforms
+        // carry a wire pad that must not fail the round trip (its
+        // value is unchecked — encoders must write 0x00 — and it is
+        // never indexed).
+        if len != want && len != want + 1 {
+            return Err(Error::Waveform(format!(
+                "waveform data {} bytes, want {want}",
+                raw.len(),
+            )));
+        }
     }
 
     let mut leads = Vec::with_capacity(channels);
     for (c, def) in defs.iter().enumerate() {
-        let label = def.string(tags::CHANNEL_LABEL).unwrap_or("?").to_string();
+        // Per-channel Type 1 attributes are required with real values:
+        // silent defaults would make `physical_samples` lie about the
+        // wire data. Absent reads Missing; present-but-unusable reads
+        // a Waveform shape error.
+        let def_shape = |tag, what: &str| {
+            if def.get(tag).is_none() {
+                Error::Missing(tag.to_string())
+            } else {
+                Error::Waveform(format!("{tag} present but not {what}"))
+            }
+        };
+        // Waveform Bits Stored (per-channel Type 1): 0 is meaningless
+        // and stored > allocated mis-slices the packed samples.
+        let stored = def
+            .uint16(tags::WAVEFORM_BITS_STORED)
+            .ok_or_else(|| def_shape(tags::WAVEFORM_BITS_STORED, "U16"))?;
+        if stored == 0 || stored > bits {
+            return Err(Error::Samples(format!(
+                "Waveform Bits Stored {stored} disagrees with bits_allocated {bits}"
+            )));
+        }
+        let label = def
+            .require_string(tags::CHANNEL_LABEL)
+            .map_err(|_| def_shape(tags::CHANNEL_LABEL, "usable text"))?
+            .to_string();
         // `f64::from_str` accepts "NaN"/"inf", which the encoder
-        // refuses to write: treat non-finite like unparsable (fall
-        // back to the default) so parse/encode agree.
-        let num = |tag, default: f64| {
+        // refuses to write: treat non-finite like unparsable (an
+        // error here, absent for the optional filters below) so
+        // parse/encode agree.
+        let req_num = |tag| -> Result<f64> {
             def.string(tag)
                 .and_then(|s| s.trim().parse::<f64>().ok())
                 .filter(|v| v.is_finite())
-                .unwrap_or(default)
+                .ok_or_else(|| def_shape(tag, "a finite number"))
         };
         let opt_num = |tag| {
             def.string(tag)
                 .and_then(|s| s.trim().parse::<f64>().ok())
                 .filter(|v| v.is_finite())
         };
-        let units = def
+        let units_seq = def
             .sequence(tags::CHANNEL_SENSITIVITY_UNITS_SEQUENCE)
-            .and_then(|s| s.first()?.string(tags::CODE_VALUE))
-            .unwrap_or("mV")
+            .ok_or_else(|| def_shape(tags::CHANNEL_SENSITIVITY_UNITS_SEQUENCE, "a sequence"))?;
+        let units = units_seq
+            .first()
+            .and_then(|s| s.string(tags::CODE_VALUE))
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                Error::Waveform(format!(
+                    "{} present but without a usable {}",
+                    tags::CHANNEL_SENSITIVITY_UNITS_SEQUENCE,
+                    tags::CODE_VALUE
+                ))
+            })?
             .to_string();
         let source = def
             .sequence(tags::CHANNEL_SOURCE_SEQUENCE)
@@ -593,10 +661,10 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
         leads.push(crate::model::EcgLead {
             label,
             samples: lead_samples,
-            sensitivity: num(tags::CHANNEL_SENSITIVITY, 1.0),
+            sensitivity: req_num(tags::CHANNEL_SENSITIVITY)?,
             units,
-            correction_factor: num(tags::CHANNEL_SENSITIVITY_CORRECTION_FACTOR, 1.0),
-            baseline: num(tags::CHANNEL_BASELINE, 0.0),
+            correction_factor: req_num(tags::CHANNEL_SENSITIVITY_CORRECTION_FACTOR)?,
+            baseline: req_num(tags::CHANNEL_BASELINE)?,
             mdc_code,
             source_code,
             filter_low_hz: opt_num(tags::FILTER_LOW_FREQUENCY),
@@ -620,10 +688,19 @@ pub fn recording_from_waveform_item(item: &DataSet) -> Result<EcgRecording> {
     Ok(rec)
 }
 
-fn waveform_bytes(item: &DataSet) -> Result<Vec<u8>> {
+fn waveform_bytes(item: &DataSet, bits: u16) -> Result<Vec<u8>> {
     let el = item
         .get(tags::WAVEFORM_DATA)
         .ok_or_else(|| Error::Missing(tags::WAVEFORM_DATA.to_string()))?;
+    // PS3.5 §8.3: 8-bit samples ride OB, 16-bit samples OW. A crossed
+    // VR would mis-slice every sample, so reject it.
+    let want_vr = if bits == 8 { Vr::Ob } else { Vr::Ow };
+    if el.vr != want_vr {
+        return Err(Error::Waveform(format!(
+            "Waveform Data VR {} disagrees with bits_allocated {bits} (want {want_vr})",
+            el.vr
+        )));
+    }
     match &el.value {
         Value::Bytes(b) => Ok(b.clone()),
         Value::Fragments(f) => Ok(f.joined()),
@@ -638,12 +715,14 @@ fn waveform_bytes(item: &DataSet) -> Result<Vec<u8>> {
 /// Type 2 attribute is at least present, so the result validates
 /// against the ECG IODs.
 ///
-/// Validated here: UID syntax for all four UID fields, Patient Sex
-/// (`M`/`F`/`O` when non-empty), Waveform Originality (in the item
-/// builder), the non-empty Type 1 Instance Number, and the
-/// per-SOP-class channel caps (12-lead ≤ 13, General ECG ≤ 24). Other
-/// free-text fields (dates, names, labels, descriptions) are the
-/// caller's responsibility and are written verbatim: garbage in,
+/// Validated here: UID syntax for all four UID fields, the ECG-only
+/// SOP Class (12-lead, General, or Ambulatory — anything else is
+/// rejected rather than stamped with a wrong `ECG` modality),
+/// Patient Sex (`M`/`F`/`O` when non-empty), Waveform Originality (in
+/// the item builder), the non-empty Type 1 Instance Number, and the
+/// per-SOP-class channel caps (12-lead ≤ 13, General ECG ≤ 24).
+/// Other free-text fields (dates, names, labels, descriptions) are
+/// the caller's responsibility and are written verbatim: garbage in,
 /// non-conformant out.
 pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Result<DataSet> {
     let mut meta = meta.clone();
@@ -666,8 +745,11 @@ pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Resul
             "Patient Sex {sex:?} (want M, F, or O)"
         )));
     }
-    // Per-SOP-class channel caps (A.34.3.4.4 / A.34.4.4.3); other
-    // waveform SOP classes pass through uncapped.
+    // ECG-only SOP Class: the modality below is derived from it,
+    // so unknown UIDs must fail here, not stamp a wrong "ECG".
+    let modality = modality_for_sop_class(&meta.sop_class_uid)?;
+    // Per-SOP-class channel caps (A.34.3.4.4 / A.34.4.4.3);
+    // Ambulatory ECG passes through uncapped.
     let cap = match meta.sop_class_uid.as_str() {
         SOP_12_LEAD_ECG => Some(13),
         SOP_GENERAL_ECG => Some(24),
@@ -705,7 +787,7 @@ pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Resul
     ds.put_uid(tags::SOP_INSTANCE_UID, meta.sop_instance_uid.clone());
     ds.put_uid(tags::STUDY_INSTANCE_UID, meta.study_uid.clone());
     ds.put_uid(tags::SERIES_INSTANCE_UID, meta.series_uid.clone());
-    ds.put_text(tags::MODALITY, Vr::Cs, "ECG");
+    ds.put_text(tags::MODALITY, Vr::Cs, modality);
     ds.put_text(tags::MANUFACTURER, Vr::Lo, meta.manufacturer.clone());
     ds.put_text(tags::MANUFACTURER_MODEL_NAME, Vr::Lo, meta.model.clone());
     ds.put_person_name(tags::PATIENT_NAME, vec![meta.patient_name.clone()]);
@@ -746,7 +828,7 @@ pub fn recording_to_dataset(rec: &EcgRecording, meta: &EcgInstanceMeta) -> Resul
     if let Some(d) = &meta.series_description {
         ds.put_text(tags::SERIES_DESCRIPTION, Vr::Lo, d.clone());
     }
-    ds.put_text(tags::SERIES_NUMBER, Vr::Is, "1");
+    ds.put_text(tags::SERIES_NUMBER, Vr::Is, meta.series_number.clone());
     ds.put_text(tags::INSTANCE_NUMBER, Vr::Is, meta.instance_number.clone());
     ds.put_sequence(
         tags::WAVEFORM_SEQUENCE,
@@ -798,7 +880,8 @@ mod tests {
                         .map(|t| ((t + i as i32 * 7) % 2000) - 1000)
                         .collect(),
                     0.001,
-                );
+                )
+                .unwrap();
                 lead.mdc_code = Some((*code).to_string());
                 lead.filter_low_hz = Some(0.05);
                 lead.filter_high_hz = Some(150.0);
@@ -865,7 +948,7 @@ mod tests {
                 (SampleInterpretation::Signed, 8) => 100,
                 _ => 200,
             };
-            let leads = vec![EcgLead::new("II", vec![0, max, max / 2, 1], 0.001)];
+            let leads = vec![EcgLead::new("II", vec![0, max, max / 2, 1], 0.001).unwrap()];
             let mut rec = EcgRecording::new(leads, 250.0).unwrap();
             rec.sample_interpretation = interp;
             rec.bits_allocated = bits;
@@ -1071,20 +1154,29 @@ mod tests {
 
     #[test]
     fn non_finite_wire_floats_parse_as_absent() {
+        // Optional floats (filters, powerline) parse as absent, never
+        // NaN; required per-channel floats are errors (no silent
+        // defaults that would make physical_samples lie).
+        let mut item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        let mut defs = item
+            .sequence(tags::CHANNEL_DEFINITION_SEQUENCE)
+            .unwrap()
+            .to_vec();
+        defs[0].put_text(tags::FILTER_LOW_FREQUENCY, Vr::Ds, "inf");
+        item.put_sequence(tags::CHANNEL_DEFINITION_SEQUENCE, defs);
+        item.put_text(tags::POWERLINE_FREQUENCY, Vr::Ds, "NaN");
+        let back = recording_from_waveform_item(&item).unwrap();
+        assert_eq!(back.leads[0].filter_low_hz, None);
+        assert_eq!(back.powerline_hz, None);
+        // Required sensitivity NaN is an error, not a 1.0 default.
         let mut item = recording_to_waveform_item(&twelve_lead()).unwrap();
         let mut defs = item
             .sequence(tags::CHANNEL_DEFINITION_SEQUENCE)
             .unwrap()
             .to_vec();
         defs[0].put_text(tags::CHANNEL_SENSITIVITY, Vr::Ds, "NaN");
-        defs[0].put_text(tags::FILTER_LOW_FREQUENCY, Vr::Ds, "inf");
         item.put_sequence(tags::CHANNEL_DEFINITION_SEQUENCE, defs);
-        item.put_text(tags::POWERLINE_FREQUENCY, Vr::Ds, "NaN");
-        let back = recording_from_waveform_item(&item).unwrap();
-        // Defaults/absent, mirroring unparsable strings (never NaN).
-        assert_eq!(back.leads[0].sensitivity, 1.0);
-        assert_eq!(back.leads[0].filter_low_hz, None);
-        assert_eq!(back.powerline_hz, None);
+        assert!(recording_from_waveform_item(&item).is_err());
     }
 
     #[test]
@@ -1134,7 +1226,7 @@ mod tests {
     fn eight_bit_waveform_uses_ob_and_survives_part10() {
         // Odd total bytes (1 lead x 3 samples): the wire pad byte must
         // not fail the decode.
-        let leads = vec![EcgLead::new("II", vec![0, 100, -100], 0.001)];
+        let leads = vec![EcgLead::new("II", vec![0, 100, -100], 0.001).unwrap()];
         let mut rec = EcgRecording::new(leads, 250.0).unwrap();
         rec.sample_interpretation = SampleInterpretation::Signed;
         rec.bits_allocated = 8;
@@ -1160,7 +1252,7 @@ mod tests {
     fn general_ecg_validates() {
         let leads: Vec<EcgLead> = ["I", "II", "V1", "V2"]
             .iter()
-            .map(|l| EcgLead::new(*l, vec![0, 10, -10, 5], 0.001))
+            .map(|l| EcgLead::new(*l, vec![0, 10, -10, 5], 0.001).unwrap())
             .collect();
         let rec = EcgRecording::new(leads, 500.0).unwrap();
         let mut meta = dated_meta();
@@ -1247,7 +1339,7 @@ mod tests {
         // Channel caps: 12-lead <= 13 (A.34.3.4.4), General <= 24
         // (A.34.4.4.3: 1-24, so >12-lead carts use General ECG).
         let many: Vec<EcgLead> = (0..14)
-            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
+            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001).unwrap())
             .collect();
         let rec14 = EcgRecording::new(many, 500.0).unwrap();
         let meta12 = dated_meta();
@@ -1257,24 +1349,184 @@ mod tests {
         assert!(recording_to_dataset(&rec14, &meta_gen).is_ok());
         // Boundaries hold: 13/14 on 12-lead, 24/25 on General.
         let thirteen: Vec<EcgLead> = (0..13)
-            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
+            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001).unwrap())
             .collect();
         let rec13 = EcgRecording::new(thirteen, 500.0).unwrap();
         assert!(recording_to_dataset(&rec13, &dated_meta()).is_ok());
         assert!(recording_to_dataset(&rec13, &meta_gen).is_ok());
         let twenty_four: Vec<EcgLead> = (0..24)
-            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
+            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001).unwrap())
             .collect();
         let rec24 = EcgRecording::new(twenty_four, 500.0).unwrap();
         assert!(recording_to_dataset(&rec24, &meta_gen).is_ok());
         let twenty_five: Vec<EcgLead> = (0..25)
-            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001))
+            .map(|i| EcgLead::new(format!("C{i}"), vec![0, 1], 0.001).unwrap())
             .collect();
         let rec25 = EcgRecording::new(twenty_five, 500.0).unwrap();
         assert!(recording_to_dataset(&rec25, &meta_gen).is_err());
-        // Unknown waveform SOPs pass through uncapped.
+        // Non-ECG waveform SOPs are rejected, not stamped "ECG";
+        // Ambulatory ECG is ECG and passes through uncapped.
         let mut meta_other = dated_meta();
         meta_other.sop_class_uid = "1.2.840.10008.5.1.4.1.1.9.2.2".into();
-        assert!(recording_to_dataset(&rec14, &meta_other).is_ok());
+        assert!(matches!(
+            recording_to_dataset(&rec14, &meta_other),
+            Err(Error::InvalidMeta(_))
+        ));
+        let mut meta_amb = dated_meta();
+        meta_amb.sop_class_uid = SOP_AMBULATORY_ECG.to_string();
+        let ds = recording_to_dataset(&rec14, &meta_amb).unwrap();
+        assert_eq!(ds.string(tags::MODALITY), Some("ECG"));
+    }
+
+    #[test]
+    fn non_ascii_source_code_declares_utf8() {
+        let mut rec = twelve_lead();
+        rec.leads[1].source_code = Some(crate::model::ChannelSourceCode {
+            value: "X".into(),
+            scheme: "99FOO".into(),
+            meaning: "Fremd-Kanal ✓".into(),
+        });
+        let ds = recording_to_dataset(&rec, &dated_meta()).unwrap();
+        assert_eq!(ds.string(tags::SPECIFIC_CHARACTER_SET), Some("ISO_IR 192"));
+    }
+
+    #[test]
+    fn waveform_data_vr_must_match_bits() {
+        // 16-bit data as OB: reject.
+        let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        let bytes = item.bytes(tags::WAVEFORM_DATA).unwrap().to_vec();
+        let mut crossed = item.clone();
+        crossed.put_bytes(tags::WAVEFORM_DATA, Vr::Ob, bytes);
+        let err = recording_from_waveform_item(&crossed).unwrap_err();
+        assert!(matches!(err, Error::Waveform(_)), "{err:?}");
+        // 8-bit data as OW: reject.
+        let leads = vec![EcgLead::new("II", vec![0, 10, -10], 0.001).unwrap()];
+        let mut rec8 = EcgRecording::new(leads, 250.0).unwrap();
+        rec8.bits_allocated = 8;
+        rec8.sample_interpretation = SampleInterpretation::Signed;
+        let item8 = recording_to_waveform_item(&rec8).unwrap();
+        assert_eq!(item8.get(tags::WAVEFORM_DATA).unwrap().vr, Vr::Ob);
+        let bytes8 = item8.bytes(tags::WAVEFORM_DATA).unwrap().to_vec();
+        let mut crossed8 = item8.clone();
+        crossed8.put_bytes(tags::WAVEFORM_DATA, Vr::Ow, bytes8);
+        let err = recording_from_waveform_item(&crossed8).unwrap_err();
+        assert!(matches!(err, Error::Waveform(_)), "{err:?}");
+    }
+
+    #[test]
+    fn waveform_bits_stored_is_cross_checked() {
+        let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        let with_stored = |stored: Option<u16>| {
+            let mut defs = item
+                .sequence(tags::CHANNEL_DEFINITION_SEQUENCE)
+                .unwrap()
+                .to_vec();
+            match stored {
+                Some(v) => defs[0].put_u16_single(tags::WAVEFORM_BITS_STORED, v),
+                None => {
+                    defs[0].remove(tags::WAVEFORM_BITS_STORED);
+                }
+            }
+            let mut item = item.clone();
+            item.put_sequence(tags::CHANNEL_DEFINITION_SEQUENCE, defs);
+            item
+        };
+        // Missing: absent Type 1 reads Missing.
+        let err = recording_from_waveform_item(&with_stored(None)).unwrap_err();
+        assert!(matches!(err, Error::Missing(_)), "{err:?}");
+        // 0 and > allocated (16): rejected.
+        for bad in [0, 17, 32] {
+            let err = recording_from_waveform_item(&with_stored(Some(bad))).unwrap_err();
+            assert!(matches!(err, Error::Samples(_)), "{bad}: {err:?}");
+        }
+        // Stored < allocated (12-in-16 packing) is legitimate.
+        let back = recording_from_waveform_item(&with_stored(Some(12))).unwrap();
+        assert_eq!(back.leads.len(), 12);
+    }
+
+    #[test]
+    fn missing_channel_type1_attributes_rejected() {
+        let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        // Absent Type 1 channel attributes read Missing, never defaults.
+        for tag in [
+            tags::CHANNEL_LABEL,
+            tags::CHANNEL_SENSITIVITY,
+            tags::CHANNEL_SENSITIVITY_CORRECTION_FACTOR,
+            tags::CHANNEL_BASELINE,
+            tags::CHANNEL_SENSITIVITY_UNITS_SEQUENCE,
+        ] {
+            let mut defs = item
+                .sequence(tags::CHANNEL_DEFINITION_SEQUENCE)
+                .unwrap()
+                .to_vec();
+            defs[0].remove(tag);
+            let mut gone = item.clone();
+            gone.put_sequence(tags::CHANNEL_DEFINITION_SEQUENCE, defs);
+            let err = recording_from_waveform_item(&gone).unwrap_err();
+            assert!(matches!(err, Error::Missing(_)), "{tag}: {err:?}");
+        }
+        // Present-but-unusable reads Waveform, never a silent default.
+        let mut defs = item
+            .sequence(tags::CHANNEL_DEFINITION_SEQUENCE)
+            .unwrap()
+            .to_vec();
+        defs[0].put_text(tags::CHANNEL_LABEL, Vr::Sh, "");
+        defs[1].put_text(tags::CHANNEL_SENSITIVITY, Vr::Ds, "abc");
+        defs[2].put_text(tags::CHANNEL_SENSITIVITY_CORRECTION_FACTOR, Vr::Ds, "inf");
+        defs[3].put_text(tags::CHANNEL_BASELINE, Vr::Ds, "");
+        let mut units = defs[4]
+            .sequence(tags::CHANNEL_SENSITIVITY_UNITS_SEQUENCE)
+            .unwrap()
+            .to_vec();
+        units[0].put_text(tags::CODE_VALUE, Vr::Sh, "");
+        defs[4].put_sequence(tags::CHANNEL_SENSITIVITY_UNITS_SEQUENCE, units);
+        let mut bad = item.clone();
+        bad.put_sequence(tags::CHANNEL_DEFINITION_SEQUENCE, defs);
+        let err = recording_from_waveform_item(&bad).unwrap_err();
+        assert!(matches!(err, Error::Waveform(_)), "{err:?}");
+    }
+
+    #[test]
+    fn series_number_written_from_meta() {
+        let mut meta = dated_meta();
+        meta.series_number = "7".into();
+        let ds = recording_to_dataset(&twelve_lead(), &meta).unwrap();
+        assert_eq!(ds.string(tags::SERIES_NUMBER), Some("7"));
+        // Type 2: empty stays present-but-empty.
+        meta.series_number.clear();
+        let ds = recording_to_dataset(&twelve_lead(), &meta).unwrap();
+        assert!(ds.contains(tags::SERIES_NUMBER));
+        assert!(ds.string(tags::SERIES_NUMBER).is_none_or(|s| s.is_empty()));
+    }
+
+    #[test]
+    fn non_ecg_sop_rejected_for_modality() {
+        for uid in [
+            "1.2.840.10008.5.1.4.1.1.9.2.1",
+            "1.2.840.10008.5.1.4.1.1.9.2.2",
+            "1.2.840.10008.5.1.4.1.1.2",
+        ] {
+            let mut meta = dated_meta();
+            meta.sop_class_uid = uid.into();
+            let err = recording_to_dataset(&twelve_lead(), &meta).unwrap_err();
+            assert!(matches!(err, Error::InvalidMeta(_)), "{uid}: {err:?}");
+        }
+        for uid in [SOP_12_LEAD_ECG, SOP_GENERAL_ECG, SOP_AMBULATORY_ECG] {
+            let mut meta = dated_meta();
+            meta.sop_class_uid = uid.into();
+            let ds = recording_to_dataset(&twelve_lead(), &meta).unwrap();
+            assert_eq!(ds.string(tags::MODALITY), Some("ECG"), "{uid}");
+        }
+    }
+
+    #[test]
+    fn sixteen_bit_overlength_byte_rejected() {
+        let item = recording_to_waveform_item(&twelve_lead()).unwrap();
+        let mut bytes = item.bytes(tags::WAVEFORM_DATA).unwrap().to_vec();
+        bytes.push(0x00);
+        let mut padded = item.clone();
+        padded.put_bytes(tags::WAVEFORM_DATA, Vr::Ow, bytes);
+        let err = recording_from_waveform_item(&padded).unwrap_err();
+        assert!(matches!(err, Error::Waveform(_)), "{err:?}");
     }
 }

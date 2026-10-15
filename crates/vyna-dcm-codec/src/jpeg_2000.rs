@@ -618,15 +618,28 @@ unsafe extern "C" fn mem_skip(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_OFF_T {
     if nb >= 0 {
         // `try_from`: a bare `as usize` truncates past 4 GiB on 32-bit.
         let step = usize::try_from(nb).unwrap_or(usize::MAX);
-        state.pos = state.pos.saturating_add(step);
         if !state.writable {
-            state.pos = state.pos.min(state.data.len());
+            // A short skip must fail, not clamp-and-succeed: the port
+            // adds the full offset to its own cursor on success, so
+            // clamping desyncs it past EOF (reads then serve bytes
+            // the port believes are elsewhere). Landing exactly on
+            // EOF stays success.
+            let remaining = state.data.len().saturating_sub(state.pos);
+            if step > remaining {
+                return -1;
+            }
         }
+        state.pos = state.pos.saturating_add(step);
     } else {
         // Backward skips are real moves (via `seek_relative`): ignoring
         // them desyncs the port's accounting from `pos`.
         let step = usize::try_from(nb.unsigned_abs()).unwrap_or(usize::MAX);
-        state.pos = state.pos.saturating_sub(step);
+        // Same the other way: past-BOF clamping would leave the port
+        // recording a negative cursor while `pos` sits at 0.
+        if step > state.pos {
+            return -1;
+        }
+        state.pos -= step;
     }
     // `pos` never exceeds a `Vec` length (`<= isize::MAX`), so the
     // narrowing to `i64` is exact on every platform.
@@ -657,6 +670,33 @@ unsafe extern "C" fn mem_seek(nb: OPJ_OFF_T, data: *mut c_void) -> OPJ_BOOL {
 mod tests {
     use super::*;
     use crate::jpeg::mean_abs_diff;
+
+    #[test]
+    fn mem_skip_and_seek_fail_cleanly_at_bounds() {
+        // Over-EOF skips/seeks must report failure, never
+        // clamp-and-succeed: clamping desyncs the port cursor past
+        // EOF (reads then serve bytes the port believes are
+        // elsewhere).
+        let state = Box::new(MemState {
+            data: vec![1, 2, 3, 4],
+            out: Rc::new(RefCell::new(Vec::new())),
+            pos: 0,
+            writable: false,
+        });
+        let raw = Box::into_raw(state).cast::<c_void>();
+        unsafe {
+            assert_eq!(mem_skip(4, raw), 4); // exactly to EOF: success
+            assert_eq!(mem_skip(1, raw), -1); // past EOF: failure
+            assert_eq!(mem_skip(-5, raw), -1); // past BOF: failure
+            assert_eq!(mem_skip(-4, raw), 0);
+            assert_eq!(mem_seek(4, raw), 1);
+            assert_eq!(mem_seek(5, raw), 0);
+            assert_eq!(mem_seek(-1, raw), 0);
+            assert_eq!(mem_skip(1, std::ptr::null_mut()), -1);
+            assert_eq!(mem_seek(1, std::ptr::null_mut()), 0);
+            mem_free(raw);
+        }
+    }
 
     #[test]
     fn hostile_numbps_never_panics() {
@@ -710,8 +750,10 @@ mod tests {
             // Backward skip moves pos (was a silent no-op success).
             assert_eq!(mem_skip(-3, p), 5);
             assert_eq!(st.pos, 5);
-            assert_eq!(mem_skip(-99, p), 0);
-            assert_eq!(st.pos, 0);
+            // Past-BOF skips fail with pos untouched (were
+            // clamp-and-succeed, desyncing the port cursor).
+            assert_eq!(mem_skip(-99, p), -1);
+            assert_eq!(st.pos, 5);
         }
     }
 
@@ -743,10 +785,10 @@ mod tests {
     }
 
     #[test]
-    fn stream_callbacks_clamp_and_cap() {
-        // Reader: skips past EOF clamp to the input length; seeks past
-        // EOF fail (clamp-success would desync the port's offset
-        // accounting and trip its length assert).
+    fn stream_callbacks_fail_past_bounds_and_cap() {
+        // Reader: skips/seeks past the bounds fail with pos untouched
+        // (clamp-and-succeed would desync the port's offset
+        // accounting); in-range skips move both ways.
         let mut st = MemState {
             data: vec![0u8; 16],
             out: Rc::new(RefCell::new(Vec::new())),
@@ -758,13 +800,16 @@ mod tests {
             assert_eq!(mem_seek(100, p), 0);
             assert_eq!(st.pos, 16);
             st.pos = 0;
-            assert_eq!(mem_skip(100, p), 16);
-            assert_eq!(st.pos, 16);
+            assert_eq!(mem_skip(100, p), -1);
+            assert_eq!(st.pos, 0);
             assert_eq!(mem_seek(-1, p), 0);
-            assert_eq!(st.pos, 16);
-            // Negative skips move backward (were a silent no-op).
-            assert_eq!(mem_skip(-5, p), 11);
-            assert_eq!(st.pos, 11);
+            assert_eq!(st.pos, 0);
+            assert_eq!(mem_skip(5, p), 5);
+            assert_eq!(st.pos, 5);
+            assert_eq!(mem_skip(-5, p), 0);
+            assert_eq!(st.pos, 0);
+            assert_eq!(mem_skip(-1, p), -1);
+            assert_eq!(st.pos, 0);
         }
         // Writer: a wild forward jump fails the write instead of
         // zero-filling gigabytes; a small gap still works.

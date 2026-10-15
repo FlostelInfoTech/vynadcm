@@ -303,13 +303,63 @@ impl DataSet {
     }
 }
 
-/// Parse `DS`/`IS` text as `f64`, rejecting Rust-only non-finite
-/// spellings (`inf`, `-Infinity`, `NaN`, ...) that the DS grammar
-/// (PS3.5 §6.2) forbids. They are the only gap: everything else
-/// `f64::from_str` accepts is valid DS.
+/// Parse `DS`/`IS` text as `f64`: the spelling must match the DS
+/// grammar (PS3.5 §6.2) and the value must be finite (an exponent
+/// like `1e999` parses but overflows to infinity).
 fn parse_finite(s: &str) -> Option<f64> {
-    let f: f64 = s.trim().parse().ok()?;
+    let t = s.trim();
+    if !is_ds_spelling(t) {
+        return None;
+    }
+    let f: f64 = t.parse().ok()?;
     f.is_finite().then_some(f)
+}
+
+/// True when `t` (already trimmed) matches the DS grammar: an
+/// optional sign, digits with an optional fraction (a `.` needs
+/// digits after it), and an optional exponent. Rejects the
+/// Rust-only `f64::from_str` spellings (`1_0`, `12.`, `inf`,
+/// `NaN`, ...) that are not DS.
+fn is_ds_spelling(t: &str) -> bool {
+    let b = t.as_bytes();
+    let mut i = 0;
+    if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+        i += 1;
+    }
+    let int_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let int_digits = i - int_start;
+    let mut frac_digits = 0;
+    if i < b.len() && b[i] == b'.' {
+        i += 1;
+        let frac_start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        frac_digits = i - frac_start;
+        if frac_digits == 0 {
+            return false;
+        }
+    }
+    if int_digits == 0 && frac_digits == 0 {
+        return false;
+    }
+    if i < b.len() && (b[i] == b'e' || b[i] == b'E') {
+        i += 1;
+        if i < b.len() && (b[i] == b'+' || b[i] == b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < b.len() && b[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == exp_start {
+            return false;
+        }
+    }
+    i == b.len()
 }
 
 #[cfg(test)]
@@ -362,6 +412,28 @@ mod tests {
             Value::F32(vec![f32::INFINITY]),
         ));
         assert_eq!(ds.float(tags::RESCALE_SLOPE), Some(f64::INFINITY));
+    }
+
+    #[test]
+    fn float_rejects_rust_only_ds_spellings() {
+        // `f64::from_str` accepts these, but the DS grammar (PS3.5
+        // §6.2) does not: underscores, a bare trailing point, a bare
+        // exponent, and embedded whitespace.
+        for bad in ["1_0", "12.", "1e", "e5", ".", "+", "1 2", "0x10"] {
+            assert_eq!(parse_finite(bad), None, "{bad:?}");
+        }
+        for (good, want) in [
+            ("1", 1.0),
+            ("-0.5", -0.5),
+            ("+2e3", 2000.0),
+            (".5", 0.5),
+            ("1E-3", 0.001),
+            (" 12.5 ", 12.5),
+        ] {
+            assert_eq!(parse_finite(good), Some(want), "{good:?}");
+        }
+        // Finite grammar, infinite value: exponent overflow stays out.
+        assert_eq!(parse_finite("1e999"), None);
     }
 
     #[test]

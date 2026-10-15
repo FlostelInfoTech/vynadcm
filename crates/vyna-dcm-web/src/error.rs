@@ -10,6 +10,20 @@ pub enum Error {
     #[error("HTTP error: {0}")]
     Http(String),
 
+    /// Request timed out (retryable for idempotent operations such
+    /// as QIDO/WADO reads; STOW retries may duplicate instances).
+    #[error("request timed out: {0}")]
+    Timeout(String),
+
+    /// Connection-level failure: refused, reset, unreachable host,
+    /// or DNS failure (no TLS handshake was completed).
+    #[error("connection failed: {0}")]
+    Connect(String),
+
+    /// TLS handshake or certificate-verification failure.
+    #[error("TLS error: {0}")]
+    Tls(String),
+
     /// Non-successful HTTP status.
     #[error("DICOMweb status {status}: {body}")]
     Status {

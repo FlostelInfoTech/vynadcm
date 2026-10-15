@@ -72,7 +72,19 @@ impl DirInstance {
     /// File path relative to the media root (`DICOMDIR` directory).
     #[must_use]
     pub fn relative_path(&self) -> PathBuf {
-        self.file_id.iter().collect()
+        // Sanitized: traversal (`..`), `.`, and separator pieces from
+        // untrusted files are dropped, so joining this onto the
+        // media root cannot escape it.
+        let mut out = PathBuf::new();
+        for comp in &self.file_id {
+            for piece in comp.split(['/', '\\']) {
+                if piece.is_empty() || piece == "." || piece == ".." {
+                    continue;
+                }
+                out.push(piece);
+            }
+        }
+        out
     }
 }
 
@@ -566,13 +578,7 @@ pub fn build_dicomdir(entries: &[DirEntry], file_set_id: Option<&str>) -> Result
     let start = crate::PREFIX_LEN + meta_section_len(&meta)?;
     let abs: Vec<u32> = rels
         .iter()
-        .map(|r| {
-            u32::try_from(start + r).map_err(|_| Error::BadValue {
-                tag: SEQ,
-                vr: Vr::Sq,
-                message: "file too large for 32-bit directory offsets".into(),
-            })
-        })
+        .map(|r| abs_offset(start, *r))
         .collect::<Result<_>>()?;
     for (i, item) in items.iter_mut().enumerate() {
         let (next, lower) = links[i];
@@ -593,6 +599,21 @@ pub fn build_dicomdir(entries: &[DirEntry], file_set_id: Option<&str>) -> Result
     let bytes2 = crate::encode_dataset(&ds, ts)?;
     debug_assert_eq!(bytes.len(), bytes2.len(), "offset stamping shifted layout");
     write_part10(&meta, &ds)
+}
+
+/// Absolute item offset: `start + rel` must fit `u32`. The addition
+/// itself is checked first: on 32-bit targets it can overflow `usize`
+/// (a debug panic, a wrapped offset in release) before the `u32`
+/// narrowing ever sees it.
+fn abs_offset(start: usize, rel: usize) -> Result<u32> {
+    start
+        .checked_add(rel)
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| Error::BadValue {
+            tag: SEQ,
+            vr: Vr::Sq,
+            message: "file too large for 32-bit directory offsets".into(),
+        })
 }
 
 fn link_children(
@@ -819,6 +840,34 @@ fn validate_entry(entry: &DirEntry) -> Result<()> {
                 message: format!("file ID component {comp:?} must be 1–16 chars"),
             });
         }
+        // Components become path segments (see `relative_path`), so
+        // traversal and separators are refused; a backslash would
+        // additionally corrupt the multi-valued CS encoding.
+        if comp == ".." || comp.contains('/') || comp.contains('\\') {
+            return Err(Error::BadValue {
+                tag: FILE_ID,
+                vr: Vr::Cs,
+                message: format!(
+                    "file ID component {comp:?} must not be `..` or contain separators"
+                ),
+            });
+        }
+    }
+    // The override lands in a CS value (≤ 16 chars); overlong input
+    // must fail here, not encode non-conformant. Empty/blank falls
+    // back to the SOP Class mapping (see `instance_item`).
+    if let Some(rt) = entry
+        .record_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        && rt.len() > 16
+    {
+        return Err(Error::BadValue {
+            tag: REC_TYPE,
+            vr: Vr::Cs,
+            message: format!("record type override {rt:?} exceeds 16 characters"),
+        });
     }
     Ok(())
 }
@@ -1125,6 +1174,65 @@ mod tests {
             let entries = vec![entry(&dss[0], &file_id, "1.2.840.10008.1.2.1", None)];
             assert!(build_dicomdir(&entries, None).is_err(), "{file_id:?}");
         }
+        // Traversal and separators in file IDs.
+        for file_id in [vec![".."], vec!["A", ".."], vec!["A/B"], vec!["A\\B"]] {
+            let entries = vec![entry(&dss[0], &file_id, "1.2.840.10008.1.2.1", None)];
+            assert!(build_dicomdir(&entries, None).is_err(), "{file_id:?}");
+        }
+        // Overlong record type override (CS caps at 16 chars).
+        let entries = vec![entry(
+            &dss[0],
+            &["F1"],
+            "1.2.840.10008.1.2.1",
+            Some("0123456789ABCDEFG"),
+        )];
+        assert!(build_dicomdir(&entries, None).is_err());
+        // A 16-char override is accepted.
+        let entries = vec![entry(
+            &dss[0],
+            &["F1"],
+            "1.2.840.10008.1.2.1",
+            Some("0123456789ABCDEF"),
+        )];
+        assert!(build_dicomdir(&entries, None).is_ok());
+    }
+
+    #[test]
+    fn relative_path_drops_traversal_pieces() {
+        // Untrusted file IDs cannot escape the media root through
+        // `relative_path` (the build side refuses these outright;
+        // the read side sanitizes).
+        let inst = |file_id: &[&str]| DirInstance {
+            record_type: "IMAGE".into(),
+            sop_class_uid: "1.2.3".into(),
+            sop_uid: "1.2.3.1".into(),
+            ts_uid: "1.2.840.10008.1.2.1".into(),
+            instance_number: None,
+            file_id: file_id.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(
+            inst(&["DICOM", "IM1"]).relative_path(),
+            PathBuf::from("DICOM/IM1")
+        );
+        assert_eq!(
+            inst(&["..", "..", "etc", "x"]).relative_path(),
+            PathBuf::from("etc/x")
+        );
+        assert_eq!(
+            inst(&["A/B", ".", "C\\D"]).relative_path(),
+            PathBuf::from("A/B/C/D")
+        );
+        assert_eq!(inst(&[".."]).relative_path(), PathBuf::from(""));
+    }
+
+    #[test]
+    fn abs_offset_checks_addition_before_narrowing() {
+        assert_eq!(abs_offset(100, 24).unwrap(), 124);
+        assert!(abs_offset(100, u32::MAX as usize).is_err());
+        // The `usize` addition itself overflows (32-bit): must error,
+        // never wrap into a bogus small offset.
+        assert!(abs_offset(usize::MAX, 1).is_err());
+        assert!(abs_offset(usize::MAX, usize::MAX).is_err());
     }
 
     #[test]

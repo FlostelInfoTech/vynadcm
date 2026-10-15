@@ -586,21 +586,35 @@ fn update_lossy_tags(
 }
 
 /// Format an `f64` as a `DS` value (≤ 16 chars, no exponent).
+///
+/// Sub-1 values gain precision instead of rounding to `"0"` (a
+/// compression ratio of 0 is nonsense); only exactly `0.0` prints
+/// as `"0"`.
 fn ds_format(v: f64) -> String {
     if v == 0.0 {
         return "0".into();
     }
-    let mut s = format!("{v:.3}");
-    while s.contains('.') && s.ends_with('0') {
-        s.pop();
+    for prec in 3..=14 {
+        let mut s = format!("{v:.prec$}");
+        while s.contains('.') && s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+        if s != "0" && s != "-0" {
+            if s.len() > 16 {
+                s.truncate(16);
+            }
+            return s;
+        }
     }
-    if s.ends_with('.') {
-        s.pop();
+    // Below 1e-14: clamp to the smallest nonzero 16-char DS.
+    if v > 0.0 {
+        "0.00000000000001".into()
+    } else {
+        "-0.0000000000001".into()
     }
-    if s.len() > 16 {
-        s.truncate(16);
-    }
-    s
 }
 
 #[cfg(test)]
@@ -610,6 +624,23 @@ mod tests {
     use vyna_dcm_core::PersonName;
 
     const TS_EXPLICIT: TransferSyntax = TransferSyntax::ExplicitVrLittleEndian;
+
+    #[test]
+    fn ds_format_never_prints_nonzero_as_zero() {
+        assert_eq!(ds_format(0.0), "0");
+        assert_eq!(ds_format(2.5), "2.5");
+        assert_eq!(ds_format(1.0), "1");
+        assert_eq!(ds_format(0.5), "0.5");
+        // Sub-1 ratios gain precision instead of rounding to "0".
+        assert_eq!(ds_format(0.0004), "0.0004");
+        assert_eq!(ds_format(1e-10), "0.0000000001");
+        // Pathological tinies clamp to the smallest nonzero DS.
+        assert_eq!(ds_format(1e-300), "0.00000000000001");
+        assert_eq!(ds_format(-1e-300), "-0.0000000000001");
+        for v in [1e-300, 0.0004, 1e-10, 123.456] {
+            assert!(ds_format(v).len() <= 16, "{v}");
+        }
+    }
 
     fn descriptors(
         rows: u16,

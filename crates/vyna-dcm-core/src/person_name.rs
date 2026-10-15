@@ -143,12 +143,18 @@ impl PersonName {
     }
 
     /// Strict parse: rejects backslashes (split multi-valued names
-    /// first), groups past the 3rd, components past the 5th, and any
-    /// group longer than 64 characters (PS3.5 §6.2).
+    /// first), control characters, groups past the 3rd, components
+    /// past the 5th, and any group longer than 64 characters
+    /// (PS3.5 §6.2).
     pub fn try_parse(s: &str) -> Result<Self, Error> {
         if s.contains('\\') {
             return Err(Error::Parse(
                 "multi-valued PN must be split on backslash first".into(),
+            ));
+        }
+        if s.chars().any(|c| c.is_control()) {
+            return Err(Error::Parse(
+                "PN must not contain control characters".into(),
             ));
         }
         let mut groups = s.split('=');
@@ -275,6 +281,11 @@ mod tests {
         assert!(PersonName::try_parse(&format!("{}={}", "B".repeat(65), "x")).is_err());
         assert!(PersonName::try_parse(&"C".repeat(64)).is_ok());
         assert!(PersonName::try_parse("A^B^C^D^E=a=b").is_ok());
+        // Control characters (NUL, newline, DEL, ...) are never valid
+        // in user-supplied names.
+        for bad in ["Doe\0^Jane", "A\nB", "A\tB", "A\x7FB", "A\u{85}B"] {
+            assert!(PersonName::try_parse(bad).is_err(), "{bad:?}");
+        }
         // Lossy parse keeps its documented truncation (decode path).
         let pn = PersonName::parse("A^B^C^D^E^F=a=b=c=d");
         assert_eq!(pn.to_dicom_string(), "A^B^C^D^E=a=b");

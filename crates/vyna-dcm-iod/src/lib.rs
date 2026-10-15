@@ -643,6 +643,79 @@ mod tests {
     }
 
     #[test]
+    fn ecg_and_pdf_negative_paths() {
+        use vyna_dcm_core::sop_class;
+        let native = Some(TransferSyntax::ExplicitVrLittleEndian);
+        let kinds_for = |uid: &str, ds: &DataSet| {
+            validate(ds, uid, native)
+                .unwrap()
+                .findings
+                .iter()
+                .map(|f| f.kind.clone())
+                .collect::<Vec<_>>()
+        };
+        // Waveform Sequence is Type 1 in both ECG IODs.
+        for uid in [
+            sop_class::TWELVE_LEAD_ECG_WAVEFORM,
+            sop_class::GENERAL_ECG_WAVEFORM,
+        ] {
+            let base = valid_fixture(find_iod(uid).unwrap());
+            let mut ds = base.clone();
+            ds.remove(tags::WAVEFORM_SEQUENCE);
+            assert!(
+                kinds_for(uid, &ds).contains(&Kind::MissingType1),
+                "{uid} missing Waveform Sequence"
+            );
+            let mut ds = base.clone();
+            ds.put_sequence(tags::WAVEFORM_SEQUENCE, Vec::new());
+            assert!(
+                kinds_for(uid, &ds).contains(&Kind::EmptyType1),
+                "{uid} empty Waveform Sequence"
+            );
+        }
+        // ECG Type 1 datetimes (Content Date/Time, Acquisition DateTime).
+        let uid = sop_class::TWELVE_LEAD_ECG_WAVEFORM;
+        let base = valid_fixture(find_iod(uid).unwrap());
+        for (tag, vr) in [
+            (tags::CONTENT_DATE, Vr::Da),
+            (tags::CONTENT_TIME, Vr::Tm),
+            (tags::ACQUISITION_DATE_TIME, Vr::Dt),
+        ] {
+            let mut ds = base.clone();
+            ds.remove(tag);
+            assert!(
+                kinds_for(uid, &ds).contains(&Kind::MissingType1),
+                "{tag} missing"
+            );
+            let mut ds = base.clone();
+            ds.insert(DataElement::text(tag, vr, ""));
+            assert!(
+                kinds_for(uid, &ds).contains(&Kind::EmptyType1),
+                "{tag} empty"
+            );
+        }
+        // Encapsulated Document + MIME Type are Type 1 in the PDF IOD.
+        let uid = sop_class::ENCAPSULATED_PDF;
+        let base = valid_fixture(find_iod(uid).unwrap());
+        let mut ds = base.clone();
+        ds.remove(tags::ENCAPSULATED_DOCUMENT);
+        assert!(kinds_for(uid, &ds).contains(&Kind::MissingType1));
+        let mut ds = base.clone();
+        ds.put_bytes(tags::ENCAPSULATED_DOCUMENT, Vr::Ob, Vec::new());
+        assert!(kinds_for(uid, &ds).contains(&Kind::EmptyType1));
+        let mut ds = base.clone();
+        ds.remove(tags::MIME_TYPE_OF_ENCAPSULATED_DOCUMENT);
+        assert!(kinds_for(uid, &ds).contains(&Kind::MissingType1));
+        let mut ds = base.clone();
+        ds.insert(DataElement::text(
+            tags::MIME_TYPE_OF_ENCAPSULATED_DOCUMENT,
+            Vr::Lo,
+            "",
+        ));
+        assert!(kinds_for(uid, &ds).contains(&Kind::EmptyType1));
+    }
+
+    #[test]
     fn conditional_rules_fire() {
         use vyna_dcm_core::sop_class;
         let native = Some(TransferSyntax::ExplicitVrLittleEndian);

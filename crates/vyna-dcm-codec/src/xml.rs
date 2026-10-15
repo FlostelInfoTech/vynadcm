@@ -274,11 +274,11 @@ fn read_attributes(
         match next(reader, buf)? {
             Event::Start(e) if is(&e, b"DicomAttribute") => {
                 let (tag, vr) = attribute_head(&e)?;
-                ds.insert(read_attribute_body(reader, buf, tag, vr, depth)?);
+                insert_unique(&mut ds, read_attribute_body(reader, buf, tag, vr, depth)?)?;
             }
             Event::Empty(e) if is(&e, b"DicomAttribute") => {
                 let (tag, vr) = attribute_head(&e)?;
-                ds.insert(DataElement::new(tag, vr, Value::Empty));
+                insert_unique(&mut ds, DataElement::new(tag, vr, Value::Empty))?;
             }
             Event::End(e) if e.name().as_ref() == end => return Ok(ds),
             Event::Text(e) => check_ws(&e)?,
@@ -292,6 +292,15 @@ fn read_attributes(
             _ => {}
         }
     }
+}
+
+/// Insert, rejecting duplicate tags (last-win would silently drop data).
+fn insert_unique(ds: &mut DataSet, el: DataElement) -> Result<()> {
+    if ds.contains(el.tag) {
+        return Err(Error::Xml(format!("{}: duplicate attribute", el.tag)));
+    }
+    ds.insert(el);
+    Ok(())
 }
 
 /// Required `tag` + `vr` from a `DicomAttribute` open tag.
@@ -880,6 +889,13 @@ mod tests {
             r#"<DicomAttribute tag="00280010" vr="US"><InlineBinary>AA==</InlineBinary></DicomAttribute>"#,
         );
         assert!(dataset_from_xml(&bad).is_err());
+        // Duplicate attributes are refused (last-win would drop data).
+        let bad = wrap(concat!(
+            r#"<DicomAttribute tag="00280010" vr="US"><Value number="1">1</Value></DicomAttribute>"#,
+            r#"<DicomAttribute tag="00280010" vr="US"><Value number="1">2</Value></DicomAttribute>"#,
+        ));
+        let err = dataset_from_xml(&bad).unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
     #[test]

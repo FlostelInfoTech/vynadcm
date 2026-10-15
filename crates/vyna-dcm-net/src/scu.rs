@@ -73,7 +73,7 @@ impl Association {
         &mut self,
         sop_class_uid: &str,
         rsp_field: u16,
-        build: impl FnOnce(u16) -> Command,
+        build: impl FnOnce(u16) -> Result<Command>,
         dataset: Option<&DataSet>,
     ) -> Result<DimseMessage> {
         let ctx = self
@@ -81,7 +81,7 @@ impl Association {
             .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
             .clone();
         let id = self.next_message_id();
-        let cmd = build(id);
+        let cmd = build(id)?;
         self.send(ctx.id, &cmd, dataset).await?;
         self.expect_message(rsp_field, id).await
     }
@@ -89,7 +89,12 @@ impl Association {
     /// C-ECHO against the Verification (or any echoable) SOP class.
     pub async fn echo(&mut self, sop_class_uid: &str) -> Result<u16> {
         let msg = self
-            .request_single(sop_class_uid, CF::C_ECHO_RSP, Command::echo_rq, None)
+            .request_single(
+                sop_class_uid,
+                CF::C_ECHO_RSP,
+                |id| Ok(Command::echo_rq(id)),
+                None,
+            )
             .await?;
         Ok(msg.command.status.unwrap_or(status::PROCESSING_FAILURE))
     }
@@ -139,7 +144,7 @@ impl Association {
         let id = self.next_message_id();
         self.send(
             ctx.id,
-            &Command::find_rq(id, priority, sop_class_uid),
+            &Command::find_rq(id, priority, sop_class_uid)?,
             Some(query),
         )
         .await?;
@@ -161,8 +166,10 @@ impl Association {
     /// C-FIND collecting all matches (capped: [`MAX_FIND_MATCHES`]
     /// responses / [`MAX_FIND_BYTES`] bytes; past either cap the SCU
     /// drains to the final response and errors, keeping the
-    /// association usable). For callback streaming use [`Association::find_with`]
-    /// (capped by `max_pending_responses`, aborting past it).
+    /// association usable). The drain itself is bounded by
+    /// `max_pending_responses` like [`Association::find_with`]: past
+    /// it the association aborts with [`Error::TooManyResponses`]
+    /// instead of draining a rogue peer's endless PENDINGs.
     pub async fn find_all(
         &mut self,
         sop_class_uid: &str,
@@ -176,17 +183,19 @@ impl Association {
         let id = self.next_message_id();
         self.send(
             ctx.id,
-            &Command::find_rq(id, priority, sop_class_uid),
+            &Command::find_rq(id, priority, sop_class_uid)?,
             Some(query),
         )
         .await?;
         let mut matches = Vec::new();
         let mut bytes: u64 = 0;
         let mut overflow: Option<Error> = None;
+        let mut pending = 0u32;
         loop {
             let msg = self.expect_message(CF::C_FIND_RSP, id).await?;
             let s = msg.command.status.unwrap_or(status::PROCESSING_FAILURE);
             if status::is_pending(s) {
+                self.count_pending(&mut pending).await?;
                 // Past the cap: drop matches but keep consuming so the
                 // association stays in sync through the final response.
                 if let Some(ds) = msg.dataset.filter(|_| overflow.is_none()) {
@@ -238,7 +247,7 @@ impl Association {
         let id = self.next_message_id();
         self.send(
             ctx.id,
-            &Command::find_rq(id, priority, sop_class_uid),
+            &Command::find_rq(id, priority, sop_class_uid)?,
             Some(query),
         )
         .await?;
@@ -288,7 +297,7 @@ impl Association {
             .ok_or_else(|| Error::NoPresentationContext(sop_class_uid.into()))?
             .clone();
         let id = self.next_message_id();
-        let cmd = Command::move_rq(id, priority, sop_class_uid, dest.as_str());
+        let cmd = Command::move_rq(id, priority, sop_class_uid, dest.as_str())?;
         self.send(ctx.id, &cmd, Some(query)).await?;
         self.await_move_get(CF::C_MOVE_RSP, id).await
     }
@@ -315,7 +324,7 @@ impl Association {
         let id = self.next_message_id();
         self.send(
             ctx.id,
-            &Command::get_rq(id, priority, sop_class_uid),
+            &Command::get_rq(id, priority, sop_class_uid)?,
             Some(query),
         )
         .await?;
@@ -380,7 +389,14 @@ impl Association {
             .request_single(
                 sop_class_uid,
                 CF::N_CREATE_RSP,
-                |id| Command::n_create_rq(id, sop_class_uid, sop_instance_uid, has_dataset),
+                |id| {
+                    Ok(Command::n_create_rq(
+                        id,
+                        sop_class_uid,
+                        sop_instance_uid,
+                        has_dataset,
+                    ))
+                },
                 dataset,
             )
             .await?;
@@ -401,7 +417,7 @@ impl Association {
             .request_single(
                 sop_class_uid,
                 CF::N_SET_RSP,
-                |id| Command::n_set_rq(id, sop_class_uid, sop_instance_uid),
+                |id| Ok(Command::n_set_rq(id, sop_class_uid, sop_instance_uid)),
                 Some(dataset),
             )
             .await?;
@@ -422,7 +438,14 @@ impl Association {
             .request_single(
                 sop_class_uid,
                 CF::N_GET_RSP,
-                |id| Command::n_get_rq(id, sop_class_uid, sop_instance_uid, attributes),
+                |id| {
+                    Ok(Command::n_get_rq(
+                        id,
+                        sop_class_uid,
+                        sop_instance_uid,
+                        attributes,
+                    ))
+                },
                 None,
             )
             .await?;
@@ -446,13 +469,13 @@ impl Association {
                 sop_class_uid,
                 CF::N_ACTION_RSP,
                 |id| {
-                    Command::n_action_rq(
+                    Ok(Command::n_action_rq(
                         id,
                         sop_class_uid,
                         sop_instance_uid,
                         action_type_id,
                         has_dataset,
-                    )
+                    ))
                 },
                 dataset,
             )
@@ -472,7 +495,7 @@ impl Association {
             .request_single(
                 sop_class_uid,
                 CF::N_DELETE_RSP,
-                |id| Command::n_delete_rq(id, sop_class_uid, sop_instance_uid),
+                |id| Ok(Command::n_delete_rq(id, sop_class_uid, sop_instance_uid)),
                 None,
             )
             .await?;
@@ -494,13 +517,13 @@ impl Association {
                 sop_class_uid,
                 CF::N_EVENT_REPORT_RSP,
                 |id| {
-                    Command::n_event_report_rq(
+                    Ok(Command::n_event_report_rq(
                         id,
                         sop_class_uid,
                         sop_instance_uid,
                         event_type_id,
                         has_dataset,
-                    )
+                    ))
                 },
                 dataset,
             )
@@ -747,6 +770,61 @@ mod tests {
             "{err:?}"
         );
         assert_eq!(*seen.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn find_all_aborts_past_pending_cap() {
+        // Same rogue-peer drain bound as find_with: 5 matches against
+        // a cap of 2 must abort, not collect-and-drain forever.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handlers = ArcTestScp::new(TestScp {
+            stored: Mutex::new(vec![]),
+            find_matches: (0..5).map(|i| test_ds(&format!("1.2.3.{i}"))).collect(),
+            move_instances: vec![],
+            fail_store: false,
+        });
+        let h2 = handlers.clone();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            stream.set_nodelay(true).unwrap();
+            let acc = AcceptorOptions {
+                association: short_opts(),
+                ..Default::default()
+            };
+            accept(stream, &acc, &*h2, &ScpOptions::default())
+                .await
+                .unwrap();
+        });
+
+        let mut opts = short_opts();
+        opts.max_pending_responses = 2;
+        let mut assoc = Association::request(
+            &opts,
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            &addr.to_string(),
+            propose(
+                &[vyna_dcm_core::sop_class::STUDY_ROOT_FIND],
+                &[vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian],
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let err = assoc
+            .find_all(
+                vyna_dcm_core::sop_class::STUDY_ROOT_FIND,
+                &DataSet::new(),
+                priority::MEDIUM,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::TooManyResponses { limit: 2 }),
+            "{err:?}"
+        );
     }
 
     #[tokio::test]

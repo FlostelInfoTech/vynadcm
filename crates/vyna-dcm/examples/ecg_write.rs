@@ -25,7 +25,8 @@ fn main() -> Result<(), String> {
                 })
                 .collect(),
             0.001, // 1 µV per LSB, reported in mV
-        );
+        )
+        .map_err(|e| e.to_string())?;
         lead.mdc_code = Some((*code).to_string());
         lead.filter_low_hz = Some(0.05);
         lead.filter_high_hz = Some(150.0);

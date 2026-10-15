@@ -1819,6 +1819,7 @@ name = "vyna-dcm-web"
 version = "0.5.0"
 dependencies = [
  "bytes",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-util",
@@ -1826,6 +1827,7 @@ dependencies = [
  "rcgen",
  "reqwest",
  "rustls",
+ "rustls-pemfile",
  "rustls-platform-verifier",
  "serde",
  "serde_json",
@@ -1835,6 +1837,7 @@ dependencies = [
  "uuid",
  "vyna-dcm-codec",
  "vyna-dcm-core",
+ "webpki-roots",
 ]
 
 [[package]]

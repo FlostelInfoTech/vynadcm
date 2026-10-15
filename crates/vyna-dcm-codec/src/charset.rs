@@ -9,8 +9,8 @@
 //! 138/148/166`, `ISO_IR 192`, `ISO_IR 13`, `ISO 2022 IR 13/87/159`
 //! (Japanese, incl. code-extension pairs), `ISO 2022 IR 149`
 //! (Korean, G1 via SO/SI), `GB18030`, `GBK`, `GB2312`. Anything else falls
-//! back to Latin-1 on decode (the historical behavior) and UTF-8
-//! bytes on encode (data-preserving).
+//! back to Latin-1 both ways (characters past U+00FF encode as `?`,
+//! so every encoded byte decodes back).
 
 use encoding_rs as enc;
 
@@ -25,8 +25,7 @@ pub enum Decoding {
     Iso2022Jp,
     /// Korean KS X 1001 in G1 (SO/SI switching + EUC-KR runs).
     Iso2022Kr,
-    /// Declared but unsupported: Latin-1 fallback on decode,
-    /// UTF-8 bytes on encode.
+    /// Declared but unsupported: Latin-1 fallback both ways.
     Unsupported,
 }
 
@@ -137,19 +136,15 @@ pub fn decode_text(raw: &[u8], decoding: &Decoding) -> String {
 #[must_use]
 pub fn encode_text(text: &str, decoding: &Decoding) -> Vec<u8> {
     match decoding {
-        Decoding::Default | Decoding::Unsupported => text.as_bytes().to_vec(),
+        // Latin-1, mirroring the decode fallback: emitting UTF-8 here
+        // would decode back as mojibake.
+        Decoding::Default | Decoding::Unsupported => encode_latin1(text),
         Decoding::Single(single) => match single {
             Single::Ascii => text
                 .bytes()
                 .map(|b| if b < 0x80 { b } else { b'?' })
                 .collect(),
-            Single::Latin1 => {
-                let mut out = Vec::with_capacity(text.len());
-                for c in text.chars() {
-                    out.push(u8::try_from(c as u32).unwrap_or(b'?'));
-                }
-                out
-            }
+            Single::Latin1 => encode_latin1(text),
             Single::JisX0201 => encode_jis_x_0201(text),
             Single::Codec(enc) => encode_with(enc, text),
         },
@@ -160,6 +155,16 @@ pub fn encode_text(text: &str, decoding: &Decoding) -> Vec<u8> {
 
 fn latin1(raw: &[u8]) -> String {
     raw.iter().map(|b| *b as char).collect()
+}
+
+/// Latin-1 encode, the counterpart of [`latin1`] decode: characters
+/// past U+00FF become `?` so every output byte decodes back.
+fn encode_latin1(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        out.push(u8::try_from(c as u32).unwrap_or(b'?'));
+    }
+    out
 }
 
 /// JIS X 0201 8-bit form: ASCII GL (with Yen/Sign exceptions),
@@ -244,8 +249,14 @@ fn decode_iso_2022_kr(raw: &[u8]) -> String {
         } else if b == 0x1B {
             flush(&mut run, &mut out);
             g1 = false;
-            out.push('\u{FFFD}');
-            i += 1;
+            // `ESC ( B` re-designates ASCII G0: a no-op (ASCII is the
+            // default), not an error.
+            if raw.get(i + 1) == Some(&b'(') && raw.get(i + 2) == Some(&b'B') {
+                i += 3;
+            } else {
+                out.push('\u{FFFD}');
+                i += 1;
+            }
         } else if b == 0x0E {
             g1 = true;
             i += 1;
@@ -327,7 +338,15 @@ fn encode_with(enc: &'static enc::Encoding, text: &str) -> Vec<u8> {
         match result {
             enc::EncoderResult::InputEmpty => {
                 debug_assert!(rest.is_empty());
-                break;
+                if last {
+                    break;
+                }
+                // Input consumed but the stream never finalized: loop
+                // once more with `last = true` so stateful encodings
+                // (ISO-2022-JP) emit their closing shift (`ESC ( B`).
+                // Without it, multi-value joins splice a raw backslash
+                // into a still-shifted stream (merged values + mojibake).
+                continue;
             }
             enc::EncoderResult::OutputFull => continue,
             enc::EncoderResult::Unmappable(_) => {
@@ -449,11 +468,45 @@ mod tests {
         assert_eq!(decode_text(&[0xE9], &none), "é"); // Latin-1 fallback
         let bogus = parse_specific_character_set(&["NO_SUCH_CHARSET".to_string()]);
         assert_eq!(decode_text(&[0xE9], &bogus), "é");
-        assert_eq!(encode_text("é", &bogus), "é".as_bytes());
+        // Encode mirrors the Latin-1 decode (UTF-8 bytes here would
+        // decode back as mojibake); past U+00FF becomes `?`.
+        assert_eq!(encode_text("é", &bogus), b"\xe9");
+        assert_eq!(encode_text("€", &bogus), b"?");
+        assert_eq!(encode_text("Müller→", &none), b"M\xfcller?");
         // Single unsupported term in a pair poisons the whole set.
         let mixed =
             parse_specific_character_set(&["ISO 2022 IR 13".to_string(), "NOPE".to_string()]);
         assert!(matches!(mixed, Decoding::Unsupported));
+    }
+
+    #[test]
+    fn iso2022_jp_closes_with_esc_paren_b() {
+        // The encoder must finalize the stream (`last = true`), or
+        // ISO-2022-JP never emits the trailing `ESC ( B` and a
+        // multi-value join splices a raw backslash into JIS X 0208
+        // bytes (merged values + mojibake on decode).
+        let jp = decoding_for("iso2022-jp");
+        let encoded = encode_text("山田", &jp);
+        assert!(
+            encoded.ends_with(b"\x1B(B"),
+            "missing trailing ESC(B: {encoded:?}"
+        );
+        // Per-value encode + backslash join (as encode.rs does) must
+        // decode back to two values.
+        let mut joined = encode_text("山田", &jp);
+        joined.push(b'\\');
+        joined.extend_from_slice(&encode_text("太郎", &jp));
+        assert_eq!(decode_text(&joined, &jp), "山田\\太郎");
+    }
+
+    #[test]
+    fn iso2022_kr_esc_paren_b_is_ascii_noop() {
+        // `ESC ( B` re-designates ASCII G0: consumed silently, not
+        // U+FFFD followed by a literal "(B".
+        let kr = decoding_for("iso2022-kr");
+        assert_eq!(decode_text(b"ABC\x1B(BDEF", &kr), "ABCDEF");
+        // Unknown escapes still replace (one U+FFFD, stream resyncs).
+        assert_eq!(decode_text(b"A\x1BZD", &kr), "A\u{FFFD}ZD");
     }
 
     #[test]

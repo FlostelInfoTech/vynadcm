@@ -523,6 +523,15 @@ pub fn decode_pixels_with(
             ))
         }
         (Value::Fragments(f), ts) => {
+            // Fragments under a native (uncompressed) syntax are a
+            // data-shape mismatch, not an unknown syntax.
+            if ts.is_uncompressed() {
+                return Err(Error::BadValue {
+                    tag: tags::PIXEL_DATA,
+                    vr: el.vr,
+                    message: format!("fragmented pixel data does not match {ts:?}"),
+                });
+            }
             let codec =
                 codec.ok_or_else(|| Error::UnsupportedTransferSyntax(ts.uid().to_string()))?;
             if !codec.syntaxes().contains(&ts) {
@@ -705,6 +714,21 @@ mod tests {
     use vyna_dcm_core::{DataElement, tags};
 
     const TS_JPEG: TransferSyntax = TransferSyntax::JpegBaseline8Bit;
+
+    #[test]
+    fn fragments_under_native_syntax_are_bad_value() {
+        // Fragmented pixels with a native transfer syntax are a
+        // data-shape mismatch (`BadValue`), not an unknown syntax —
+        // even with no codec plugged in.
+        let ds = jpeg_dataset();
+        let err =
+            decode_pixels_with(&ds, TransferSyntax::ExplicitVrLittleEndian, None).unwrap_err();
+        assert!(
+            matches!(err, Error::BadValue { .. }),
+            "wrong variant: {err:?}"
+        );
+        assert!(err.to_string().contains("fragmented"), "{err}");
+    }
 
     fn jpeg_dataset() -> DataSet {
         DataSet::new()

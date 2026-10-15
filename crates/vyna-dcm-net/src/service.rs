@@ -57,6 +57,12 @@ pub struct AcceptorOptions {
     pub check_called_ae: bool,
     /// User-identity gate; `None` = no authentication.
     pub user_identity_auth: Option<UserIdentityAuth>,
+    /// How long to wait for the initial A-ASSOCIATE-RQ on a new
+    /// connection (ARTIM-style: PS3.8 §9.1.5, 30 s). Separate from
+    /// [`AssociationOptions::read_timeout`](crate::AssociationOptions::read_timeout):
+    /// a peer that connects and goes silent must not hold an
+    /// association slot for the full inactivity budget.
+    pub associate_timeout: Duration,
 }
 
 impl AcceptorOptions {
@@ -82,6 +88,7 @@ impl Default for AcceptorOptions {
             accepted_sop_classes: None,
             check_called_ae: false,
             user_identity_auth: None,
+            associate_timeout: Duration::from_secs(30),
         }
     }
 }
@@ -577,18 +584,19 @@ where
 {
     let mut stream: Box<dyn crate::association::AsyncReadWrite> = Box::new(stream);
     let first = timeout(
-        acceptor.association.read_timeout,
+        acceptor.associate_timeout,
         crate::pdu::read_pdu(&mut stream, acceptor.association.max_incoming_pdu),
     )
     .await
     .map_err(|_| Error::Timeout("association request"))??;
     let Pdu::AssociateRq(rq) = first else {
-        crate::pdu::write_pdu(
+        crate::pdu::write_pdu_timeout(
             &mut stream,
             &Pdu::Abort {
                 source: 2,
                 reason: 2,
             },
+            acceptor.association.write_timeout,
         )
         .await
         .ok();
@@ -605,11 +613,21 @@ where
                 origin: rj.source,
                 reason: rj.reason,
             };
-            crate::pdu::write_pdu(&mut stream, &Pdu::AssociateRj(rj)).await?;
+            crate::pdu::write_pdu_timeout(
+                &mut stream,
+                &Pdu::AssociateRj(rj),
+                acceptor.association.write_timeout,
+            )
+            .await?;
             return Err(err);
         }
     };
-    crate::pdu::write_pdu(&mut stream, &Pdu::AssociateAc(ac)).await?;
+    crate::pdu::write_pdu_timeout(
+        &mut stream,
+        &Pdu::AssociateAc(ac),
+        acceptor.association.write_timeout,
+    )
+    .await?;
     let info = AssociationInfo {
         local_ae: acceptor.ae_title.clone(),
         peer_ae: rq.calling_ae.clone(),
@@ -617,6 +635,31 @@ where
     };
     let mut assoc = Association::from_accepted(stream, info, contexts, &acceptor.association);
     run_scp(&mut assoc, handlers, scp_opts).await
+}
+
+/// Accept one inbound connection under a concurrency cap: holds a
+/// `slots` permit for the association lifetime, refusing with
+/// [`Error::TooManyAssociations`] (stream dropped, like the CLI SCPs'
+/// over-cap path) when no permit is immediately available.
+///
+/// Library embedders spawning one task per connection should route
+/// every connection through this with a shared semaphore instead of
+/// bare [`accept`], which cannot bound concurrency by itself.
+pub async fn accept_limited<S, H>(
+    stream: S,
+    acceptor: &AcceptorOptions,
+    handlers: &H,
+    scp_opts: &ScpOptions,
+    slots: &tokio::sync::Semaphore,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    H: Handlers,
+{
+    let Ok(_permit) = slots.try_acquire() else {
+        return Err(Error::TooManyAssociations);
+    };
+    accept(stream, acceptor, handlers, scp_opts).await
 }
 
 /// Run the SCP dispatch loop until release, abort or transport error.
@@ -682,20 +725,30 @@ async fn dispatch<H: Handlers>(
     };
     // The request must name the SOP Class its presentation context was
     // negotiated for: anything else is cross-context service (handlers
-    // would serve Y while responses echo X).
-    let request_uid = match cmd.field {
-        CF::N_SET_RQ | CF::N_GET_RQ | CF::N_ACTION_RQ | CF::N_DELETE_RQ => {
-            &cmd.requested_sop_class_uid
+    // would serve Y while responses echo X). A missing UID fails too —
+    // only C-CANCEL-RQ legitimately carries none.
+    if cmd.field != CF::C_CANCEL_RQ {
+        let request_uid = match cmd.field {
+            CF::N_SET_RQ | CF::N_GET_RQ | CF::N_ACTION_RQ | CF::N_DELETE_RQ => {
+                &cmd.requested_sop_class_uid
+            }
+            _ => &cmd.affected_sop_class_uid,
+        };
+        match request_uid {
+            Some(uid) if *uid == context.abstract_syntax => {}
+            Some(uid) => {
+                return Err(Error::BadCommand(format!(
+                    "SOP Class {uid} requested on context negotiated for {}",
+                    context.abstract_syntax
+                )));
+            }
+            None => {
+                return Err(Error::BadCommand(format!(
+                    "request without SOP Class UID ({})",
+                    cmd.name()
+                )));
+            }
         }
-        _ => &cmd.affected_sop_class_uid,
-    };
-    if let Some(uid) = request_uid
-        && *uid != context.abstract_syntax
-    {
-        return Err(Error::BadCommand(format!(
-            "SOP Class {uid} requested on context negotiated for {}",
-            context.abstract_syntax
-        )));
     }
 
     match cmd.field {
@@ -1046,10 +1099,12 @@ async fn handle_move<H: Handlers>(
         tracing::warn!("C-MOVE destination is not a valid AE title; failing");
         return fail_final(assoc, status::MOVE_DESTINATION_UNKNOWN).await;
     };
-    // Empty plan: SUCCESS with zero counts and no outbound association
-    // (a flaky-but-valid destination must not fail a zero-match retrieve).
+    // Empty plan: handler status (a warning survives) with zero
+    // counts and no outbound association (a flaky-but-valid
+    // destination must not fail a zero-match retrieve).
     if plan.total == 0 {
-        let rsp = Command::move_get_rsp(true, rsp_id, sop, status::SUCCESS, 0, 0, 0, 0);
+        let s = move_get_final(handler_status, 0);
+        let rsp = Command::move_get_rsp(true, rsp_id, sop, s, 0, 0, 0, 0);
         assoc.send(ctx_id, &rsp, None).await?;
         return Ok(());
     }
@@ -1167,13 +1222,7 @@ async fn handle_move<H: Handlers>(
     // Best-effort: all sub-operations concluded; the final below stands
     // regardless of whether the goodbye handshake completes.
     outbound.release().await.ok();
-    // A SUCCESS final with failed sub-operations lies to the caller;
-    // PS3.4 C.4.2/C.4.3 report B000 instead.
-    let final_status = if done_fail > 0 {
-        status::SUBOPERATIONS_COMPLETE_WITH_FAILURES
-    } else {
-        status::SUCCESS
-    };
+    let final_status = move_get_final(handler_status, done_fail);
     let rsp = Command::move_get_rsp(
         true,
         rsp_id,
@@ -1186,6 +1235,20 @@ async fn handle_move<H: Handlers>(
     );
     assoc.send(ctx_id, &rsp, None).await?;
     Ok(())
+}
+
+/// C-MOVE/C-GET final status: failures surface as B000 (a SUCCESS
+/// final with failed sub-operations lies to the caller; PS3.4
+/// C.4.2/C.4.3), otherwise a handler-returned warning survives
+/// instead of being coerced to SUCCESS.
+fn move_get_final(handler_status: u16, done_fail: u16) -> u16 {
+    if done_fail > 0 {
+        status::SUBOPERATIONS_COMPLETE_WITH_FAILURES
+    } else if status::is_warning(handler_status) {
+        handler_status
+    } else {
+        status::SUCCESS
+    }
 }
 
 async fn handle_get<H: Handlers>(
@@ -1255,7 +1318,7 @@ async fn handle_get<H: Handlers>(
             priority::MEDIUM,
             &inst.sop_class_uid,
             &inst.sop_instance_uid,
-        );
+        )?;
         assoc
             .send(st_ctx.id, &store_cmd, Some(&inst.dataset))
             .await?;
@@ -1369,12 +1432,7 @@ async fn handle_get<H: Handlers>(
             }
         }
     }
-    // See handle_move: failures surface as B000, never SUCCESS.
-    let final_status = if done_fail > 0 {
-        status::SUBOPERATIONS_COMPLETE_WITH_FAILURES
-    } else {
-        status::SUCCESS
-    };
+    let final_status = move_get_final(handler_status, done_fail);
     let rsp = Command::move_get_rsp(
         false,
         rsp_id,
@@ -1507,7 +1565,7 @@ mod tests {
         let (mut assoc, _b, ctx) = duplex_scp("1.2.840.10008.5.1.4.1.1.2");
         let msg = DimseMessage {
             context_id: ctx.id,
-            command: Command::find_rq(7, priority::MEDIUM, "1.2.840.10008.5.1.4.1.1.4"),
+            command: Command::find_rq(7, priority::MEDIUM, "1.2.840.10008.5.1.4.1.1.4").unwrap(),
             dataset: Some(DataSet::new()),
         };
         let err = dispatch(&mut assoc, &handlers, &opts, msg)
@@ -1535,7 +1593,7 @@ mod tests {
         let (mut assoc, b, ctx) = duplex_scp(sop);
         let msg = DimseMessage {
             context_id: ctx.id,
-            command: Command::find_rq(3, priority::MEDIUM, sop),
+            command: Command::find_rq(3, priority::MEDIUM, sop).unwrap(),
             dataset: Some(DataSet::new()),
         };
         dispatch(&mut assoc, &handlers, &opts, msg).await.unwrap();
@@ -1685,6 +1743,269 @@ mod tests {
         rq.presentation_contexts.push(second);
         let (_, ctxs) = negotiate(&rq, &opts).unwrap();
         assert_eq!(ctxs.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_missing_sop_class_uid() {
+        let handlers = ProbeHandlers {
+            find_final: status::SUCCESS,
+            find_matches: vec![],
+            n_get_called: Mutex::new(false),
+            event_called: Mutex::new(false),
+        };
+        let opts = ScpOptions::default();
+        // UID-less requests fail closed (only C-CANCEL may omit UIDs).
+        let sop = "1.2.840.10008.5.1.4.1.2.2.1";
+        let (mut assoc, _b, ctx) = duplex_scp(sop);
+        let mut cmd = Command::find_rq(7, priority::MEDIUM, sop).unwrap();
+        cmd.affected_sop_class_uid = None;
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: cmd,
+            dataset: Some(DataSet::new()),
+        };
+        let err = dispatch(&mut assoc, &handlers, &opts, msg)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::BadCommand(_)), "{err:?}");
+        // C-CANCEL-RQ without UIDs is still accepted-and-ignored.
+        let (mut assoc, _b, ctx) = duplex_scp(sop);
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: Command::cancel_rq(7),
+            dataset: None,
+        };
+        dispatch(&mut assoc, &handlers, &opts, msg).await.unwrap();
+    }
+
+    /// C-MOVE/C-GET handlers answering with a warning and (for MOVE)
+    /// an empty plan.
+    struct WarnPlan;
+
+    impl Handlers for WarnPlan {
+        async fn on_move(
+            &self,
+            _ctx: &RequestContext<'_>,
+            _query: &DataSet,
+            _destination: &str,
+        ) -> (u16, Vec<MoveInstance>) {
+            (status::ELEMENTS_DISCARDED, Vec::new())
+        }
+
+        async fn on_get(
+            &self,
+            _ctx: &RequestContext<'_>,
+            _query: &DataSet,
+        ) -> (u16, Vec<MoveInstance>) {
+            (status::ELEMENTS_DISCARDED, Vec::new())
+        }
+    }
+
+    /// Read the single final C-MOVE/C-GET-RSP status off the peer half.
+    async fn final_move_get_status(
+        b: tokio::io::DuplexStream,
+        ctx: NegotiatedContext,
+        field: u16,
+        id: u16,
+    ) -> u16 {
+        let info = AssociationInfo {
+            local_ae: AeTitle::new("SCU").unwrap(),
+            peer_ae: AeTitle::new("SCP").unwrap(),
+            peer_max_pdu: 0,
+        };
+        let mut peer = Association::from_accepted(
+            Box::new(b) as Box<dyn AsyncReadWrite>,
+            info,
+            vec![ctx],
+            &AssociationOptions::default(),
+        );
+        *rsp_statuses(&mut peer, field, id).await.last().unwrap()
+    }
+
+    #[tokio::test]
+    async fn move_empty_plan_preserves_handler_warning() {
+        // Empty plan, warning handler status: the final must be the
+        // warning, not SUCCESS (no outbound dial happens).
+        let sop = "1.2.840.10008.5.1.4.1.2.2.2";
+        let (mut assoc, b, ctx) = duplex_scp(sop);
+        let mut map = HashMap::new();
+        map.insert("DEST".to_string(), ("127.0.0.1".to_string(), 11112));
+        let scp_opts = ScpOptions {
+            move_config: Some(ScpMoveConfig {
+                directory: Arc::new(HashMapDirectory { map }),
+                assoc_options: AssociationOptions::default(),
+                calling_ae: AeTitle::new("SCP").unwrap(),
+            }),
+            ..Default::default()
+        };
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: Command::move_rq(11, priority::MEDIUM, sop, "DEST").unwrap(),
+            dataset: Some(DataSet::new()),
+        };
+        dispatch(&mut assoc, &WarnPlan, &scp_opts, msg)
+            .await
+            .unwrap();
+        drop(assoc);
+        assert_eq!(
+            final_move_get_status(b, ctx, CF::C_MOVE_RSP, 11).await,
+            status::ELEMENTS_DISCARDED
+        );
+    }
+
+    #[tokio::test]
+    async fn get_empty_plan_preserves_handler_warning() {
+        let sop = "1.2.840.10008.5.1.4.1.2.2.3";
+        let (mut assoc, b, ctx) = duplex_scp(sop);
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: Command::get_rq(12, priority::MEDIUM, sop).unwrap(),
+            dataset: Some(DataSet::new()),
+        };
+        dispatch(&mut assoc, &WarnPlan, &ScpOptions::default(), msg)
+            .await
+            .unwrap();
+        drop(assoc);
+        assert_eq!(
+            final_move_get_status(b, ctx, CF::C_GET_RSP, 12).await,
+            status::ELEMENTS_DISCARDED
+        );
+    }
+
+    #[tokio::test]
+    async fn get_final_preserves_handler_warning_with_sub_ops() {
+        // One successful sub-operation plus a handler warning: the
+        // final must still be the warning, not SUCCESS.
+        struct WarnGet;
+        impl Handlers for WarnGet {
+            async fn on_get(
+                &self,
+                _ctx: &RequestContext<'_>,
+                _query: &DataSet,
+            ) -> (u16, Vec<MoveInstance>) {
+                let mut ds = DataSet::new();
+                ds.put_text(
+                    vyna_dcm_core::tags::PATIENT_NAME,
+                    vyna_dcm_core::Vr::Pn,
+                    "Doe^Jane",
+                );
+                (
+                    status::ELEMENTS_DISCARDED,
+                    vec![MoveInstance {
+                        sop_class_uid: vyna_dcm_core::sop_class::CT_IMAGE.to_string(),
+                        sop_instance_uid: "1.2.9.1".to_string(),
+                        dataset: ds,
+                    }],
+                )
+            }
+        }
+        let sop = vyna_dcm_core::sop_class::CT_IMAGE;
+        let (mut assoc, b, ctx) = duplex_scp(sop);
+        let peer_ctx = ctx.clone();
+        let peer_task = tokio::spawn(async move {
+            let info = AssociationInfo {
+                local_ae: AeTitle::new("SCU").unwrap(),
+                peer_ae: AeTitle::new("SCP").unwrap(),
+                peer_max_pdu: 0,
+            };
+            let mut peer = Association::from_accepted(
+                Box::new(b) as Box<dyn AsyncReadWrite>,
+                info,
+                vec![peer_ctx],
+                &AssociationOptions::default(),
+            );
+            // Answer the single C-STORE-RQ, then collect C-GET-RSPs.
+            let DimseEvent::Message(m) = peer.recv().await.unwrap() else {
+                panic!("released");
+            };
+            assert_eq!(m.command.field, CF::C_STORE_RQ);
+            let store_id = m.command.message_id.unwrap();
+            let rsp = Command::store_rsp(
+                store_id,
+                m.command.affected_sop_class_uid.clone(),
+                m.command.affected_sop_instance_uid.clone(),
+                status::SUCCESS,
+            );
+            peer.send(m.context_id, &rsp, None).await.unwrap();
+            rsp_statuses(&mut peer, CF::C_GET_RSP, 13).await
+        });
+        let msg = DimseMessage {
+            context_id: ctx.id,
+            command: Command::get_rq(13, priority::MEDIUM, sop).unwrap(),
+            dataset: Some(DataSet::new()),
+        };
+        dispatch(&mut assoc, &WarnGet, &ScpOptions::default(), msg)
+            .await
+            .unwrap();
+        let statuses = peer_task.await.unwrap();
+        assert_eq!(statuses, vec![status::PENDING, status::ELEMENTS_DISCARDED]);
+    }
+
+    #[tokio::test]
+    async fn accept_uses_short_associate_timer() {
+        // A connected-but-silent peer must hit the 30 s-style ARTIM
+        // timer, not the 300 s inactivity budget.
+        struct EchoOnly;
+        impl Handlers for EchoOnly {}
+        let (peer, b) = tokio::io::duplex(65536);
+        let _peer = peer; // held open and silent (a drop would EOF instead)
+        let acc = AcceptorOptions {
+            associate_timeout: Duration::from_millis(100),
+            ..Default::default()
+        };
+        let t0 = std::time::Instant::now();
+        let err = accept(b, &acc, &EchoOnly, &ScpOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Timeout("association request")),
+            "{err:?}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn accept_limited_enforces_concurrency_cap() {
+        struct EchoOnly;
+        impl Handlers for EchoOnly {}
+        // No permits: refused without touching the stream.
+        let slots = tokio::sync::Semaphore::new(0);
+        let (_a, b) = tokio::io::duplex(65536);
+        let err = accept_limited(
+            b,
+            &AcceptorOptions::default(),
+            &EchoOnly,
+            &ScpOptions::default(),
+            &slots,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::TooManyAssociations), "{err:?}");
+        // One permit: a full associate-then-release loopback succeeds.
+        let slots = tokio::sync::Semaphore::new(1);
+        let (a, b) = tokio::io::duplex(65536);
+        let peer_task = tokio::spawn(async move {
+            use crate::pdu::{Pdu, read_pdu, write_pdu};
+            let mut peer = a;
+            write_pdu(&mut peer, &Pdu::AssociateRq(sample_rq()))
+                .await
+                .unwrap();
+            let ac = read_pdu(&mut peer, 64 * 1024 * 1024).await.unwrap();
+            assert!(matches!(ac, Pdu::AssociateAc(_)), "{ac:?}");
+            write_pdu(&mut peer, &Pdu::ReleaseRq).await.unwrap();
+            let rsp = read_pdu(&mut peer, 64 * 1024 * 1024).await.unwrap();
+            assert!(matches!(rsp, Pdu::ReleaseRsp), "{rsp:?}");
+        });
+        accept_limited(
+            b,
+            &AcceptorOptions::default(),
+            &EchoOnly,
+            &ScpOptions::default(),
+            &slots,
+        )
+        .await
+        .unwrap();
+        peer_task.await.unwrap();
     }
 
     #[test]

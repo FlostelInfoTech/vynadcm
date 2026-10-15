@@ -409,13 +409,13 @@ impl Stream {
 
   pub fn get_bytes_left(&self) -> i64 {
     log::trace!("-- byte_left(), offset={}", self.m_byte_offset);
-    assert!(self.m_byte_offset >= 0i64);
-    assert!(self.m_stream_length >= self.m_byte_offset as OPJ_UINT64);
-    let nb = if self.m_stream_length != 0 {
-      (self.m_stream_length as OPJ_OFF_T) - self.m_byte_offset
-    } else {
-      0i64
-    };
+    // Saturating: a desynced cursor (hostile callback behavior) must
+    // report 0 left, never panic on a length assert.
+    let off = self.m_byte_offset.max(0) as OPJ_UINT64;
+    let nb = self
+      .m_stream_length
+      .saturating_sub(off)
+      .min(i64::MAX as OPJ_UINT64) as i64;
     log::trace!("-- get_number_byte_left() = {}", nb);
     nb
   }
@@ -590,4 +590,23 @@ pub(crate) fn opj_stream_seek(
 pub(crate) fn opj_stream_has_seek(mut p_stream: *const opj_stream_private_t) -> OPJ_BOOL {
   let p_stream = unsafe { &*p_stream };
   p_stream.has_seek() as _
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn get_bytes_left_saturates_on_desync() {
+    let mut stream = Stream::new_custom(1024, true);
+    stream.m_stream_length = 100;
+    stream.m_byte_offset = 40;
+    assert_eq!(stream.get_bytes_left(), 60);
+    // A desynced cursor (past EOF, or negative) reports 0 left
+    // instead of panicking on a length assert.
+    stream.m_byte_offset = 120;
+    assert_eq!(stream.get_bytes_left(), 0);
+    stream.m_byte_offset = -5;
+    assert_eq!(stream.get_bytes_left(), 100);
+  }
 }

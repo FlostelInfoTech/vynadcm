@@ -75,8 +75,20 @@ pub struct EcgLead {
 
 impl EcgLead {
     /// Build a lead with VynaECG defaults (mV, 1.0 correction, 0 baseline).
-    pub fn new(label: impl Into<String>, samples: Vec<i32>, sensitivity: f64) -> Self {
-        Self {
+    ///
+    /// Rejects non-finite `sensitivity` (NaN/inf are not valid `DS` and
+    /// would poison [`EcgLead::physical_samples`]).
+    pub fn new(
+        label: impl Into<String>,
+        samples: Vec<i32>,
+        sensitivity: f64,
+    ) -> crate::Result<Self> {
+        if !sensitivity.is_finite() {
+            return Err(crate::Error::Waveform(format!(
+                "non-finite lead sensitivity {sensitivity}"
+            )));
+        }
+        Ok(Self {
             label: label.into(),
             samples,
             sensitivity,
@@ -88,7 +100,7 @@ impl EcgLead {
             filter_low_hz: None,
             filter_high_hz: None,
             notch_hz: None,
-        }
+        })
     }
 
     /// Convert raw samples to physical units.
@@ -102,8 +114,11 @@ impl EcgLead {
     }
 
     /// Convert raw samples from `i16` storage.
-    #[must_use]
-    pub fn from_i16(label: impl Into<String>, samples: &[i16], sensitivity: f64) -> Self {
+    pub fn from_i16(
+        label: impl Into<String>,
+        samples: &[i16],
+        sensitivity: f64,
+    ) -> crate::Result<Self> {
         Self::new(
             label,
             samples.iter().map(|s| i32::from(*s)).collect(),
@@ -149,6 +164,10 @@ pub struct EcgRecording {
 impl EcgRecording {
     /// Build a recording; all leads must share the sample count.
     /// Defaults: signed 16-bit samples.
+    ///
+    /// Rejects non-finite lead floats (sensitivity, correction factor,
+    /// baseline, filter frequencies): NaN/inf are not valid `DS` and
+    /// would poison [`EcgLead::physical_samples`] and the encoder.
     pub fn new(leads: Vec<EcgLead>, sampling_frequency_hz: f64) -> crate::Result<Self> {
         if leads.is_empty() {
             return Err(crate::Error::Waveform("recording without leads".into()));
@@ -160,6 +179,32 @@ impl EcgRecording {
             return Err(crate::Error::Waveform(format!(
                 "bad sampling frequency {sampling_frequency_hz}"
             )));
+        }
+        for lead in &leads {
+            for (what, v) in [
+                ("sensitivity", lead.sensitivity),
+                ("correction factor", lead.correction_factor),
+                ("baseline", lead.baseline),
+            ] {
+                if !v.is_finite() {
+                    return Err(crate::Error::Waveform(format!(
+                        "non-finite lead {what} {v}"
+                    )));
+                }
+            }
+            for (what, v) in [
+                ("filter low", lead.filter_low_hz),
+                ("filter high", lead.filter_high_hz),
+                ("notch", lead.notch_hz),
+            ] {
+                if let Some(f) = v
+                    && !f.is_finite()
+                {
+                    return Err(crate::Error::Waveform(format!(
+                        "non-finite lead {what} frequency {f}"
+                    )));
+                }
+            }
         }
         let n = leads[0].len();
         if leads.iter().any(|l| l.len() != n) {
@@ -243,7 +288,7 @@ mod tests {
         let lead = EcgLead {
             baseline: 0.5,
             correction_factor: 2.0,
-            ..EcgLead::new("II", vec![0, 1000, -1000], 0.001)
+            ..EcgLead::new("II", vec![0, 1000, -1000], 0.001).unwrap()
         };
         let phys = lead.physical_samples();
         assert_eq!(phys, vec![0.5, 2.5, -1.5]);
@@ -251,8 +296,8 @@ mod tests {
 
     #[test]
     fn recording_validates_shape() {
-        let a = EcgLead::new("I", vec![0; 10], 0.001);
-        let b = EcgLead::new("II", vec![0; 9], 0.001);
+        let a = EcgLead::new("I", vec![0; 10], 0.001).unwrap();
+        let b = EcgLead::new("II", vec![0; 9], 0.001).unwrap();
         assert!(EcgRecording::new(vec![a.clone()], 500.0).is_ok());
         assert!(matches!(
             EcgRecording::new(vec![a, b], 500.0),
@@ -264,12 +309,56 @@ mod tests {
         ));
         for bad in [0.0, -500.0, f64::NAN, f64::INFINITY] {
             assert!(
-                EcgRecording::new(vec![EcgLead::new("I", vec![0; 10], 0.001)], bad).is_err(),
+                EcgRecording::new(vec![EcgLead::new("I", vec![0; 10], 0.001).unwrap()], bad)
+                    .is_err(),
                 "rate {bad} accepted"
             );
         }
-        let r = EcgRecording::new(vec![EcgLead::new("I", vec![0; 5000], 0.001)], 500.0).unwrap();
+        let r = EcgRecording::new(
+            vec![EcgLead::new("I", vec![0; 5000], 0.001).unwrap()],
+            500.0,
+        )
+        .unwrap();
         assert_eq!(r.duration_secs(), 10.0);
+    }
+
+    #[test]
+    fn lead_constructors_reject_non_finite_floats() {
+        for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(
+                EcgLead::new("II", vec![0, 1], bad).is_err(),
+                "sensitivity {bad} accepted"
+            );
+            assert!(
+                EcgLead::from_i16("II", &[0, 1], bad).is_err(),
+                "from_i16 sensitivity {bad} accepted"
+            );
+        }
+        assert!(EcgLead::from_i16("II", &[0, -5], 0.001).is_ok());
+        // Correction factor / baseline / filters ride public fields, so
+        // the recording constructor is the backstop.
+        for mutate in [
+            "sensitivity",
+            "correction",
+            "baseline",
+            "filter_low",
+            "filter_high",
+            "notch",
+        ] {
+            let mut lead = EcgLead::new("II", vec![0, 1], 0.001).unwrap();
+            match mutate {
+                "sensitivity" => lead.sensitivity = f64::NAN,
+                "correction" => lead.correction_factor = f64::INFINITY,
+                "baseline" => lead.baseline = f64::NAN,
+                "filter_low" => lead.filter_low_hz = Some(f64::NAN),
+                "filter_high" => lead.filter_high_hz = Some(f64::INFINITY),
+                _ => lead.notch_hz = Some(f64::NAN),
+            }
+            assert!(
+                EcgRecording::new(vec![lead], 500.0).is_err(),
+                "{mutate} accepted"
+            );
+        }
     }
 
     #[test]

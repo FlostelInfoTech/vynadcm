@@ -274,7 +274,11 @@ impl Command {
         if let Some(d) = &self.move_destination {
             ds.put_text(tags::MOVE_DESTINATION, Vr::Ae, d.clone());
         }
-        ds.put_u16_single(tags::PRIORITY, self.priority);
+        // PS3.7: Priority (0000,0700) is a request-only element;
+        // responses and C-CANCEL-RQ must not carry it.
+        if !self.is_response() {
+            ds.put_u16_single(tags::PRIORITY, self.priority);
+        }
         ds.put_u16_single(tags::COMMAND_DATA_SET_TYPE, self.data_set_type);
         if let Some(s) = self.status {
             ds.put_u16_single(tags::STATUS, s);
@@ -409,20 +413,32 @@ impl Command {
         c
     }
 
+    /// DIMSE priority must be 0 (medium), 1 (high) or 2 (low).
+    fn check_priority(priority: u16) -> Result<()> {
+        if priority <= priority::LOW {
+            Ok(())
+        } else {
+            Err(Error::BadCommand(format!(
+                "priority {priority} out of range 0..=2"
+            )))
+        }
+    }
+
     /// C-STORE-RQ (dataset always follows).
     pub fn store_rq(
         message_id: u16,
         priority: u16,
         sop_class_uid: impl Into<String>,
         sop_instance_uid: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self> {
+        Self::check_priority(priority)?;
         let mut c = Self::base(command_field::C_STORE_RQ);
         c.message_id = Some(message_id);
         c.priority = priority;
         c.affected_sop_class_uid = Some(sop_class_uid.into());
         c.affected_sop_instance_uid = Some(sop_instance_uid.into());
         c.data_set_type = DATA_SET_PRESENT;
-        c
+        Ok(c)
     }
 
     /// C-STORE-RSP.
@@ -441,13 +457,18 @@ impl Command {
     }
 
     /// C-FIND-RQ (dataset always follows).
-    pub fn find_rq(message_id: u16, priority: u16, sop_class_uid: impl Into<String>) -> Self {
+    pub fn find_rq(
+        message_id: u16,
+        priority: u16,
+        sop_class_uid: impl Into<String>,
+    ) -> Result<Self> {
+        Self::check_priority(priority)?;
         let mut c = Self::base(command_field::C_FIND_RQ);
         c.message_id = Some(message_id);
         c.priority = priority;
         c.affected_sop_class_uid = Some(sop_class_uid.into());
         c.data_set_type = DATA_SET_PRESENT;
-        c
+        Ok(c)
     }
 
     /// C-FIND-RSP; `with_dataset` for pending matches.
@@ -483,14 +504,15 @@ impl Command {
         priority: u16,
         sop_class_uid: impl Into<String>,
         destination: impl Into<String>,
-    ) -> Self {
+    ) -> Result<Self> {
+        Self::check_priority(priority)?;
         let mut c = Self::base(command_field::C_MOVE_RQ);
         c.message_id = Some(message_id);
         c.priority = priority;
         c.affected_sop_class_uid = Some(sop_class_uid.into());
         c.move_destination = Some(destination.into());
         c.data_set_type = DATA_SET_PRESENT;
-        c
+        Ok(c)
     }
 
     /// C-MOVE-RSP / C-GET-RSP with sub-operation counts.
@@ -521,13 +543,18 @@ impl Command {
     }
 
     /// C-GET-RQ (dataset always follows).
-    pub fn get_rq(message_id: u16, priority: u16, sop_class_uid: impl Into<String>) -> Self {
+    pub fn get_rq(
+        message_id: u16,
+        priority: u16,
+        sop_class_uid: impl Into<String>,
+    ) -> Result<Self> {
+        Self::check_priority(priority)?;
         let mut c = Self::base(command_field::C_GET_RQ);
         c.message_id = Some(message_id);
         c.priority = priority;
         c.affected_sop_class_uid = Some(sop_class_uid.into());
         c.data_set_type = DATA_SET_PRESENT;
-        c
+        Ok(c)
     }
 
     /// N-CREATE-RQ.
@@ -774,9 +801,9 @@ mod tests {
     fn command_round_trips() {
         for cmd in [
             Command::echo_rq(7),
-            Command::store_rq(1, priority::MEDIUM, "1.2.3", "1.2.3.4"),
-            Command::find_rq(2, priority::HIGH, "1.2.840.10008.5.1.4.1.2.2.1"),
-            Command::move_rq(3, priority::LOW, "1.2.3", "DEST_AE"),
+            Command::store_rq(1, priority::MEDIUM, "1.2.3", "1.2.3.4").unwrap(),
+            Command::find_rq(2, priority::HIGH, "1.2.840.10008.5.1.4.1.2.2.1").unwrap(),
+            Command::move_rq(3, priority::LOW, "1.2.3", "DEST_AE").unwrap(),
             Command::n_create_rq(4, "1.2.3", "1.2.3.4", true),
             Command::n_event_report_rq(5, "1.2.3", "1.2.3.4", 1, false),
         ] {
@@ -812,18 +839,18 @@ mod tests {
         let with_class = [
             Command::echo_rq(1),
             Command::echo_rsp(1, status::SUCCESS),
-            Command::store_rq(1, priority::MEDIUM, "1.2.3", "1.2.3.4"),
+            Command::store_rq(1, priority::MEDIUM, "1.2.3", "1.2.3.4").unwrap(),
             Command::store_rsp(
                 1,
                 Some("1.2.3".into()),
                 Some("1.2.3.4".into()),
                 status::SUCCESS,
             ),
-            Command::find_rq(1, priority::MEDIUM, "1.2.3"),
+            Command::find_rq(1, priority::MEDIUM, "1.2.3").unwrap(),
             Command::find_rsp(1, Some("1.2.3".into()), status::SUCCESS, false),
-            Command::move_rq(1, priority::MEDIUM, "1.2.3", "DEST"),
+            Command::move_rq(1, priority::MEDIUM, "1.2.3", "DEST").unwrap(),
             Command::move_get_rsp(true, 1, Some("1.2.3".into()), status::SUCCESS, 0, 0, 0, 0),
-            Command::get_rq(1, priority::MEDIUM, "1.2.3"),
+            Command::get_rq(1, priority::MEDIUM, "1.2.3").unwrap(),
             Command::n_create_rq(1, "1.2.3", "1.2.3.4", false),
             Command::n_create_rsp(
                 1,
@@ -914,5 +941,45 @@ mod tests {
         let rsp = Command::find_rsp(1, None, status::PENDING, true);
         assert!(rsp.has_dataset() && rsp.is_response());
         assert_eq!(rsp.name(), "C-FIND-RSP");
+    }
+
+    #[test]
+    fn rq_constructors_reject_bad_priority() {
+        // Only the CLI validated priority before; library-built
+        // requests with priority 3+ went on the wire as-is.
+        for p in [priority::MEDIUM, priority::HIGH, priority::LOW] {
+            assert!(Command::store_rq(1, p, "1.2.3", "1.2.3.4").is_ok());
+            assert!(Command::find_rq(1, p, "1.2.3").is_ok());
+            assert!(Command::move_rq(1, p, "1.2.3", "DEST").is_ok());
+            assert!(Command::get_rq(1, p, "1.2.3").is_ok());
+        }
+        for bad in [3, 99, u16::MAX] {
+            assert!(Command::store_rq(1, bad, "1.2.3", "1.2.3.4").is_err());
+            assert!(Command::find_rq(1, bad, "1.2.3").is_err());
+            assert!(Command::move_rq(1, bad, "1.2.3", "DEST").is_err());
+            assert!(Command::get_rq(1, bad, "1.2.3").is_err());
+        }
+    }
+
+    #[test]
+    fn responses_and_cancel_omit_priority() {
+        // PS3.7: (0000,0700) is request-only.
+        for rsp in [
+            Command::echo_rsp(1, status::SUCCESS),
+            Command::store_rsp(1, Some("1.2.3".into()), None, status::SUCCESS),
+            Command::find_rsp(1, Some("1.2.3".into()), status::SUCCESS, false),
+            Command::move_get_rsp(true, 1, Some("1.2.3".into()), status::SUCCESS, 0, 0, 0, 0),
+            Command::n_create_rsp(1, Some("1.2.3".into()), None, status::SUCCESS),
+            Command::cancel_rq(1),
+        ] {
+            assert!(
+                rsp.to_dataset().get(tags::PRIORITY).is_none(),
+                "{} carries Priority",
+                rsp.name()
+            );
+        }
+        // Requests keep it.
+        let rq = Command::find_rq(1, priority::HIGH, "1.2.3").unwrap();
+        assert_eq!(rq.to_dataset().uint16(tags::PRIORITY), Some(priority::HIGH));
     }
 }

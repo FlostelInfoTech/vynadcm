@@ -335,11 +335,28 @@ fn encode_primitive(
             if vr != Vr::Pn {
                 return Err(unencodable(format!("person names with {vr}")));
             }
-            // A backslash inside one name would decode as two names
-            // (arity corruption); hand-built structs can hold one.
+            // A structural character inside one component would decode
+            // as extra components/groups/names (arity corruption);
+            // hand-built structs can hold them, so check components.
             for name in names {
-                if name.to_dicom_string().contains('\\') {
-                    return Err(unencodable("backslash inside person name".into()));
+                for group in [&name.alphabetic]
+                    .into_iter()
+                    .chain(name.ideographic.as_ref())
+                    .chain(name.phonetic.as_ref())
+                {
+                    for part in [
+                        &group.family,
+                        &group.given,
+                        &group.middle,
+                        &group.prefix,
+                        &group.suffix,
+                    ] {
+                        if part.chars().any(|c| matches!(c, '\\' | '=' | '^')) {
+                            return Err(unencodable(format!(
+                                "separator or backslash (= ^ \\) inside person name component {part:?}"
+                            )));
+                        }
+                    }
                 }
             }
             let mut raw = Vec::new();
@@ -526,6 +543,30 @@ mod tests {
     use vyna_dcm_core::{DataElement, PersonName, tags};
 
     #[test]
+    fn japanese_multivalued_text_round_trips() {
+        // Each value must close its ISO-2022-JP shift state
+        // (`ESC ( B`), or the backslash join lands inside JIS X 0208
+        // bytes and the values merge into mojibake on decode.
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::texts(
+            tags::SPECIFIC_CHARACTER_SET,
+            Vr::Cs,
+            vec!["ISO 2022 IR 13".to_string(), "ISO 2022 IR 87".to_string()],
+        ));
+        ds.insert(DataElement::texts(
+            tags::MANUFACTURER,
+            Vr::Lo,
+            vec!["山田".to_string(), "太郎".to_string()],
+        ));
+        let bytes = encode_dataset(&ds, TransferSyntax::ExplicitVrLittleEndian).unwrap();
+        let back = decode_dataset(&bytes, TransferSyntax::ExplicitVrLittleEndian).unwrap();
+        assert_eq!(
+            back.strings(tags::MANUFACTURER),
+            Some(["山田".to_string(), "太郎".to_string()].as_slice())
+        );
+    }
+
+    #[test]
     fn person_name_backslash_is_unencodable() {
         // A backslash inside one name would decode as two names.
         let mut bad = PersonName::parse("Doe^Jane");
@@ -533,6 +574,29 @@ mod tests {
         let ds = DataSet::new().with(DataElement::person_name(tags::PATIENT_NAME, vec![bad]));
         let err = encode_dataset(&ds, TransferSyntax::ExplicitVrLittleEndian).unwrap_err();
         assert!(err.to_string().contains("backslash"), "{err}");
+    }
+
+    #[test]
+    fn person_name_separators_in_components_are_unencodable() {
+        // `=`/`^` inside one component would decode as extra
+        // groups/components (arity corruption), like backslash.
+        for (field, bad) in [("family", "A=B"), ("given", "C^D")] {
+            let mut name = PersonName::parse("Doe^Jane");
+            if field == "family" {
+                name.alphabetic.family = bad.to_string();
+            } else {
+                name.alphabetic.given = bad.to_string();
+            }
+            let ds = DataSet::new().with(DataElement::person_name(tags::PATIENT_NAME, vec![name]));
+            let err = encode_dataset(&ds, TransferSyntax::ExplicitVrLittleEndian).unwrap_err();
+            assert!(err.to_string().contains("separator"), "{bad}: {err}");
+        }
+        // Clean names still encode.
+        let ds = DataSet::new().with(DataElement::person_name(
+            tags::PATIENT_NAME,
+            vec![PersonName::parse("Adams^John^Robert^Dr^Jr=Yamada^Taro")],
+        ));
+        encode_dataset(&ds, TransferSyntax::ExplicitVrLittleEndian).unwrap();
     }
 
     fn kitchen_sink() -> DataSet {

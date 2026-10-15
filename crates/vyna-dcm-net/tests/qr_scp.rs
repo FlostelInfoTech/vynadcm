@@ -184,7 +184,7 @@ async fn find_missing_level_fails() {
 async fn find_without_dataset(assoc: &mut Association, sop: &str) -> (u16, bool) {
     let ctx = assoc.context_for(sop).unwrap().clone();
     let id = assoc.next_message_id();
-    let mut rq = Command::find_rq(id, 0, sop);
+    let mut rq = Command::find_rq(id, 0, sop).unwrap();
     rq.data_set_type = DATA_SET_NULL;
     assoc.send(ctx.id, &rq, None).await.unwrap();
     let mut saw_pending = false;
@@ -410,11 +410,11 @@ async fn send_flag_mismatch_is_rejected() {
         .clone();
     let id = assoc.next_message_id();
     // Flag says dataset, none given.
-    let rq = Command::find_rq(id, 0, sop_class::STUDY_ROOT_FIND);
+    let rq = Command::find_rq(id, 0, sop_class::STUDY_ROOT_FIND).unwrap();
     let err = assoc.send(ctx.id, &rq, None).await.unwrap_err();
     assert!(matches!(err, Error::BadCommand(_)), "{err:?}");
     // Dataset given, flag says none.
-    let mut rq = Command::find_rq(id, 0, sop_class::STUDY_ROOT_FIND);
+    let mut rq = Command::find_rq(id, 0, sop_class::STUDY_ROOT_FIND).unwrap();
     rq.data_set_type = DATA_SET_NULL;
     let err = assoc
         .send(ctx.id, &rq, Some(&DataSet::new()))
@@ -469,7 +469,7 @@ async fn get_survives_stray_cancel_for_other_op() {
     assoc
         .send(
             ctx.id,
-            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET),
+            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET).unwrap(),
             Some(&q),
         )
         .await
@@ -529,7 +529,7 @@ async fn stray_get_setup() -> (PathBuf, Association, u8, u8, u16, u16) {
     assoc
         .send(
             ctx,
-            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET),
+            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET).unwrap(),
             Some(&q),
         )
         .await
@@ -569,7 +569,7 @@ async fn get_stray_byte_flood_aborts() {
         Value::Bytes(vec![7u8; 5 * 1024 * 1024]),
     ));
     for i in 0..13u16 {
-        let rq = Command::store_rq(500 + i, 0, sop_class::CT_IMAGE, "1.2.9.99");
+        let rq = Command::store_rq(500 + i, 0, sop_class::CT_IMAGE, "1.2.9.99").unwrap();
         assoc.send(st_ctx, &rq, Some(&ds)).await.unwrap();
     }
     assert!(assoc.recv().await.is_err(), "flooded GET must abort");
@@ -747,7 +747,7 @@ async fn release_during_get_is_clean() {
     assoc
         .send(
             ctx.id,
-            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET),
+            &Command::get_rq(id, 0, sop_class::STUDY_ROOT_GET).unwrap(),
             Some(&q),
         )
         .await

@@ -8,9 +8,9 @@
 
 use std::collections::VecDeque;
 use std::time::Duration;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::net::TcpStream;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use vyna_dcm_codec::{decode_dataset, encode_dataset};
 use vyna_dcm_core::{APPLICATION_CONTEXT_NAME, TransferSyntax};
 
@@ -42,6 +42,13 @@ pub const MAX_STASHED_EVENTS: usize = 16;
 /// budget, so the combined worst case is twice this.)
 pub const MAX_STASHED_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Maximum reassembled DIMSE *command set* bytes across all its PDVs.
+/// Command sets are ~10^2 bytes (a group-length-prefixed group
+/// `0x0000`); sharing the 1 GiB dataset budget let a peer burn a
+/// gigabyte of command reassembly before decode failed. Past this
+/// [`Association::recv`] fails with [`Error::MessageTooLarge`].
+pub const MAX_COMMAND_BYTES: u64 = 64 * 1024;
+
 /// Options for requesting (SCU) or accepting (SCP) associations.
 #[derive(Clone, Debug)]
 #[non_exhaustive]
@@ -70,6 +77,14 @@ pub struct AssociationOptions {
     /// this the association aborts with [`Error::TooManyResponses`],
     /// so a rogue peer PENDING forever cannot hold the call forever.
     pub max_pending_responses: u32,
+    /// Per-PDU write timeout: a zero-window (or otherwise stalled)
+    /// peer must not hold a send path forever.
+    pub write_timeout: Duration,
+    /// Cumulative bound for reassembling one DIMSE message across all
+    /// its PDVs: the per-PDU read timeout resets on every PDU, so
+    /// without this a slow-drip peer holds [`Association::recv`]
+    /// forever. Past it `recv` fails with [`Error::Timeout`].
+    pub max_message_duration: Duration,
 }
 
 impl Association {
@@ -104,6 +119,8 @@ impl Default for AssociationOptions {
             max_incoming_pdu: 64 * 1024 * 1024,
             max_message_bytes: 1024 * 1024 * 1024,
             max_pending_responses: crate::MAX_PENDING_RESPONSES,
+            write_timeout: Duration::from_secs(30),
+            max_message_duration: Duration::from_secs(3600),
         }
     }
 }
@@ -153,6 +170,14 @@ pub struct Association {
     read_timeout: Duration,
     max_pending_responses: u32,
     next_id: u16,
+    write_timeout: Duration,
+    max_message_duration: Duration,
+    /// In-progress PDU read, preserved across `poll_event` timeouts:
+    /// bytes already consumed stay here so the next read continues
+    /// where the abandoned one stopped instead of desyncing.
+    partial_hdr: [u8; 6],
+    partial_hdr_len: usize,
+    partial_payload: Vec<u8>,
     /// Pushback queue: events seen by a cancel poll that belong to the
     /// dispatch loop (e.g. RELEASE-RQ mid-FIND), each with its dataset
     /// bytes for the [`MAX_STASHED_BYTES`] budget. [`Association::recv`]
@@ -199,6 +224,13 @@ impl Association {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
+        if proposed.is_empty() {
+            return Err(Error::BadPdu("no presentation contexts proposed".into()));
+        }
+        // Same ID rules the SCP enforces (PS3.8 §9.3.2.2), checked
+        // locally so a buggy caller fails fast instead of emitting a
+        // malformed A-ASSOCIATE-RQ the peer rejects opaquely.
+        let mut seen = [false; 256];
         for pc in &proposed {
             if pc.id == 0 || pc.id % 2 == 0 {
                 return Err(Error::BadPdu(format!(
@@ -206,6 +238,13 @@ impl Association {
                     pc.id
                 )));
             }
+            if seen[pc.id as usize] {
+                return Err(Error::BadPdu(format!(
+                    "duplicate presentation context id {}",
+                    pc.id
+                )));
+            }
+            seen[pc.id as usize] = true;
             if pc.transfer_syntaxes.is_empty() {
                 return Err(Error::BadPdu(
                     "presentation context without transfer syntaxes".into(),
@@ -225,6 +264,11 @@ impl Association {
             max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
             max_pending_responses: opts.max_pending_responses,
+            write_timeout: opts.write_timeout,
+            max_message_duration: opts.max_message_duration,
+            partial_hdr: [0; 6],
+            partial_hdr_len: 0,
+            partial_payload: Vec::new(),
             next_id: 1,
             pending: VecDeque::new(),
             pdu_queue: VecDeque::new(),
@@ -241,9 +285,9 @@ impl Association {
             role_selection: Vec::new(),
             user_identity: None,
         };
-        crate::pdu::write_pdu(&mut this.stream, &Pdu::AssociateRq(rq)).await?;
+        this.write_pdu(&Pdu::AssociateRq(rq)).await?;
         match this.read_pdu().await? {
-            Pdu::AssociateAc(ac) => this.adopt_ac(ac, &proposed)?,
+            Pdu::AssociateAc(ac) => this.adopt_ac(ac, &proposed, &opts.application_context)?,
             Pdu::AssociateRj(rj) => {
                 return Err(Error::Rejected {
                     result: rj.result,
@@ -268,20 +312,59 @@ impl Association {
     }
 
     /// Build the SCU side from an accepted AC (also used by tests).
-    fn adopt_ac(&mut self, ac: AssociateAc, proposed: &[ProposedContext]) -> Result<()> {
+    ///
+    /// Validated like the SCP validates the RQ: a mismatched
+    /// application context, an unknown or duplicate context ID, or a
+    /// transfer syntax we never proposed fails the association
+    /// instead of silently narrowing it to whatever is left.
+    fn adopt_ac(
+        &mut self,
+        ac: AssociateAc,
+        proposed: &[ProposedContext],
+        application_context: &str,
+    ) -> Result<()> {
+        if ac.application_context != application_context {
+            return Err(Error::BadPdu(format!(
+                "A-ASSOCIATE-AC application context {} differs from proposed {application_context}",
+                ac.application_context
+            )));
+        }
         self.info.peer_max_pdu = ac.max_pdu_len;
+        let mut seen = [false; 256];
         for acc in &ac.presentation_contexts {
             if acc.result != 0 {
                 continue;
             }
-            let Some(ts_uid) = &acc.transfer_syntax else {
-                continue;
-            };
-            let Some(ts) = TransferSyntax::from_uid(ts_uid) else {
-                continue;
-            };
+            if seen[acc.id as usize] {
+                return Err(Error::BadPdu(format!(
+                    "duplicate accepted presentation context id {}",
+                    acc.id
+                )));
+            }
+            seen[acc.id as usize] = true;
             let Some(prop) = proposed.iter().find(|p| p.id == acc.id) else {
-                continue;
+                return Err(Error::BadPdu(format!(
+                    "accepted unproposed presentation context id {}",
+                    acc.id
+                )));
+            };
+            let Some(ts_uid) = &acc.transfer_syntax else {
+                return Err(Error::BadPdu(format!(
+                    "accepted context {} without transfer syntax",
+                    acc.id
+                )));
+            };
+            if !prop.transfer_syntaxes.iter().any(|t| t == ts_uid) {
+                return Err(Error::BadPdu(format!(
+                    "accepted context {} with unproposed transfer syntax {ts_uid}",
+                    acc.id
+                )));
+            }
+            let Some(ts) = TransferSyntax::from_uid(ts_uid) else {
+                return Err(Error::BadPdu(format!(
+                    "accepted context {} with unknown transfer syntax {ts_uid}",
+                    acc.id
+                )));
             };
             self.contexts.push(NegotiatedContext {
                 id: acc.id,
@@ -314,6 +397,11 @@ impl Association {
             max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
             max_pending_responses: opts.max_pending_responses,
+            write_timeout: opts.write_timeout,
+            max_message_duration: opts.max_message_duration,
+            partial_hdr: [0; 6],
+            partial_hdr_len: 0,
+            partial_payload: Vec::new(),
             next_id: 1,
             pending: VecDeque::new(),
             pdu_queue: VecDeque::new(),
@@ -379,6 +467,19 @@ impl Association {
                 "command data_set_type disagrees with dataset presence".into(),
             ));
         }
+        // Priority is validated at the RQ constructors, but a
+        // hand-built command must not slip an invalid one past them.
+        use crate::dimse::command_field as CF;
+        if matches!(
+            command.field,
+            CF::C_STORE_RQ | CF::C_FIND_RQ | CF::C_MOVE_RQ | CF::C_GET_RQ
+        ) && command.priority > crate::priority::LOW
+        {
+            return Err(Error::BadCommand(format!(
+                "priority {} out of range 0..=2",
+                command.priority
+            )));
+        }
         let ctx = self
             .context_by_id(context_id)
             .ok_or(Error::UnknownContext(context_id))?
@@ -405,27 +506,36 @@ impl Association {
                     is_last: i + 1 == n,
                     data: chunk,
                 };
-                crate::pdu::write_pdu(&mut self.stream, &Pdu::Data(vec![pdv])).await?;
+                self.write_pdu(&Pdu::Data(vec![pdv])).await?;
             }
         }
         Ok(())
     }
 
     /// Largest P-DATA-TF payload we may emit (peer limit or 1 MiB).
+    ///
+    /// PS3.8: never emit a PDU larger than the peer declared — even a
+    /// tiny declared maximum is honored (fragmenting down to 1-byte
+    /// PDVs), since oversize PDUs are a protocol violation.
     fn send_max(&self) -> usize {
         let cap = if self.info.peer_max_pdu == 0 {
             1024 * 1024
         } else {
             self.info.peer_max_pdu
         };
-        (cap as usize).saturating_sub(12).max(64)
+        // 12 bytes of PDU + PDV header precede every payload.
+        (cap as usize).saturating_sub(12).max(1)
     }
 
     /// Receive one complete DIMSE message (reassembling PDVs), or a release.
+    ///
+    /// One message gets one cumulative [`AssociationOptions::max_message_duration`]
+    /// across all its PDVs on top of the per-PDU read timeout.
     pub async fn recv(&mut self) -> Result<DimseEvent> {
         if let Some((ev, _)) = self.pending.pop_front() {
             return Ok(ev);
         }
+        let deadline = Instant::now() + self.max_message_duration;
         let mut cmd_buf: Vec<u8> = Vec::new();
         let mut cmd_ctx: Option<u8> = None;
         let mut command: Option<Command> = None;
@@ -433,7 +543,7 @@ impl Association {
         loop {
             let pdv = match self.pdu_queue.pop_front() {
                 Some(p) => p,
-                None => match self.read_pdu().await? {
+                None => match self.read_pdu_capped(deadline).await? {
                     Pdu::Data(pdvs) => {
                         // decode_data rejects empty P-DATA-TFs, so the
                         // queue is non-empty and the loop makes progress.
@@ -441,7 +551,7 @@ impl Association {
                         continue;
                     }
                     Pdu::ReleaseRq => {
-                        crate::pdu::write_pdu(&mut self.stream, &Pdu::ReleaseRsp).await?;
+                        self.write_pdu(&Pdu::ReleaseRsp).await?;
                         return Ok(DimseEvent::Released);
                     }
                     Pdu::Abort { source, reason } => {
@@ -472,9 +582,9 @@ impl Association {
                     }
                     _ => cmd_ctx = Some(pdv.context_id),
                 }
-                if cmd_buf.len() as u64 + pdv.data.len() as u64 > self.max_message_bytes {
+                if cmd_buf.len() as u64 + pdv.data.len() as u64 > MAX_COMMAND_BYTES {
                     return Err(Error::MessageTooLarge {
-                        limit: self.max_message_bytes,
+                        limit: MAX_COMMAND_BYTES,
                     });
                 }
                 cmd_buf.extend_from_slice(&pdv.data);
@@ -517,11 +627,10 @@ impl Association {
 
     /// Receive one event, waiting at most `wait`; `Ok(None)` on timeout.
     ///
-    /// Used to poll for C-CANCEL between pending responses. Timeout
-    /// soundness: a timeout abandons a partial read, so callers must
-    /// only poll while the peer can solely send small single-PDU
-    /// messages (C-CANCEL is ~30 bytes); anything larger in flight
-    /// risks association desync, which then fails loudly.
+    /// Used to poll for C-CANCEL between pending responses. A timeout
+    /// abandons no data: the in-progress PDU read is preserved in
+    /// `partial_*`, so a message arriving in segments (e.g. a C-CANCEL
+    /// split across polls) resumes where it stopped.
     pub async fn poll_event(&mut self, wait: Duration) -> Result<Option<DimseEvent>> {
         if let Some((ev, _)) = self.pending.pop_front() {
             return Ok(Some(ev));
@@ -555,10 +664,18 @@ impl Association {
     }
 
     /// Clean release: RELEASE-RQ then await RELEASE-RSP.
+    ///
+    /// A simultaneous peer RELEASE-RQ (PS3.8 §9.3.8 release collision)
+    /// is answered with RELEASE-RSP and counts as clean completion,
+    /// not an error.
     pub async fn release(&mut self) -> Result<()> {
-        crate::pdu::write_pdu(&mut self.stream, &Pdu::ReleaseRq).await?;
+        self.write_pdu(&Pdu::ReleaseRq).await?;
         match self.read_pdu().await? {
             Pdu::ReleaseRsp => Ok(()),
+            Pdu::ReleaseRq => {
+                self.write_pdu(&Pdu::ReleaseRsp).await?;
+                Ok(())
+            }
             Pdu::Abort { source, reason } => Err(Error::Aborted {
                 origin: source,
                 reason,
@@ -572,16 +689,80 @@ impl Association {
 
     /// Send A-ABORT (best effort; errors swallowed except I/O).
     pub async fn abort(&mut self, source: u8, reason: u8) -> Result<()> {
-        crate::pdu::write_pdu(&mut self.stream, &Pdu::Abort { source, reason }).await
+        self.write_pdu(&Pdu::Abort { source, reason }).await
+    }
+
+    /// One PDU write bounded by [`AssociationOptions::write_timeout`].
+    async fn write_pdu(&mut self, pdu: &Pdu) -> Result<()> {
+        crate::pdu::write_pdu_timeout(&mut self.stream, pdu, self.write_timeout).await
     }
 
     async fn read_pdu(&mut self) -> Result<Pdu> {
-        timeout(
-            self.read_timeout,
-            crate::pdu::read_pdu(&mut self.stream, self.max_incoming_pdu),
-        )
-        .await
-        .map_err(|_| Error::Timeout("PDU read"))?
+        timeout(self.read_timeout, self.read_pdu_inner())
+            .await
+            .map_err(|_| Error::Timeout("PDU read"))?
+    }
+
+    /// One PDU read bounded by the per-PDU read timeout *and* the
+    /// message reassembly `deadline`.
+    async fn read_pdu_capped(&mut self, deadline: Instant) -> Result<Pdu> {
+        timeout_at(deadline, self.read_pdu())
+            .await
+            .map_err(|_| Error::Timeout("DIMSE message"))?
+    }
+
+    /// Resumable PDU read: bytes already consumed are kept in
+    /// `partial_*`, so a `poll_event` timeout abandons no data and the
+    /// next call continues where this one stopped.
+    async fn read_pdu_inner(&mut self) -> Result<Pdu> {
+        while self.partial_hdr_len < 6 {
+            let n = self
+                .stream
+                .read(&mut self.partial_hdr[self.partial_hdr_len..])
+                .await?;
+            if n == 0 {
+                return Err(Error::BadPdu("connection closed mid-PDU".into()));
+            }
+            self.partial_hdr_len += n;
+        }
+        let (typ, len) = (
+            self.partial_hdr[0],
+            u32::from_be_bytes([
+                self.partial_hdr[2],
+                self.partial_hdr[3],
+                self.partial_hdr[4],
+                self.partial_hdr[5],
+            ]),
+        );
+        if len > self.max_incoming_pdu {
+            self.reset_partial();
+            return Err(Error::BadPdu(format!(
+                "PDU length {len} exceeds cap {}",
+                self.max_incoming_pdu
+            )));
+        }
+        let total = len as usize;
+        self.partial_payload
+            .reserve(total.saturating_sub(self.partial_payload.len()));
+        while self.partial_payload.len() < total {
+            let mut chunk = [0u8; 8192];
+            let want = (total - self.partial_payload.len()).min(chunk.len());
+            let n = self.stream.read(&mut chunk[..want]).await?;
+            if n == 0 {
+                return Err(Error::BadPdu("connection closed mid-PDU".into()));
+            }
+            self.partial_payload.extend_from_slice(&chunk[..n]);
+        }
+        // Take the payload out before decoding: a malformed PDU
+        // still consumes its bytes, so the next read starts fresh.
+        let payload = std::mem::take(&mut self.partial_payload);
+        self.partial_hdr_len = 0;
+        crate::pdu::decode_pdu(typ, &payload)
+    }
+
+    fn reset_partial(&mut self) {
+        self.partial_hdr_len = 0;
+        self.partial_payload.clear();
     }
 }
 
@@ -623,6 +804,11 @@ mod tests {
             max_message_bytes: opts.max_message_bytes,
             read_timeout: opts.read_timeout,
             max_pending_responses: opts.max_pending_responses,
+            write_timeout: opts.write_timeout,
+            max_message_duration: opts.max_message_duration,
+            partial_hdr: [0; 6],
+            partial_hdr_len: 0,
+            partial_payload: Vec::new(),
             next_id: u16::MAX,
             pending: VecDeque::new(),
             pdu_queue: VecDeque::new(),
@@ -794,7 +980,8 @@ mod tests {
             priority::MEDIUM,
             vyna_dcm_core::sop_class::CT_IMAGE,
             "1.2.3.4",
-        );
+        )
+        .unwrap();
         let sent = tokio::spawn(async move {
             let mut sender = sender;
             sender.send(1, &cmd, Some(&ds)).await.unwrap();
@@ -848,5 +1035,338 @@ mod tests {
             }
         }
         assert_eq!(ids, vec![Some(1), Some(2)]);
+    }
+
+    fn loopback_ctx(id: u8) -> NegotiatedContext {
+        NegotiatedContext {
+            id,
+            abstract_syntax: vyna_dcm_core::sop_class::CT_IMAGE.to_string(),
+            transfer_syntax: TransferSyntax::ExplicitVrLittleEndian,
+            transfer_syntax_uid: TransferSyntax::ExplicitVrLittleEndian.uid().to_string(),
+        }
+    }
+
+    fn loopback_info(local: &str, peer: &str) -> AssociationInfo {
+        AssociationInfo {
+            local_ae: AeTitle::new(local).unwrap(),
+            peer_ae: AeTitle::new(peer).unwrap(),
+            peer_max_pdu: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn poll_event_preserves_partial_pdu() {
+        // A C-CANCEL split across two polls: the ZERO-wait poll must
+        // return None without dropping the bytes it already consumed.
+        use tokio::io::AsyncWriteExt;
+        let (a, b) = tokio::io::duplex(65536);
+        let mut peer = a;
+        let mut assoc = Association::from_accepted(
+            Box::new(b),
+            loopback_info("SCP", "SCU"),
+            vec![loopback_ctx(1)],
+            &AssociationOptions::default(),
+        );
+        let cmd_bytes = encode_command(&Command::cancel_rq(7)).unwrap();
+        let mut frame = vec![0x04u8, 0x00];
+        frame.extend_from_slice(&((cmd_bytes.len() + 6) as u32).to_be_bytes());
+        frame.extend_from_slice(&((cmd_bytes.len() + 2) as u32).to_be_bytes());
+        frame.extend([1u8, 0x03]); // context 1, command + last
+        frame.extend_from_slice(&cmd_bytes);
+        peer.write_all(&frame[..10]).await.unwrap();
+        assert!(assoc.poll_event(Duration::ZERO).await.unwrap().is_none());
+        peer.write_all(&frame[10..]).await.unwrap();
+        match assoc.poll_event(Duration::from_secs(5)).await.unwrap() {
+            Some(DimseEvent::Message(m)) => {
+                assert_eq!(m.command.field, crate::dimse::command_field::C_CANCEL_RQ);
+                assert_eq!(m.command.message_id_rsp, Some(7));
+            }
+            other => panic!("expected C-CANCEL, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn write_timeout_bounds_stalled_peer() {
+        // Nobody reads: the send must fail, not hang on a full buffer.
+        let (a, _b) = tokio::io::duplex(1024);
+        let opts = AssociationOptions {
+            write_timeout: Duration::from_millis(100),
+            ..AssociationOptions::default()
+        };
+        let mut assoc = Association::from_accepted(
+            Box::new(a),
+            loopback_info("SCU", "SCP"),
+            vec![loopback_ctx(1)],
+            &opts,
+        );
+        let mut ds = vyna_dcm_core::DataSet::new();
+        ds.put_bytes(
+            vyna_dcm_core::tags::PIXEL_DATA,
+            vyna_dcm_core::Vr::Ow,
+            vec![0xABu8; 256 * 1024],
+        );
+        let cmd = Command::store_rq(1, crate::dimse::priority::MEDIUM, "1.2.3", "1.2.3.4").unwrap();
+        let err = assoc.send(1, &cmd, Some(&ds)).await.unwrap_err();
+        assert!(matches!(err, Error::Timeout("PDU write")), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn release_handles_simultaneous_peer_release() {
+        // PS3.8 §9.3.8 collision: both sides send RELEASE-RQ at once;
+        // both must complete cleanly.
+        let (a, b) = tokio::io::duplex(65536);
+        let opts = AssociationOptions::default();
+        let mut left =
+            Association::from_accepted(Box::new(a), loopback_info("A", "B"), vec![], &opts);
+        let mut right =
+            Association::from_accepted(Box::new(b), loopback_info("B", "A"), vec![], &opts);
+        let (r1, r2) = tokio::join!(left.release(), right.release());
+        r1.unwrap();
+        r2.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_enforces_cumulative_message_deadline() {
+        // A peer that never finishes the PDU must hit the cumulative
+        // message bound, not the (much longer) per-PDU read timeout.
+        use tokio::io::AsyncWriteExt;
+        let (a, b) = tokio::io::duplex(65536);
+        let mut peer = a;
+        let opts = AssociationOptions {
+            read_timeout: Duration::from_secs(30),
+            max_message_duration: Duration::from_millis(100),
+            ..AssociationOptions::default()
+        };
+        let mut assoc = Association::from_accepted(
+            Box::new(b),
+            loopback_info("SCP", "SCU"),
+            vec![loopback_ctx(1)],
+            &opts,
+        );
+        peer.write_all(&[0x04u8, 0x00, 0x00]).await.unwrap();
+        let t0 = std::time::Instant::now();
+        let err = assoc.recv().await.unwrap_err();
+        assert!(matches!(err, Error::Timeout("DIMSE message")), "{err:?}");
+        assert!(t0.elapsed() < Duration::from_secs(30));
+    }
+
+    #[test]
+    fn tiny_peer_max_pdu_is_respected() {
+        // PS3.8: emitted PDUs must fit the peer's declared maximum,
+        // however small (12 bytes of PDU + PDV header overhead).
+        let opts = AssociationOptions::default();
+        let (a, _b) = tokio::io::duplex(64);
+        let mut assoc =
+            Association::from_accepted(Box::new(a), loopback_info("SCU", "SCP"), vec![], &opts);
+        assoc.info.peer_max_pdu = 20;
+        assert_eq!(assoc.send_max(), 8);
+        assoc.info.peer_max_pdu = 13;
+        assert_eq!(assoc.send_max(), 1);
+        assoc.info.peer_max_pdu = 0;
+        assert_eq!(assoc.send_max(), 1024 * 1024 - 12);
+    }
+
+    #[tokio::test]
+    async fn tiny_peer_max_pdu_still_round_trips() {
+        // 8-byte PDV payloads must reassemble into the intact message.
+        let (a, b) = tokio::io::duplex(65536);
+        let opts = AssociationOptions::default();
+        let mut sender = Association::from_accepted(
+            Box::new(a),
+            loopback_info("SCU", "SCP"),
+            vec![loopback_ctx(1)],
+            &opts,
+        );
+        sender.info.peer_max_pdu = 20;
+        let mut receiver = Association::from_accepted(
+            Box::new(b),
+            loopback_info("SCP", "SCU"),
+            vec![loopback_ctx(1)],
+            &opts,
+        );
+        let mut ds = vyna_dcm_core::DataSet::new();
+        ds.put_bytes(
+            vyna_dcm_core::tags::PIXEL_DATA,
+            vyna_dcm_core::Vr::Ow,
+            vec![0xCDu8; 300],
+        );
+        let cmd = Command::store_rq(1, crate::dimse::priority::MEDIUM, "1.2.3", "1.2.3.4").unwrap();
+        sender.send(1, &cmd, Some(&ds)).await.unwrap();
+        drop(sender);
+        match receiver.recv().await.unwrap() {
+            DimseEvent::Message(m) => assert_eq!(m.dataset.unwrap(), ds),
+            DimseEvent::Released => panic!("unexpected release"),
+        }
+    }
+
+    #[tokio::test]
+    async fn command_reassembly_has_dedicated_budget() {
+        // A 70 KiB command stream must trip the 64 KiB command budget,
+        // not accumulate toward the 1 GiB dataset budget.
+        let (a, b) = tokio::io::duplex(1024 * 1024);
+        let mut w = a;
+        let chunk = vec![0x55u8; 8192];
+        let mut pdvs = Vec::new();
+        for i in 0..9 {
+            pdvs.push(Pdv {
+                context_id: 1,
+                is_command: true,
+                is_last: i == 8,
+                data: chunk.clone(),
+            });
+        }
+        crate::pdu::write_pdu(&mut w, &Pdu::Data(pdvs))
+            .await
+            .unwrap();
+        drop(w);
+        let mut receiver = Association::from_accepted(
+            Box::new(b),
+            loopback_info("SCP", "SCU"),
+            vec![loopback_ctx(1)],
+            &AssociationOptions::default(),
+        );
+        let err = receiver.recv().await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::MessageTooLarge {
+                    limit: MAX_COMMAND_BYTES
+                }
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn adopt_ac_validates_like_negotiate() {
+        use crate::pdu::AcceptedContext;
+        let opts = AssociationOptions::default();
+        let (a, _b) = tokio::io::duplex(64);
+        let mut assoc =
+            Association::from_accepted(Box::new(a), loopback_info("SCU", "SCP"), vec![], &opts);
+        let proposed = vec![crate::pdu::ProposedContext {
+            id: 1,
+            abstract_syntax: "1.2.3".into(),
+            transfer_syntaxes: vec![TransferSyntax::ExplicitVrLittleEndian.uid().to_string()],
+        }];
+        let app = opts.application_context.clone();
+        let ac = |ctxs: Vec<AcceptedContext>| crate::pdu::AssociateAc {
+            application_context: app.clone(),
+            presentation_contexts: ctxs,
+            max_pdu_len: 16384,
+            implementation_class_uid: "1.2.9".into(),
+            implementation_version: None,
+            async_ops: None,
+            role_selection: vec![],
+            user_identity_response: None,
+        };
+        let accepted = |id: u8, ts: Option<&str>| AcceptedContext {
+            id,
+            result: 0,
+            transfer_syntax: ts.map(str::to_string),
+        };
+        // Happy path + rejected entries skipped.
+        assoc.contexts.clear();
+        assoc
+            .adopt_ac(
+                ac(vec![
+                    accepted(1, Some(TransferSyntax::ExplicitVrLittleEndian.uid())),
+                    AcceptedContext {
+                        id: 3,
+                        result: 3,
+                        transfer_syntax: None,
+                    },
+                ]),
+                &proposed,
+                &app,
+            )
+            .unwrap();
+        assert_eq!(assoc.contexts.len(), 1);
+        // Wrong application context.
+        let mut bad = ac(vec![accepted(
+            1,
+            Some(TransferSyntax::ExplicitVrLittleEndian.uid()),
+        )]);
+        bad.application_context = "9.9.9".into();
+        assert!(assoc.adopt_ac(bad, &proposed, &app).is_err());
+        // Duplicate accepted ID.
+        assert!(
+            assoc
+                .adopt_ac(
+                    ac(vec![
+                        accepted(1, Some(TransferSyntax::ExplicitVrLittleEndian.uid())),
+                        accepted(1, Some(TransferSyntax::ExplicitVrLittleEndian.uid())),
+                    ]),
+                    &proposed,
+                    &app,
+                )
+                .is_err()
+        );
+        // Unproposed ID, missing TS, unproposed TS.
+        assert!(
+            assoc
+                .adopt_ac(
+                    ac(vec![accepted(
+                        3,
+                        Some(TransferSyntax::ExplicitVrLittleEndian.uid())
+                    )]),
+                    &proposed,
+                    &app,
+                )
+                .is_err()
+        );
+        assert!(
+            assoc
+                .adopt_ac(ac(vec![accepted(1, None)]), &proposed, &app)
+                .is_err()
+        );
+        assert!(
+            assoc
+                .adopt_ac(ac(vec![accepted(1, Some("9.9.9.9"))]), &proposed, &app)
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_over_rejects_bad_proposals_locally() {
+        // Duplicate IDs and empty proposals fail before any wire I/O
+        // (the peer half is never even read here).
+        let opts = AssociationOptions {
+            read_timeout: Duration::from_millis(100),
+            ..AssociationOptions::default()
+        };
+        let pc = |id: u8| crate::pdu::ProposedContext {
+            id,
+            abstract_syntax: "1.2.3".into(),
+            transfer_syntaxes: vec![TransferSyntax::ExplicitVrLittleEndian.uid().to_string()],
+        };
+        let (a, _b) = tokio::io::duplex(64);
+        let err = match Association::request_over(
+            &opts,
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            a,
+            vec![pc(1), pc(1)],
+        )
+        .await
+        {
+            Ok(_) => panic!("duplicate IDs accepted"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::BadPdu(_)), "{err:?}");
+        let (a, _b) = tokio::io::duplex(64);
+        let err = match Association::request_over(
+            &opts,
+            &AeTitle::new("SCU").unwrap(),
+            &AeTitle::new("SCP").unwrap(),
+            a,
+            Vec::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("empty proposal accepted"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, Error::BadPdu(_)), "{err:?}");
     }
 }

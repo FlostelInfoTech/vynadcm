@@ -95,6 +95,105 @@ fn same_origin(url: &str, base: &str) -> bool {
 /// OOM the client.
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024 * 1024;
 
+/// Default total request timeout (bulk transfers can legitimately
+/// take minutes).
+const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Custom TLS trust/identity (see [`DicomWebClient::with_extra_ca_pem`]).
+/// Stored as PEM so every builder composes through one rebuild path.
+#[derive(Clone, Default)]
+struct ClientTls {
+    /// Extra CA PEM: appended to Mozilla roots, or the only trust
+    /// when `private_ca_only`.
+    ca_pem: Option<Vec<u8>>,
+    /// Trust only `ca_pem` (no WebPKI roots).
+    private_ca_only: bool,
+    /// Mutual-TLS client identity: cert chain + private key PEM.
+    client_identity: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+// Manual `Debug`: key/CA PEM bytes must never reach logs.
+impl std::fmt::Debug for ClientTls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientTls")
+            .field("ca_pem", &self.ca_pem.as_ref().map(|_| "<redacted>"))
+            .field("private_ca_only", &self.private_ca_only)
+            .field(
+                "client_identity",
+                &self.client_identity.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
+}
+
+/// Classify a reqwest transport failure into the typed variants
+/// ([`Error::Timeout`] is retryable for idempotent reads;
+/// [`Error::Connect`] and [`Error::Tls`] are not transient
+/// round-trips to retry blindly).
+fn transport_error(e: reqwest::Error) -> Error {
+    if e.is_timeout() {
+        return Error::Timeout(e.to_string());
+    }
+    if has_tls_source(&e) {
+        return Error::Tls(e.to_string());
+    }
+    if e.is_connect() {
+        return Error::Connect(e.to_string());
+    }
+    Error::Http(e.to_string())
+}
+
+/// Whether the error's source chain carries a TLS failure. A failed
+/// handshake also reports `is_connect`, so this check runs first.
+/// Matching stays below the top message, which embeds the request
+/// URL — a host named `certs.example` must not misclassify a refused
+/// connection as a TLS failure.
+fn has_tls_source(e: &reqwest::Error) -> bool {
+    use std::error::Error as _;
+    // Deterministic pass: any `rustls::Error` in the chain, through
+    // `io::Error` payload layers too (handshake failures arrive
+    // double-wrapped, and `source()` does not descend into `io`
+    // payloads — only `get_ref` does).
+    let mut next = e.source();
+    while let Some(s) = next {
+        if tls_payload(s) {
+            return true;
+        }
+        next = s.source();
+    }
+    // Fallback pass: rustls failure names in chain `Debug` (pinned by
+    // `transport_tls_failure_is_typed`, whose `InvalidMessage` names
+    // no crate).
+    let mut next = e.source();
+    while let Some(s) = next {
+        let d = format!("{s:?}").to_ascii_lowercase();
+        if d.contains("rustls")
+            || d.contains("invalidmessage")
+            || d.contains("certificate")
+            || d.contains("handshake")
+            || d.contains("webpki")
+        {
+            return true;
+        }
+        next = s.source();
+    }
+    false
+}
+
+/// Whether this chain link is (or wraps, through any depth of
+/// `io::Error` payload) a `rustls::Error`.
+fn tls_payload(s: &(dyn std::error::Error + 'static)) -> bool {
+    if s.downcast_ref::<rustls::Error>().is_some() {
+        return true;
+    }
+    if let Some(io) = s.downcast_ref::<std::io::Error>()
+        && let Some(inner) = io.get_ref()
+    {
+        return tls_payload(inner);
+    }
+    false
+}
+
 /// DICOMweb client over a service base URL like
 /// `https://pacs.example/dicom-web`.
 #[derive(Clone, Debug)]
@@ -102,6 +201,10 @@ pub struct DicomWebClient {
     http: reqwest::Client,
     base_url: String,
     auth: Option<Auth>,
+    /// Per-request timeout, applied to every request builder (see
+    /// [`Self::with_timeout`]).
+    timeout: std::time::Duration,
+    tls: ClientTls,
 }
 
 impl DicomWebClient {
@@ -145,11 +248,13 @@ impl DicomWebClient {
         let _ = rustls::crypto::ring::default_provider().install_default();
         // A hung server must not hang us forever; bulk transfers
         // can legitimately take minutes, hence the budget.
-        let http = Self::build_http(std::time::Duration::from_secs(300))?;
+        let http = Self::build_http(DEFAULT_TIMEOUT, &ClientTls::default())?;
         Ok(Self {
             http,
             base_url: base,
             auth: None,
+            timeout: DEFAULT_TIMEOUT,
+            tls: ClientTls::default(),
         })
     }
 
@@ -161,16 +266,99 @@ impl DicomWebClient {
         use rustls_platform_verifier::BuilderVerifierExt;
         rustls::ClientConfig::builder()
             .with_platform_verifier()
-            .map_err(|e| Error::Http(format!("platform TLS verifier: {e}")))
+            .map_err(|e| Error::Tls(format!("platform TLS verifier: {e}")))
             .map(|b| b.with_no_client_auth())
     }
 
-    /// Shared HTTP engine (also used by [`Self::with_timeout`], which
-    /// rebuilds the immutable reqwest client).
-    fn build_http(timeout: std::time::Duration) -> Result<reqwest::Client> {
+    /// rustls client config for custom trust/identity (parity with
+    /// `vyna-dcm-net`'s `TlsConnector`): Mozilla roots plus the CA
+    /// PEM, or the CA PEM alone in private-CA mode, with an optional
+    /// mutual-TLS client identity. Custom-CA modes verify against
+    /// Mozilla roots rather than the OS store (the platform verifier
+    /// exposes no extra-roots hook).
+    fn custom_tls_config(tls: &ClientTls) -> Result<rustls::ClientConfig> {
+        use std::io::BufReader;
+        let ca_pem = tls
+            .ca_pem
+            .as_deref()
+            .ok_or_else(|| Error::Tls("no CA configured".into()))?;
+        let mut roots = rustls::RootCertStore::empty();
+        if !tls.private_ca_only {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+        let mut added = 0u32;
+        for cert in rustls_pemfile::certs(&mut BufReader::new(ca_pem)) {
+            let cert = cert.map_err(|e| Error::Tls(format!("CA PEM: {e}")))?;
+            roots
+                .add(cert)
+                .map_err(|e| Error::Tls(format!("CA PEM: {e}")))?;
+            added += 1;
+        }
+        if added == 0 {
+            return Err(Error::Tls("CA PEM holds no certificates".into()));
+        }
+        let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+        match tls.client_identity.as_ref() {
+            None => Ok(builder.with_no_client_auth()),
+            Some((cert_pem, key_pem)) => {
+                let (certs, key) = Self::parse_identity(cert_pem, key_pem)?;
+                builder
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| Error::Tls(format!("client identity: {e}")))
+            }
+        }
+    }
+
+    /// Parse a mutual-TLS client identity (cert chain + private key
+    /// PEM), requiring at least one certificate and a key.
+    fn parse_identity(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<(
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    )> {
+        use std::io::BufReader;
+        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem))
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| Error::Tls(format!("client identity certs: {e}")))?;
+        if certs.is_empty() {
+            return Err(Error::Tls("client identity holds no certificates".into()));
+        }
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem))
+            .map_err(|e| Error::Tls(format!("client identity key: {e}")))?
+            .ok_or_else(|| Error::Tls("client identity holds no private key".into()))?;
+        Ok((certs, key))
+    }
+
+    /// TLS config for the current options: platform trust by default
+    /// (plus a client identity when set), custom trust once a CA PEM
+    /// is configured.
+    fn tls_config_for(tls: &ClientTls) -> Result<rustls::ClientConfig> {
+        if tls.ca_pem.is_some() {
+            return Self::custom_tls_config(tls);
+        }
+        match tls.client_identity.as_ref() {
+            None => Self::platform_tls_config(),
+            Some((cert_pem, key_pem)) => {
+                use rustls_platform_verifier::BuilderVerifierExt;
+                let (certs, key) = Self::parse_identity(cert_pem, key_pem)?;
+                rustls::ClientConfig::builder()
+                    .with_platform_verifier()
+                    .map_err(|e| Error::Tls(format!("platform TLS verifier: {e}")))?
+                    .with_client_auth_cert(certs, key)
+                    .map_err(|e| Error::Tls(format!("client identity: {e}")))
+            }
+        }
+    }
+
+    /// Shared HTTP engine (also used by the TLS builders, which
+    /// rebuild the immutable reqwest client — timeouts apply
+    /// per-request instead, so [`Self::with_timeout`] never rebuilds).
+    fn build_http(timeout: std::time::Duration, tls: &ClientTls) -> Result<reqwest::Client> {
         reqwest::Client::builder()
             .timeout(timeout)
-            .use_preconfigured_tls(Self::platform_tls_config()?)
+            .use_preconfigured_tls(Self::tls_config_for(tls)?)
             .build()
             .map_err(|e| Error::Http(e.to_string()))
     }
@@ -193,25 +381,66 @@ impl DicomWebClient {
     }
 
     /// Override the default 300 s total request timeout.
+    ///
+    /// Infallible by construction: the timeout is stored and applied
+    /// to every request builder, so — unlike the TLS builders below —
+    /// this never rebuilds the HTTP engine and never fails.
     #[must_use]
     pub fn with_timeout(mut self, timeout: std::time::Duration) -> Self {
-        // `reqwest` clients are immutable once built; rebuild with
-        // the same settings plus the new timeout.
-        match Self::build_http(timeout) {
-            Ok(http) => self.http = http,
-            Err(e) => tracing::warn!("client rebuild for timeout failed ({e}); keeping old client"),
-        }
+        self.timeout = timeout;
         self
     }
 
+    /// Rebuild the HTTP engine after a TLS option change (the only
+    /// builders that rebuild: `reqwest` clients are immutable).
+    fn rebuild_http(&mut self) -> Result<()> {
+        self.http = Self::build_http(self.timeout, &self.tls)?;
+        Ok(())
+    }
+
+    /// Trust an additional private CA (PEM) alongside the default
+    /// roots — hospital PACS fleets behind an internal CA (parity
+    /// with `vyna-dcm-net`'s `TlsConnector::new`). Empty or
+    /// unparseable PEM is [`Error::Tls`]; last CA call wins.
+    pub fn with_extra_ca_pem(mut self, ca_pem: &[u8]) -> Result<Self> {
+        self.tls.ca_pem = Some(ca_pem.to_vec());
+        self.tls.private_ca_only = false;
+        self.rebuild_http()?;
+        Ok(self)
+    }
+
+    /// Trust *only* the given private CA PEM (no WebPKI roots) —
+    /// prefer this over [`Self::with_extra_ca_pem`] when the fleet
+    /// has an internal CA, so no public-CA-issued certificate can
+    /// impersonate the peer (parity with `TlsConnector::new_private_ca`).
+    pub fn with_private_ca_pem(mut self, ca_pem: &[u8]) -> Result<Self> {
+        self.tls.ca_pem = Some(ca_pem.to_vec());
+        self.tls.private_ca_only = true;
+        self.rebuild_http()?;
+        Ok(self)
+    }
+
+    /// Present a mutual-TLS client identity (certificate chain +
+    /// private key PEM) on every HTTPS connection (parity with
+    /// `TlsConnector`'s client-identity parameter). Composes with the
+    /// default platform trust or with either CA builder above.
+    pub fn with_client_identity_pem(
+        mut self,
+        cert_chain_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<Self> {
+        self.tls.client_identity = Some((cert_chain_pem.to_vec(), key_pem.to_vec()));
+        self.rebuild_http()?;
+        Ok(self)
+    }
+
     fn get(&self, url: String) -> reqwest::RequestBuilder {
-        let mut req = self.http.get(url);
-        req = self.apply_auth(req);
-        req
+        let req = self.http.get(url).timeout(self.timeout);
+        self.apply_auth(req)
     }
 
     fn post(&self, url: String) -> reqwest::RequestBuilder {
-        self.apply_auth(self.http.post(url))
+        self.apply_auth(self.http.post(url).timeout(self.timeout))
     }
 
     fn apply_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
@@ -255,7 +484,7 @@ impl DicomWebClient {
             .query(query)
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(transport_error)?;
         Self::expect_json_array(resp).await
     }
 
@@ -324,7 +553,7 @@ impl DicomWebClient {
             )
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(transport_error)?;
         Self::expect_multipart(resp).await
     }
 
@@ -341,7 +570,7 @@ impl DicomWebClient {
             .header("Accept", "multipart/related; type=\"application/dicom\"")
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(transport_error)?;
         Self::expect_multipart(resp).await
     }
 
@@ -359,7 +588,7 @@ impl DicomWebClient {
             .header("Accept", "multipart/related; type=\"application/dicom\"")
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(transport_error)?;
         Self::expect_multipart(resp).await
     }
 
@@ -437,7 +666,7 @@ impl DicomWebClient {
             .header("Accept", "application/dicom+json")
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(transport_error)?;
         let (_ct, body) = Self::expect_ok(resp).await?;
         let v: serde_json::Value =
             serde_json::from_slice(&body).map_err(|e| Error::Json(e.to_string()))?;
@@ -475,7 +704,7 @@ impl DicomWebClient {
             .header("Accept", accept)
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(transport_error)?;
         Self::expect_multipart(resp).await
     }
 
@@ -505,9 +734,9 @@ impl DicomWebClient {
         // Same-origin (including server-relative URIs resolved above)
         // keeps auth; cross-origin absolute URIs must not carry it.
         let same = same_origin(&url, &self.base_url);
-        let req = self.http.get(url);
+        let req = self.http.get(url).timeout(self.timeout);
         let req = if same { self.apply_auth(req) } else { req };
-        let resp = req.send().await.map_err(|e| Error::Http(e.to_string()))?;
+        let resp = req.send().await.map_err(transport_error)?;
         Self::expect_ok(resp).await
     }
 
@@ -524,7 +753,7 @@ impl DicomWebClient {
             .query(&params)
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(transport_error)?;
         Self::expect_ok(resp).await
     }
 
@@ -632,7 +861,7 @@ impl DicomWebClient {
             .body(body)
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            .map_err(transport_error)?;
         let (status, ct, raw) = Self::read_body_capped(resp).await?;
         if !(200..300).contains(&status) {
             return Err(Error::Status {
@@ -694,7 +923,7 @@ impl DicomWebClient {
             )));
         }
         let mut body = Vec::new();
-        while let Some(chunk) = resp.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
+        while let Some(chunk) = resp.chunk().await.map_err(transport_error)? {
             if body.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
                 return Err(Error::Http(format!(
                     "response exceeds {MAX_RESPONSE_BYTES} bytes"
@@ -1295,5 +1524,288 @@ mod tests {
         let req = WadoUriRequest::new("1.2.1", "1.2.2", "1.2.3");
         let err = client.wado_uri_dataset(&req).await.unwrap_err();
         assert!(matches!(err, Error::BadRequest(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn transport_timeout_is_typed() {
+        // Stub accepts and never answers: the request must fail with
+        // the retryable Timeout variant — proving `with_timeout`
+        // applies end to end (it stores the budget; builders use it).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let Ok((_tcp, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        let client = DicomWebClient::new(format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .with_timeout(std::time::Duration::from_millis(200));
+        let t0 = std::time::Instant::now();
+        let err = client.search_studies(&[]).await.unwrap_err();
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(10),
+            "timeout did not apply: {:?}",
+            t0.elapsed()
+        );
+        assert!(matches!(err, Error::Timeout(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn transport_refused_is_connect() {
+        // Nothing listens: a connect-level failure, not stringly Http.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let client = DicomWebClient::new(format!("http://127.0.0.1:{port}")).unwrap();
+        let err = client.search_studies(&[]).await.unwrap_err();
+        assert!(matches!(err, Error::Connect(_)), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn transport_tls_failure_is_typed() {
+        // Plain-HTTP stub hit over https://: the handshake dies and
+        // must surface as Tls — not Connect (a failed handshake also
+        // reports `is_connect`) and not stringly Http.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let Ok((mut tcp, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 4096];
+            if tcp.read(&mut buf).await.unwrap_or(0) > 0 {
+                let _ = tcp
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nno",
+                    )
+                    .await;
+            }
+        });
+        let client = DicomWebClient::new(format!("https://127.0.0.1:{port}")).unwrap();
+        let err = client.search_studies(&[]).await.unwrap_err();
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
+    }
+
+    /// Minimal TLS+HTTP stub: handshakes with `config`, reads one
+    /// request head per connection, answers `body`. Serves `n`
+    /// connections, then stops.
+    fn https_stub(
+        config: Arc<rustls::ServerConfig>,
+        n: usize,
+        body: Vec<u8>,
+    ) -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..n {
+                let Ok((tcp, _)) = listener.accept() else {
+                    break;
+                };
+                tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .ok();
+                let mut conn = match rustls::ServerConnection::new(config.clone()) {
+                    Ok(c) => c,
+                    Err(_) => break,
+                };
+                let mut sock = tcp;
+                let mut tls = rustls::Stream::new(&mut conn, &mut sock);
+                // A client without the requested identity dies in the
+                // handshake; that error is the expected negative.
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                let mut ok = false;
+                for _ in 0..65536 {
+                    match tls.read_exact(&mut byte) {
+                        Ok(()) => {
+                            head.push(byte[0]);
+                            if head.ends_with(b"\r\n\r\n") {
+                                ok = true;
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                if !ok {
+                    continue;
+                }
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/dicom+json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = tls.write_all(resp.as_bytes());
+                let _ = tls.write_all(&body);
+            }
+        });
+        (addr, handle)
+    }
+
+    fn server_config(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+        client_ca_pem: Option<&[u8]>,
+    ) -> Arc<rustls::ServerConfig> {
+        use std::io::BufReader;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem))
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem))
+            .unwrap()
+            .unwrap();
+        let config = match client_ca_pem {
+            None => rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .unwrap(),
+            Some(ca) => {
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in rustls_pemfile::certs(&mut BufReader::new(ca)) {
+                    roots.add(cert.unwrap()).unwrap();
+                }
+                let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                    .build()
+                    .unwrap();
+                rustls::ServerConfig::builder()
+                    .with_client_cert_verifier(verifier)
+                    .with_single_cert(certs, key)
+                    .unwrap()
+            }
+        };
+        Arc::new(config)
+    }
+
+    #[tokio::test]
+    async fn tls_private_ca_verifies_over_wire() {
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let ca_pem = certified.cert.pem().into_bytes();
+        let key_pem = certified.signing_key.serialize_pem().into_bytes();
+        let (addr, server) = https_stub(server_config(&ca_pem, &key_pem, None), 1, b"[]".to_vec());
+        let client = DicomWebClient::new(format!("https://{addr}"))
+            .unwrap()
+            .with_private_ca_pem(&ca_pem)
+            .unwrap();
+        let studies = client.search_studies(&[]).await.unwrap();
+        assert!(studies.is_empty());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_extra_ca_verifies_over_wire() {
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let ca_pem = certified.cert.pem().into_bytes();
+        let key_pem = certified.signing_key.serialize_pem().into_bytes();
+        let (addr, server) = https_stub(server_config(&ca_pem, &key_pem, None), 1, b"[]".to_vec());
+        let client = DicomWebClient::new(format!("https://{addr}"))
+            .unwrap()
+            .with_extra_ca_pem(&ca_pem)
+            .unwrap();
+        let studies = client.search_studies(&[]).await.unwrap();
+        assert!(studies.is_empty());
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_untrusted_server_is_typed_error() {
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let ca_pem = certified.cert.pem().into_bytes();
+        let key_pem = certified.signing_key.serialize_pem().into_bytes();
+        // Two handshakes: default trust, then a *wrong* private CA.
+        let (addr, server) = https_stub(server_config(&ca_pem, &key_pem, None), 2, b"[]".to_vec());
+        let client = DicomWebClient::new(format!("https://{addr}")).unwrap();
+        let err = client.search_studies(&[]).await.unwrap_err();
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        let other = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let client = DicomWebClient::new(format!("https://{addr}"))
+            .unwrap()
+            .with_private_ca_pem(other.cert.pem().as_bytes())
+            .unwrap();
+        let err = client.search_studies(&[]).await.unwrap_err();
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_client_identity_mtls_round_trip() {
+        let server_cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        let server_pem = server_cert.cert.pem().into_bytes();
+        let server_key = server_cert.signing_key.serialize_pem().into_bytes();
+        let client_cert = rcgen::generate_simple_self_signed(vec!["client".into()]).unwrap();
+        let client_pem = client_cert.cert.pem().into_bytes();
+        let client_key = client_cert.signing_key.serialize_pem().into_bytes();
+        // Two handshakes: without, then with, the client identity.
+        let (addr, server) = https_stub(
+            server_config(&server_pem, &server_key, Some(&client_pem)),
+            2,
+            b"[]".to_vec(),
+        );
+        // No identity: the server-mandated handshake fails.
+        let bare = DicomWebClient::new(format!("https://{addr}"))
+            .unwrap()
+            .with_private_ca_pem(&server_pem)
+            .unwrap();
+        let err = bare.search_studies(&[]).await.unwrap_err();
+        assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        // With identity: the round trip succeeds.
+        let mtls = DicomWebClient::new(format!("https://{addr}"))
+            .unwrap()
+            .with_private_ca_pem(&server_pem)
+            .unwrap()
+            .with_client_identity_pem(&client_pem, &client_key)
+            .unwrap();
+        assert!(mtls.search_studies(&[]).await.unwrap().is_empty());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tls_builders_reject_garbage_pem() {
+        for bad in [b"".as_slice(), b"not a pem at all"] {
+            let err = DicomWebClient::new("https://127.0.0.1:1")
+                .unwrap()
+                .with_private_ca_pem(bad)
+                .unwrap_err();
+            assert!(matches!(err, Error::Tls(_)), "{err:?}");
+            let err = DicomWebClient::new("https://127.0.0.1:1")
+                .unwrap()
+                .with_extra_ca_pem(bad)
+                .unwrap_err();
+            assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        }
+        let good = rcgen::generate_simple_self_signed(vec!["client".into()]).unwrap();
+        let cert_pem = good.cert.pem().into_bytes();
+        let key_pem = good.signing_key.serialize_pem().into_bytes();
+        // Identity missing its key, or its certs, is refused.
+        for (cert, key) in [
+            (cert_pem.as_slice(), b"".as_slice()),
+            (b"".as_slice(), key_pem.as_slice()),
+        ] {
+            let err = DicomWebClient::new("https://127.0.0.1:1")
+                .unwrap()
+                .with_client_identity_pem(cert, key)
+                .unwrap_err();
+            assert!(matches!(err, Error::Tls(_)), "{err:?}");
+        }
+        // The pair together builds.
+        assert!(
+            DicomWebClient::new("https://127.0.0.1:1")
+                .unwrap()
+                .with_client_identity_pem(&cert_pem, &key_pem)
+                .is_ok()
+        );
+        // Debug never prints CA/key material.
+        let shown = format!(
+            "{:?}",
+            DicomWebClient::new("https://127.0.0.1:1")
+                .unwrap()
+                .with_extra_ca_pem(&cert_pem)
+                .unwrap()
+                .with_client_identity_pem(&cert_pem, &key_pem)
+                .unwrap()
+        );
+        assert!(!shown.contains("BEGIN"), "{shown}");
+        assert!(shown.contains("<redacted>"), "{shown}");
     }
 }

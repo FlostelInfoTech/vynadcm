@@ -14,7 +14,7 @@ use image::{DynamicImage, ImageFormat};
 use vyna_dcm_core::{DataElement, DataSet, TransferSyntax, Value, Vr, tags};
 
 use crate::transcode::{Geometry, Photometric, deinterleave_planar, swap_pairs};
-use crate::{BundledCodec, Error, Result, decode_pixels};
+use crate::{BundledCodec, Error, MAX_PIXEL_BYTES, Result, decode_pixels};
 
 /// Render one 1-based frame of `ds` (stored in `src`) to PNG bytes.
 pub fn frame_to_png(ds: &DataSet, src: TransferSyntax, frame: usize) -> Result<Vec<u8>> {
@@ -107,6 +107,27 @@ pub fn frame_to_png(ds: &DataSet, src: TransferSyntax, frame: usize) -> Result<V
 /// single-frame native (`MONOCHROME2`/`RGB`, unsigned). UIDs are
 /// kept (see module docs).
 pub fn inject_png(ds: &mut DataSet, png: &[u8]) -> Result<()> {
+    // Header-only probe before the full decode: a hostile PNG can
+    // claim gigapixel dimensions, and decoding it first would try to
+    // allocate the whole frame.
+    let (w, h) = image::ImageReader::new(std::io::Cursor::new(png))
+        .with_guessed_format()
+        .map_err(|e| Error::Image(e.to_string()))?
+        .into_dimensions()
+        .map_err(|e| Error::Image(e.to_string()))?;
+    if w > u16::MAX as u32 || h > u16::MAX as u32 {
+        return Err(Error::Image(format!(
+            "PNG dimensions {w}x{h} exceed 16 bits"
+        )));
+    }
+    // 4 bytes/px worst case: rejected formats (RGBA) still decode
+    // fully before the color check below, so budget for them too.
+    let worst = u64::from(w) * u64::from(h) * 4;
+    if worst > MAX_PIXEL_BYTES as u64 {
+        return Err(Error::Image(format!(
+            "PNG {w}x{h} exceeds the {MAX_PIXEL_BYTES}-byte pixel budget"
+        )));
+    }
     let img = image::load_from_memory(png).map_err(|e| Error::Image(e.to_string()))?;
     let (w, h) = (img.width(), img.height());
     let (photo, samples, bits, bytes) = match img {
@@ -312,5 +333,54 @@ mod tests {
         let mut ds = DataSet::new();
         assert!(inject_png(&mut ds, &buf).is_err());
         assert!(inject_png(&mut ds, b"not a png").is_err());
+    }
+
+    fn crc32_ieee(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let lsb = crc & 1;
+                crc >>= 1;
+                if lsb != 0 {
+                    crc ^= 0xEDB8_8320;
+                }
+            }
+        }
+        !crc
+    }
+
+    /// Signature + IHDR + empty IDAT + IEND (no pixels): enough for
+    /// the header probe (the decoder reads up to the first IDAT).
+    fn header_only_png(w: u32, h: u32) -> Vec<u8> {
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        let mut chunk = |kind: &[u8], data: &[u8]| {
+            png.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            png.extend_from_slice(kind);
+            png.extend_from_slice(data);
+            let mut crc_input = kind.to_vec();
+            crc_input.extend_from_slice(data);
+            png.extend_from_slice(&crc32_ieee(&crc_input).to_be_bytes());
+        };
+        let mut ihdr = vec![];
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit RGB
+        chunk(b"IHDR", &ihdr);
+        chunk(b"IDAT", &[]);
+        chunk(b"IEND", &[]);
+        png
+    }
+
+    #[test]
+    fn inject_png_checks_dimensions_before_decode() {
+        // Gigapixel claims (with no pixel data at all) must fail on
+        // the header probe, before any frame allocation is attempted.
+        let mut ds = DataSet::new();
+        let err = inject_png(&mut ds, &header_only_png(100_000, 100_000)).unwrap_err();
+        assert!(err.to_string().contains("exceed 16 bits"), "{err}");
+        // Fits u16 but not the pixel budget (60000² px × 4 B).
+        let err = inject_png(&mut ds, &header_only_png(60_000, 60_000)).unwrap_err();
+        assert!(err.to_string().contains("pixel budget"), "{err}");
     }
 }

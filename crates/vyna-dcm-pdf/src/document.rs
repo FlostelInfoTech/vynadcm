@@ -345,24 +345,32 @@ pub struct ExtractedPdf {
 /// Extract the encapsulated PDF from a dataset.
 ///
 /// Fragmented storage is joined; Encapsulated Document Length (0042,0015)
-/// truncates wire padding when present and sane. The result must carry
-/// the `%PDF-` magic (the MIME type tag is reported, not enforced).
+/// strips the single wire-pad byte when present and sane. The result
+/// must carry the `%PDF-` magic (the MIME type tag is reported, not
+/// enforced).
 pub fn pdf_from_dataset(ds: &DataSet) -> Result<ExtractedPdf> {
     let el = ds
         .get(tags::ENCAPSULATED_DOCUMENT)
         .ok_or_else(|| Error::Missing(tags::ENCAPSULATED_DOCUMENT.to_string()))?;
+    // Encapsulated Document is OB (dictionary VR): anything else is a
+    // shape error, not extractable bytes.
+    if el.vr != Vr::Ob {
+        return Err(Error::NoDocumentBytes);
+    }
     let mut bytes = match &el.value {
         Value::Bytes(b) => b.clone(),
         Value::Fragments(f) => f.joined(),
         _ => return Err(Error::NoDocumentBytes),
     };
-    // A zero length with stored bytes is contradictory, not an
-    // empty document: only truncate to a positive sane length.
-    if let Some(len) = ds.uint32(tags::ENCAPSULATED_DOCUMENT_LENGTH)
-        && len > 0
-        && (len as usize) <= bytes.len()
-    {
-        bytes.truncate(len as usize);
+    // Wire padding adds at most one byte, so a sane length is the
+    // stored length or one less (the pad). A zero or much-too-short
+    // length is corrupt, not an empty document: ignore it rather than
+    // silently truncating real content away.
+    if let Some(len) = ds.uint32(tags::ENCAPSULATED_DOCUMENT_LENGTH) {
+        let len = len as usize;
+        if len > 0 && (len == bytes.len() || len + 1 == bytes.len()) {
+            bytes.truncate(len);
+        }
     }
     // Serving arbitrary stored bytes as `application/pdf` would
     // mislabel them; refuse instead (mirrors the builder's check).
@@ -384,12 +392,19 @@ pub fn file_meta_for_dataset(
     ds: &DataSet,
     ts: vyna_dcm_core::TransferSyntax,
 ) -> Result<vyna_dcm_codec::FileMeta> {
-    let sop_class = ds
-        .require_string(tags::SOP_CLASS_UID)
-        .map_err(|_| Error::Missing(tags::SOP_CLASS_UID.to_string()))?;
-    let sop_inst = ds
-        .require_string(tags::SOP_INSTANCE_UID)
-        .map_err(|_| Error::Missing(tags::SOP_INSTANCE_UID.to_string()))?;
+    // Absent reads Missing; present-but-unusable reads InvalidMeta
+    // (never Missing: the tag IS there).
+    let req = |tag| {
+        ds.require_string(tag).map_err(|_| {
+            if ds.get(tag).is_none() {
+                Error::Missing(tag.to_string())
+            } else {
+                Error::InvalidMeta(format!("{tag} present but not usable text"))
+            }
+        })
+    };
+    let sop_class = req(tags::SOP_CLASS_UID)?;
+    let sop_inst = req(tags::SOP_INSTANCE_UID)?;
     Ok(vyna_dcm_codec::FileMeta::new(sop_class, sop_inst, ts))
 }
 
@@ -728,5 +743,60 @@ mod tests {
         ));
         // Valid values still build.
         assert!(pdf_to_dataset(&pdf, &sample_meta()).is_ok());
+    }
+
+    #[test]
+    fn corrupt_short_length_is_ignored_not_truncated() {
+        // Wire padding adds at most 1 byte: a much-too-short length is
+        // corrupt and must be ignored, not silently truncate content.
+        let pdf = sample_pdf();
+        let mut ds = DataSet::new();
+        ds.put_bytes(tags::ENCAPSULATED_DOCUMENT, Vr::Ob, pdf.clone());
+        ds.put_u32_single(tags::ENCAPSULATED_DOCUMENT_LENGTH, 5);
+        assert_eq!(pdf_from_dataset(&ds).unwrap().bytes, pdf);
+        // One-less (the pad) still strips exactly.
+        let mut padded = pdf.clone();
+        padded.push(0x00);
+        let mut ds = DataSet::new();
+        ds.put_bytes(tags::ENCAPSULATED_DOCUMENT, Vr::Ob, padded);
+        ds.put_u32_single(tags::ENCAPSULATED_DOCUMENT_LENGTH, pdf.len() as u32);
+        assert_eq!(pdf_from_dataset(&ds).unwrap().bytes, pdf);
+    }
+
+    #[test]
+    fn extract_requires_ob_vr() {
+        let pdf = sample_pdf();
+        let mut ds = DataSet::new();
+        ds.put_bytes(tags::ENCAPSULATED_DOCUMENT, Vr::Ow, pdf);
+        assert!(matches!(pdf_from_dataset(&ds), Err(Error::NoDocumentBytes)));
+    }
+
+    #[test]
+    fn file_meta_distinguishes_missing_from_unusable() {
+        use vyna_dcm_core::TransferSyntax as Ts;
+        // Absent reads Missing.
+        assert!(matches!(
+            file_meta_for_dataset(&DataSet::new(), Ts::ExplicitVrLittleEndian),
+            Err(Error::Missing(_))
+        ));
+        // Present-but-unusable (wrong type, empty) reads InvalidMeta.
+        let mut ds = DataSet::new();
+        ds.insert(DataElement::new(
+            tags::SOP_CLASS_UID,
+            Vr::Ul,
+            Value::U32(vec![1]),
+        ));
+        ds.put_uid(tags::SOP_INSTANCE_UID, "1.2.3");
+        assert!(matches!(
+            file_meta_for_dataset(&ds, Ts::ExplicitVrLittleEndian),
+            Err(Error::InvalidMeta(_))
+        ));
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::SOP_CLASS_UID, sop_class::ENCAPSULATED_PDF);
+        ds.put_text(tags::SOP_INSTANCE_UID, Vr::Ui, "");
+        assert!(matches!(
+            file_meta_for_dataset(&ds, Ts::ExplicitVrLittleEndian),
+            Err(Error::InvalidMeta(_))
+        ));
     }
 }

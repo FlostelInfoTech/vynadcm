@@ -28,6 +28,11 @@ pub enum Error {
     },
 
     /// VR needed from the dictionary but the tag is unknown/private.
+    ///
+    /// Currently unreachable: implicit-VR resolution falls back to
+    /// `UN` bytes for unknown/private tags, so the lookup never
+    /// fails. Kept for a future strict mode; do not remove without a
+    /// major-version bump (it is public API).
     #[error("no dictionary VR for {tag} in implicit VR syntax at offset {offset}")]
     MissingDictionaryVr {
         /// Attribute tag.

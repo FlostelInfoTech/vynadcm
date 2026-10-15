@@ -126,6 +126,10 @@ pub enum Error {
         limit: u64,
     },
 
+    /// Inbound association refused: the SCP concurrency cap is full.
+    #[error("too many concurrent associations")]
+    TooManyAssociations,
+
     /// Invalid AE title.
     #[error("invalid AE title `{0}`: {1}")]
     BadAeTitle(String, &'static str),

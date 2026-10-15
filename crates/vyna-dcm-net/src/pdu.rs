@@ -217,9 +217,23 @@ pub async fn write_pdu<W: AsyncWrite + Unpin>(w: &mut W, pdu: &Pdu) -> Result<()
     Ok(())
 }
 
+/// Write one PDU, failing with [`Error::Timeout`] past `timeout`: a
+/// zero-window (or otherwise stalled) peer must not hold a send path
+/// forever. All association send paths use this; bare [`write_pdu`]
+/// remains for tests and single-shot peers.
+pub async fn write_pdu_timeout<W: AsyncWrite + Unpin>(
+    w: &mut W,
+    pdu: &Pdu,
+    timeout: std::time::Duration,
+) -> Result<()> {
+    tokio::time::timeout(timeout, write_pdu(w, pdu))
+        .await
+        .map_err(|_| Error::Timeout("PDU write"))?
+}
+
 // -- PDU encode/decode --------------------------------------------------------
 
-fn decode_pdu(typ: u8, p: &[u8]) -> Result<Pdu> {
+pub(crate) fn decode_pdu(typ: u8, p: &[u8]) -> Result<Pdu> {
     match typ {
         0x01 => Ok(Pdu::AssociateRq(decode_assoc_rq(p)?)),
         0x02 => Ok(Pdu::AssociateAc(decode_assoc_ac(p)?)),
@@ -287,10 +301,26 @@ fn encode_pdu(pdu: &Pdu) -> Result<(u8, Vec<u8>)> {
     }
 }
 
+/// Maximum PDVs in one P-DATA-TF: the byte cap alone still allows
+/// millions of minimum-size PDVs (each a `Vec` + struct, ~5x wire
+/// bytes in heap). Conformant senders emit a handful per PDU.
+pub const MAX_PDVS_PER_PDU: usize = 4096;
+
+/// Maximum sub-items decoded at one PDU item level (association RQ/AC
+/// items, presentation-context or user-info sub-items): same
+/// count-amplification guard as [`MAX_PDVS_PER_PDU`]. Legitimate
+/// associations carry ~10^2 items per level at most.
+pub const MAX_PDU_ITEMS: usize = 1024;
+
 fn decode_data(p: &[u8]) -> Result<Vec<Pdv>> {
     let mut pdvs = Vec::new();
     let mut pos = 0;
     while pos < p.len() {
+        if pdvs.len() >= MAX_PDVS_PER_PDU {
+            return Err(Error::BadPdu(format!(
+                "P-DATA-TF exceeds {MAX_PDVS_PER_PDU} PDVs"
+            )));
+        }
         if pos + 6 > p.len() {
             return Err(Error::BadPdu("truncated PDV header".into()));
         }
@@ -326,17 +356,28 @@ fn decode_data(p: &[u8]) -> Result<Vec<Pdv>> {
 struct Items<'a> {
     buf: &'a [u8],
     pos: usize,
+    count: usize,
 }
 
 impl<'a> Items<'a> {
     fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+        Self {
+            buf,
+            pos: 0,
+            count: 0,
+        }
     }
 
     fn next(&mut self) -> Result<Option<(u8, &'a [u8])>> {
         if self.pos == self.buf.len() {
             return Ok(None);
         }
+        if self.count >= MAX_PDU_ITEMS {
+            return Err(Error::BadPdu(format!(
+                "PDU item level exceeds {MAX_PDU_ITEMS} items"
+            )));
+        }
+        self.count += 1;
         if self.pos + 4 > self.buf.len() {
             return Err(Error::BadPdu("truncated item header".into()));
         }
@@ -856,5 +897,30 @@ mod tests {
         let mut r = &wire[..];
         let err = read_pdu(&mut r, 64 * 1024 * 1024).await.unwrap_err();
         assert!(err.to_string().contains("exceeds cap"), "{err}");
+    }
+
+    #[test]
+    fn item_counts_are_capped() {
+        // 6-byte minimum-size PDVs: the byte cap alone would admit
+        // millions (~5x wire bytes in heap Vecs).
+        let mut payload = Vec::new();
+        for _ in 0..=MAX_PDVS_PER_PDU {
+            payload.extend_from_slice(&2u32.to_be_bytes());
+            payload.extend([1u8, 0x01]);
+        }
+        let err = decode_pdu(0x04, &payload).unwrap_err();
+        assert!(err.to_string().contains("PDVs"), "{err}");
+        // Same for association item levels: 4-byte empty items past
+        // the fixed 68-byte header (unknown types are skipped, but
+        // still counted).
+        let mut rq = vec![0, 1, 0, 0];
+        rq.extend(b"CALLED          ");
+        rq.extend(b"CALLING         ");
+        rq.extend([0u8; 32]);
+        for _ in 0..=MAX_PDU_ITEMS {
+            rq.extend([0x09, 0x00, 0x00, 0x00]);
+        }
+        let err = decode_pdu(0x01, &rq).unwrap_err();
+        assert!(err.to_string().contains("items"), "{err}");
     }
 }

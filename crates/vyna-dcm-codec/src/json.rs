@@ -177,25 +177,17 @@ fn floats(it: impl Iterator<Item = f64>) -> Json {
     )
 }
 
-/// VRs allowed to carry `InlineBinary` (Annex F bulk-data VRs, plus
-/// retired `SI`: export writes `SI` bytes as `InlineBinary`, so import
-/// must accept it back for round-trip symmetry).
+/// VRs allowed to carry `InlineBinary`: the byte VRs the encoder
+/// accepts as [`Value::Bytes`](vyna_dcm_core::Value::Bytes), plus
+/// retired `SI` (export writes `SI` bytes as `InlineBinary`, so
+/// import must accept it back for round-trip symmetry). Text VRs
+/// (`LT ST UT UC UR`) are refused: bytes cannot become text without
+/// the dataset's character set, and the encoder rejects `Bytes`
+/// under text VRs.
 pub(crate) fn allows_inline_binary(vr: Vr) -> bool {
     matches!(
         vr,
-        Vr::Lt
-            | Vr::Ob
-            | Vr::Od
-            | Vr::Of
-            | Vr::Ol
-            | Vr::Ov
-            | Vr::Ow
-            | Vr::Si
-            | Vr::St
-            | Vr::Uc
-            | Vr::Ur
-            | Vr::Ut
-            | Vr::Un
+        Vr::Ob | Vr::Od | Vr::Of | Vr::Ol | Vr::Ov | Vr::Ow | Vr::Si | Vr::Un
     )
 }
 
@@ -629,6 +621,13 @@ mod tests {
         let bulk = json!({"7FE00010": {"vr": "OW", "InlineBinary": "AA=="}});
         assert!(dataset_from_json(&bulk).is_ok());
         for vr in ["US", "SS", "FL", "FD", "PN", "SQ", "AT", "UI"] {
+            let v = json!({"00280010": {"vr": vr, "InlineBinary": "AA=="}});
+            assert!(dataset_from_json(&v).is_err(), "{vr}");
+        }
+        // Text VRs are refused too: the encoder rejects Bytes under
+        // text VRs, so admitting them here would build datasets that
+        // can never encode.
+        for vr in ["LT", "ST", "UT", "UC", "UR"] {
             let v = json!({"00280010": {"vr": vr, "InlineBinary": "AA=="}});
             assert!(dataset_from_json(&v).is_err(), "{vr}");
         }
