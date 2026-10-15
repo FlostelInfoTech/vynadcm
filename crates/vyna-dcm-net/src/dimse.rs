@@ -167,9 +167,12 @@ pub struct Command {
     pub affected_sop_class_uid: Option<String>,
     /// Affected SOP Instance UID (`0000,1000`).
     pub affected_sop_instance_uid: Option<String>,
-    /// Requested SOP Class UID (`0000,0003`), N-GET only.
+    /// Requested SOP Class UID (`0000,0003`): N-SET / N-GET /
+    /// N-ACTION / N-DELETE requests address the class here, not in
+    /// Affected (PS3.7 N-service request messages).
     pub requested_sop_class_uid: Option<String>,
-    /// Requested SOP Instance UID (`0000,1001`), N-GET only.
+    /// Requested SOP Instance UID (`0000,1001`): the instance for
+    /// N-SET / N-GET / N-ACTION / N-DELETE requests.
     pub requested_sop_instance_uid: Option<String>,
     /// Move Destination AE (`0000,0600`).
     pub move_destination: Option<String>,

@@ -181,10 +181,10 @@ impl Handlers for StoreScp {
 }
 
 let listener = TcpListener::bind("127.0.0.1:11112").await.unwrap();
-let acceptor = AcceptorOptions {
-    ae_title: AeTitle::new("DEMO_SCP").unwrap(),
-    ..Default::default()
-};
+// The option structs are `#[non_exhaustive]`: configure through
+// `Default` plus field assignment, not struct literals.
+let mut acceptor = AcceptorOptions::default();
+acceptor.ae_title = AeTitle::new("DEMO_SCP").unwrap();
 let handlers = Arc::new(StoreScp);
 // Bound concurrency: an unbounded spawn-per-accept lets a peer hold
 // arbitrary associations (the bins cap at `MAX_SCP_ASSOCIATIONS` = 1024).
@@ -206,7 +206,7 @@ Tighten negotiation via `AcceptorOptions`: `check_called_ae`,
 `accepted_transfer_syntaxes`, `accepted_sop_classes`,
 `user_identity_auth` (a callback returning `Some(response)` to accept).
 
-C-MOVE delivery needs `ScpOptions { move_config }` with an
+C-MOVE delivery needs `move_config` set on `ScpOptions` with an
 `AeDirectory` (e.g. `HashMapDirectory { map }`), outbound association
 options, and a calling AE.
 
@@ -268,6 +268,15 @@ let (txn, succeeded, failed) = parse_commitment_result(&event_ds);
 
 `MppsData` derives `Default`; fill the performed-procedure fields you
 need and use `to_create_dataset()` / `to_set_dataset()`.
+
+N-service addressing follows PS3.7: N-SET / N-ACTION (and N-GET /
+N-DELETE) requests carry the class in Requested SOP Class UID
+(`0000,0003`) with the instance in Requested SOP Instance UID
+(`0000,1001`), while N-CREATE / N-EVENT-REPORT use the Affected pair
+(`0000,0002` / `0000,1000`). The `Command` constructors and parser
+follow this split, so server code must read
+`command.requested_sop_class_uid` for N-SET / N-ACTION — a hand-rolled
+peer that files the class under Affected is non-conformant.
 
 ## 8. DICOMweb client
 
@@ -441,4 +450,7 @@ JPEG-family syntaxes with `UnsupportedTransferSyntax`.
 - **Snippet verification**: every snippet in §§2–11 is mirrored in a
   temporary example and `cargo check`ed on each doc release; the
   runnable `ecg_write`, `wado_fetch`, and `link_route` examples cover
-  the same paths end to end.
+  the same paths end to end. Checks must run as an *external* crate:
+  in-workspace examples cannot see `#[non_exhaustive]` construction
+  failures (a §5 snippet once shipped a struct literal that only
+  compiled in-workspace).
