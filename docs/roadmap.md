@@ -15,7 +15,9 @@ comparison rounds DONE;
 0.3.0 (2026-10-12) — post-0.2.0 hardening batch DONE;
 0.4.0 (2026-10-13) — review-fix batch DONE, first public release;
 0.5.0 (2026-10-13) — version bump to match workspace;
-0.6.0 (2026-10-15) — version bump to match workspace.
+0.6.0 (2026-10-15) — version bump to match workspace;
+Unreleased — post-0.6.0 batch (relational QR, MRDR, BulkData,
+WADO-URI server, redaction, FileStore, ATNA async) folded in.
 
 ## Contents
 
@@ -111,15 +113,17 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
   Accepted: every emitted link verified to point at an item tag,
   10 dicomdir tests, 171/171 tests, clippy clean. Out of scope
   (documented): pydicom cross-read (no independent reader
-  available here). Follow-up: `MRDR` following (loop-guarded,
-  stamped with the `MRDR` record type, unresolvable ones skipped).
+  available here). Follow-up DONE (post-0.6.0 batch, §6):
+  `MRDR` following (loop-guarded, stamped with the `MRDR`
+  record type, unresolvable ones skipped).
 - **WADO-URI client** — DONE: shipped `WadoUriRequest` +
   `wado_uri`/`wado_uri_dataset` (validated UIDs/ranges, verbatim
   rendering knobs, `application/dicom` gate on the parsed form).
   Accepted: param unit tests + stub-server e2e (DICOM parse,
   rendered passthrough, 404 surfacing), 176/176 tests, clippy
-  clean. Follow-up: WADO-URI server side (`GET /wado`, DICOM-only
-  with `transferSyntax` transcode; rendering knobs refused).
+  clean. Follow-up DONE (post-0.6.0 batch, §6): WADO-URI
+  server side (`GET /wado`, DICOM-only with `transferSyntax`
+  transcode; rendering knobs refused).
 - **Missing SCU tools** (`movescu`, `getscu`, `mppsscu`,
   `stgcmtscu`) — DONE: shipped all four (shared `-k` query builder
   with `findscu`, generated UIDs/dates where sensible) plus the
@@ -152,9 +156,9 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
   identical samples post-run, 211/211 tests, clippy clean. Out of
   scope (documented): full E.1 transcription, coded profile
   claims, free-text scrubbing, charset conversion, UID-map
-  persistence. Follow-up: native-frame pixel redaction
-  (`codec::redact_regions` + `deidentify --redact` with a
-  warned burned-in override).
+  persistence. Follow-up DONE (post-0.6.0 batch, §6):
+  native-frame pixel redaction (`codec::redact_regions` +
+  `deidentify --redact` with a warned burned-in override).
 - **ATNA audit-trail emission** (dcm4che `audit`/syslog) — DONE:
   shipped `vyna-dcm-atna` (RFC 3881 message builders with pinned
   code triples, `udp`/`tcp`/`tls` syslog delivery) plus the
@@ -182,9 +186,10 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
   (`--with-meta`) / `xml2dcm` (`--transfer-syntax`, encapsulated
   re-fragment) CLIs. Accepted: 4 round-trip/rejection tests, JP
   CJK round-trip identical, 246/246 tests, clippy clean. Out of
-  scope (documented): DCMTK `<element>` format. Follow-up:
-  `BulkData` resolution (`dataset_from_xml_with_resolver` +
-  `xml2dcm --bulk-data-dir`, traversal-safe).
+  scope (documented): DCMTK `<element>` format. Follow-up DONE
+  (post-0.6.0 batch, §6): `BulkData` resolution
+  (`dataset_from_xml_with_resolver` + `xml2dcm --bulk-data-dir`,
+  traversal-safe).
 - **UPS / IAN** — EVALUATED (2026-10-12): demand gate not met,
   no code shipped. Verified reusable on adoption day: SCU
   `n_create`/`n_set`/`n_get`/`n_action`/`n_delete`/
@@ -224,8 +229,9 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
   store, `wadorsd` stub server over a directory). Accepted: 11
   qrdb unit tests + 4 SCP tests, 4 web loopback tests over real
   HTTP, live findscp/move/getscu and wadorsd CLI smokes, 271/271
-  tests, clippy clean. Out of scope (documented): persistent
-  archive behind `wadorsd` (STOW lands in memory), UPS/IAN (§5).
+  tests, clippy clean. Out of scope (documented): UPS/IAN (§5);
+  the persistent archive shipped in the post-0.6.0 batch (§6)
+  (`FileStore` + `wadorsd --persist`).
 - **Post-0.2.0 hardening batch** — DONE: the eight follow-ups from
   the second comparison pass — `dcmodify` sequence paths, ATNA
   wiring for the remaining SCUs (echo excepted), C-CANCEL both
@@ -235,7 +241,23 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
   item (incl. full commitment Push handshake and cancel
   truncation), live CLI smokes for each, 298/298 tests, clippy
   clean. Out of scope (documented): `dump2dcm`, `mkkos`,
-  relational C-FIND, persistent QR index, UPS/IAN (still
+  persistent QR index, UPS/IAN (still demand-gated);
+  relational C-FIND shipped in the post-0.6.0 batch (§6).
+
+- **Post-0.6.0 batch** — DONE: the follow-ups §§4–6 left open
+  plus review fixes — relational C-FIND/MOVE/GET (PDU `0x56`
+  codec, `--relational` on the QR SCUs, `findscp` echo for QR
+  contexts, cross-level QRDB matching), DICOMDIR `MRDR`
+  following, XML `BulkData` resolution (`xml2dcm
+  --bulk-data-dir`), WADO-URI server side (`GET /wado`),
+  native-frame pixel redaction (`deidentify --redact`), a
+  durable `FileStore` behind `wadorsd --persist`, manifest
+  nits, `wadorsd --bearer-token-file`, J2K panic hardening, a
+  `cargo audit` CI job, truncation/mutation sweeps, and
+  non-blocking ATNA emission. Accepted: unit + loopback tests
+  per item, 683/683 tests, clippy clean, conformance
+  statement regenerated. Out of scope (documented):
+  `dump2dcm`, `mkkos`, persistent QR index, UPS/IAN (still
   demand-gated).
 
 ## 7. Deliberate non-goals

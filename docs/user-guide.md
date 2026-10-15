@@ -135,6 +135,10 @@ findscu --connect 127.0.0.1:11112 --model mwl \
 - `--cancel N` stops after N matches (C-CANCEL; a requested FE00
   exits 0). The SCP side honors cancel mid-stream during
   C-FIND/C-MOVE/C-GET.
+- `--relational` proposes relational-queries extended negotiation
+  (cross-level keys without a Query/Retrieve Level ladder);
+  without the peer's echo the query stays hierarchical. Ignored
+  for `--model mwl`.
 
 ### Retrieve: movescu / getscu
 
@@ -150,6 +154,8 @@ getscu --connect 127.0.0.1:11112 --output-dir ./got -k StudyInstanceUID=1.2.3
   accepts `patientstudy` (C-GET has no Patient/Study-only form).
 - `-k/--key` works exactly as in `findscu`, including the derived
   Query/Retrieve Level.
+- `--relational` proposes relational-queries extended negotiation,
+  as in `findscu`.
 - The destination AE must be known to the *peer*, not to `movescu`.
 - `getscu` stores Explicit LE, transcoding encapsulated arrivals.
 
@@ -169,6 +175,8 @@ mwlscp --bind 127.0.0.1:11112 ./worklist
   numeric ranges, and nested sequence keys.
 - Without `--route` entries, C-MOVE fails cleanly with Move
   Destination Unknown; C-FIND and C-GET still work.
+- `findscp` echoes relational-queries extended negotiation for QR
+  C-FIND/C-MOVE/C-GET contexts that propose it.
 
 ### MPPS and Storage Commitment: mppsscu / mppsscp / stgcmtscu / stgcmtscp
 
@@ -351,7 +359,9 @@ dcmdir --list /media/USB/DICOMDIR
 Every indexed file must sit under the output directory so its File
 ID stays relative; record types map from SOP Class (`IMAGE`, `RT
 DOSE`, `SR DOCUMENT`, …). Skipped records print with their reason
-rather than failing the import.
+rather than failing the import. `--list` follows `MRDR`
+multi-references to their target instance (loop-guarded;
+unresolvable targets are skipped, never fatal).
 
 `deidentify` applies the basic profile for research exports (names
 and IDs dummied, dates shifted or dummied, UIDs remapped

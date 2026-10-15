@@ -34,7 +34,7 @@ struct Args {
     /// Require `Authorization: Bearer <token>` on every request.
     #[arg(long)]
     bearer_token: Option<String>,
-    /// Read the Bearer [REDACTED] a file instead of argv (tokens passed
+    /// Read the Bearer `[REDACTED]` from a file instead of argv (tokens passed
     /// via `--bearer-token` are visible in `ps` output). The file
     /// content is whitespace-trimmed; conflicts with `--bearer-token`.
     #[arg(long, conflicts_with = "bearer_token")]
@@ -64,7 +64,7 @@ fn needs_phi_warning(addr: &std::net::SocketAddr, bearer_token: &Option<String>)
     bearer_token.is_none() && !addr.ip().is_loopback()
 }
 
-/// Resolve the effective Bearer [REDACTED] `--bearer-token-file`
+/// Resolve the effective Bearer `[REDACTED]` `--bearer-token-file`
 /// when given (clap forbids passing both flags at once),
 /// `--bearer-token` otherwise.
 fn resolve_token(args: &Args) -> Result<Option<String>, String> {

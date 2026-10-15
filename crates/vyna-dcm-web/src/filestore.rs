@@ -1,7 +1,7 @@
-//! Directory-backed [`DicomWebStore`](crate::server::DicomWebStore).
+//! Directory-backed [`DicomWebStore`].
 //!
 //! [`FileStore`] keeps the same in-memory index, search, and bulk
-//! semantics as [`MemoryStore`](crate::server::MemoryStore) (including
+//! semantics as [`MemoryStore`] (including
 //! its DoS caps), and additionally persists every accepted instance
 //! as a Part-10 file under `{dir}/{study}/{series}/{instance}.dcm`.
 //! [`FileStore::open`] rescans that directory, so STOW uploads and
@@ -22,7 +22,7 @@ const MAX_SCAN_DEPTH: usize = 64;
 /// Counter disambiguating concurrent temp writes of one instance.
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-/// Thread-safe directory-backed [`DicomWebStore`](crate::server::DicomWebStore).
+/// Thread-safe directory-backed [`DicomWebStore`].
 ///
 /// Instances with syntactically invalid UIDs are rejected outright:
 /// UIDs become path segments, and only strict-grammar UIDs (digits

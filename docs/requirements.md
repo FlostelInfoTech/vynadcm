@@ -17,7 +17,9 @@ charset/XML/img requirements folded in since 0.1.0;
 + ATNA completion + CLI deltas folded in;
 0.4.0 (2026-10-13) — MIT license (NFR-03), quality-gate wording;
 0.5.0 (2026-10-13) — version bump; FR-CORE-05 default-TS clarification;
-0.6.0 (2026-10-15) — version bump to match workspace.
+0.6.0 (2026-10-15) — version bump to match workspace;
+Unreleased — relational QR, MRDR, BulkData resolution, WADO-URI
+server, pixel redaction, FileStore, ATNA async folded in.
 
 ## Contents
 
@@ -150,13 +152,16 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   links exactly (`read_dicomdir`; loops and dangling offsets are
   errors, unusable records are reported, never silently dropped),
   and write them from referenced datasets (`build_dicomdir`) with
-  measured two-pass offsets. `MRDR` following stays out of scope.
+  measured two-pass offsets. Multi-referenced (`MRDR`) records
+  resolve to their target instance (loop-guarded; unresolvable
+  targets are reported with the `MRDR` type, never fatal).
 - **FR-CODEC-11 (M)** Convert datasets to/from Native DICOM Model
   XML (PS3.19 A): `Value` children for text/numbers/AT (8-hex),
   `PersonName` component groups, `InlineBinary` for byte VRs,
   nested `Item` datasets; `DS` keeps its wire lexical form (no
-  float trip). `BulkData` references are refused; DCMTK's
-  proprietary `<element>` format stays out of scope.
+  float trip). `BulkData` references resolve through a
+  caller-supplied fetch callback (without one they are refused);
+  DCMTK's proprietary `<element>` format stays out of scope.
 - **FR-CODEC-12 (M)** Single-frame PNG export/import for debugging:
   `frame_to_png` renders MONOCHROME1/2 (8/16-bit, signed offset by
   2^15, MONO1 inverted) and interleaved/planar RGB 8-bit; `inject_png`
@@ -170,7 +175,10 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   P-DATA (with max-PDU chunking), RELEASE, and ABORT PDUs.
 - **FR-NET-02 (M)** SCU: request associations with odd presentation
   context IDs, negotiate transfer syntaxes per context, send/receive
-  DIMSE, release/abort.
+  DIMSE, release/abort. QR SCU tools propose relational-queries
+  extended negotiation (`0x56`) behind `--relational`; the exchange
+  counts as relational only when the peer echoes the proposal
+  (gratuitous echoes are ignored).
 - **FR-NET-03 (M)** SCU operations: C-ECHO, C-STORE, C-FIND
   (incl. cancelable), C-MOVE, C-GET (with C-STORE sub-operation
   handler), N-CREATE/SET/GET/ACTION/DELETE/EVENT-REPORT, and
@@ -178,7 +186,8 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
 - **FR-NET-04 (M)** SCP: accept associations, negotiate with gating on
   AE title (optional strict mode), transfer syntaxes, SOP classes,
   and an optional user-identity callback; dispatch each service to
-  application `Handlers`.
+  application `Handlers`. Relational-queries proposals (`0x56`)
+  are echoed for QR C-FIND/C-MOVE/C-GET contexts only.
 - **FR-NET-05 (M)** C-MOVE: route instances to a configured destination
   AE over a dedicated outbound association; C-GET: deliver over the
   same association and abort delivery on C-CANCEL; C-FIND/C-MOVE
@@ -219,13 +228,18 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   Basic and Bearer auth.
 - **FR-WEB-02 (M)** `multipart/related` encode/decode from scratch,
   tolerating boundary-like bytes inside bodies.
-- **FR-WEB-03 (M)** Server core: route QIDO/WADO/STOW against any
-  `DicomWebStore` implementation; ship an in-memory store; expose a
-  hyper HTTP/1.1 front end (feature `server`).
+- **FR-WEB-03 (M)** Server core: route QIDO/WADO/STOW plus legacy
+  WADO-URI (`GET /wado`, DICOM-only with `transferSyntax`
+  transcode; rendering knobs refused) against any `DicomWebStore`
+  implementation; ship an in-memory store and a durable `FileStore`
+  directory store; expose a hyper HTTP/1.1 front end
+  (feature `server`).
 - **FR-WEB-04 (M)** CLIs: `qidors` (search with `-k` keys, limit/offset,
   text or JSON output), `wadors` (instance/metadata/frames/bulkdata
   retrieve), `stowrs` (multipart store), `wadorsd` (stub server over
-  a directory; STOW lands in memory).
+  a directory; `--persist` serves from a durable `FileStore` so
+  STOW uploads survive restart, otherwise STOW lands in memory;
+  `--bearer-token-file` reads the Bearer [REDACTED] a file).
 
 ### 3.5 ECG mapping (`vyna-dcm-ecg`)
 
@@ -282,23 +296,30 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   optional); UID maps stay consistent per run; dates shift
   (longitudinal) or fall back to a fixed dummy; times, clinical
   content, anatomy, and technique are kept. Burned-in `YES`
-  refuses the run; the longitudinal-temporal flag is set factually.
+  refuses the run unless `--redact` regions (or the library
+  `with_allow_burned_in` override) admit it, in which case the run
+  proceeds warned with conformance markers withheld; the
+  longitudinal-temporal flag is set factually.
 - **FR-DEID-02 (M)** `deidentify` CLI: multi-file batches with
   `--output-dir` / `--output` / `--in-place`, `--date-offset`,
   `--patient-id` / `--patient-name`, `--retain-private-tags`,
-  file-meta UID sync, per-file summaries, exit 0/1.
+  `--redact X,Y,W,H[:FRAME]` (repeatable: black rectangles over
+  native 8/16-bit frames before de-identifying; out-of-bounds
+  regions fail the file), file-meta UID sync, per-file summaries,
+  exit 0/1.
 - **FR-DEID-03 (S)** Scope honesty: curated subset (not a full E.1
   transcription), no coded profile claims, no free-text scrubbing,
-  no charset conversion, no UID-map persistence, no pixel redaction.
+  no charset conversion, no UID-map persistence.
 
 ### 3.9 CLI tools (`vyna-dcm`, feature `cli`)
 
 - **FR-CLI-01 (M)** Network tools: `echoscu`, `echoscp`, `storescu`,
   `storescp` (with `--exec` receive hooks), `findscu` (incl. MWL
-  model, `-k` keys, JSON output, `--cancel N`), `movescu` (C-MOVE
-  to a `--dest` AE), `getscu` (C-GET into `--output-dir`,
-  transcoding encapsulated arrivals to native), `findscp` (QR
-  FIND/MOVE/GET from a directory, `--route` AE table), `mwlscp`
+  model, `-k` keys, JSON output, `--cancel N`, `--relational`),
+  `movescu` (C-MOVE to a `--dest` AE, `--relational`), `getscu`
+  (C-GET into `--output-dir`, transcoding encapsulated arrivals
+  to native, `--relational`), `findscp` (QR FIND/MOVE/GET from a
+  directory, `--route` AE table), `mwlscp`
   (worklist FIND from a directory), `mppsscu` (MPPS N-CREATE +
   N-SET), `mppsscp` (MPPS N-CREATE/N-SET into a directory),
   `stgcmtscu` (Storage Commitment N-ACTION + report wait),
@@ -312,7 +333,8 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
 - **FR-CLI-02 (M)** File tools: `dcmdump`, `dcm2json` (incl. file-meta
   option), `json2dcm` (incl. transfer-syntax selection),
   `dcm2xml` (incl. file-meta option), `xml2dcm` (incl.
-  transfer-syntax selection), `dcm2img` (`--frame`), `img2dcm`
+  transfer-syntax selection and `--bulk-data-dir`), `dcm2img`
+  (`--frame`), `img2dcm`
   (PNG + template, native by default, `--transfer-syntax` +
   quality knobs for encapsulated targets),
   `dcmvalidate` (IOD check with SOP-Class override; exit 0/1/2),
@@ -326,7 +348,8 @@ Rust 1.99+, edition 2024, async via tokio, MIT license
   `dcmdir` (create a DICOMDIR from files/dirs, or `--list` one;
   exit 0/1),
   `deidentify` (basic-profile de-identification with date offset,
-  dummy overrides, and batch outputs; exit 0/1).
+  dummy overrides, `--redact` regions, and batch outputs;
+  exit 0/1).
 
 ### 3.10 ATNA audit trail (`vyna-dcm-atna`)
 
@@ -418,21 +441,21 @@ IPv6-specific handling.
 | FR-CODEC-07 | native/RLE path covered indirectly via `frames_and_stow` (WADO frames); bundled JPEG paths by `baseline_*_roundtrip_is_close`, `lossless_roundtrips_exactly`, `near_lossless_honours_error_bound`, `flat_frames_roundtrip`, `lossy_roundtrip_is_close`, `cross_checks_against_independent_j2k`, `bundled_multi_frame_roundtrip`, `truncated_input_*`, plus the `PixelCodec` plug-in tests |
 | FR-CODEC-08 | `dump_contains_expected_lines` |
 | FR-CODEC-09 | `mono8_lossless_matrix_is_exact`, `mono16_and_bigendian_roundtrip_exact`, `rgb_*`, `ybr422_*`, `ybr_full_*`, `lossy_source_keeps_history_*`, `multiframe_*`, `bad_inputs_rejected`, `baseline_rgb_odd_sizes_roundtrip`, CLI `dcm2dcm` matrix runs |
-| FR-CODEC-10 | `roundtrip_tree` (every link points at an item tag), `empty_dir_roundtrip`, `record_type_mapping`, `entry_validation`, `rejects_non_directory`, `walker_*` (skips, loops, dangling, deleted), `capture_points_at_item_tags`, CLI `dcmdir` create+list runs |
-| FR-CODEC-11 | `round_trips_mixed_dataset`, `person_name_component_groups`, `rejects_bad_inputs`, `liberal_parse_accepts_minimal`, CLI `dcm2xml` → `xml2dcm` JP round-trip run |
+| FR-CODEC-10 | `roundtrip_tree` (every link points at an item tag), `empty_dir_roundtrip`, `record_type_mapping`, `entry_validation`, `rejects_non_directory`, `walker_*` (skips, loops, dangling, deleted), `capture_points_at_item_tags`, `mrdr_follows_to_shared_leaf`, `mrdr_failures_skip_loudly`, CLI `dcmdir` create+list runs |
+| FR-CODEC-11 | `round_trips_mixed_dataset`, `person_name_component_groups`, `rejects_bad_inputs`, `liberal_parse_accepts_minimal`, `bulk_data_resolves_through_callback`, `bulk_file_policy_accepts_relative_and_rejects_escapes`, CLI `dcm2xml` → `xml2dcm` JP round-trip run, CLI `bulk_data_dir_end_to_end` |
 | FR-CODEC-12 | `png_round_trip_mono16_signed`, `mono1_inverts_and_planar_rgb_renders`, `rejects_unsupported` (img), `corpus_renders_png`, CLI `dcm2img` → `img2dcm` byte-identical run |
-| FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, `loopback_find_cancel_truncates`, `loopback_storage_commit`, `storage_commit_skips_wait_on_action_failure`, PDU/DIMSE unit tests (13), `qr_scp` integration tests (17); live C-ECHO against third-party endpoint `0x0000`, live `findscu --cancel` vs `findscp` (FE00, exit 0) |
+| FR-NET-01…06 | `loopback_echo_store_find`, `loopback_move_and_get`, `loopback_find_cancel_truncates`, `loopback_storage_commit`, `storage_commit_skips_wait_on_action_failure`, PDU/DIMSE unit tests (13), `qr_scp` integration tests (17), `relational_requested_matches_bit_and_sop`, `adopt_ac_sets_relational_only_when_proposed_and_echoed`, `negotiates_relational_for_qr_contexts`, `relational_proposal_builds_bit_set_entry`; live C-ECHO against third-party endpoint `0x0000`, live `findscu --cancel` vs `findscp` (FE00, exit 0) |
 | FR-NET-07 | worklist/MPPS/commitment tests |
 | FR-NET-08 | `tls_loopback_echo`, `rejects_empty_chain_and_key` |
-| FR-NET-09…11 | `wildcard_and_range_match`, `pn_matches_leading_components`, `level_grouping_dedupes`, `responses_echo_requested_keys_only`, `sequence_keys_match_nested`, loopback `find_study_level_groups`, `find_missing_level_fails`, `move_delivers_to_destination`, `get_serves_over_same_association`, `mwl_matches_station`, `mpps_create_then_set_merges`, `mpps_rejects_bad_requests`, `mpps_final_states_reject_updates`, `mpps_reloads_persisted_steps`, `commitment_holds_partition`, `commitment_rejects_bad_requests`, loopback `loopback_mpps_create_set`, `loopback_storage_commit_push`, CLI `findscp`/`mwlscp`/`mppsscp`/`stgcmtscp` smoke runs |
-| FR-WEB-01…03 | `end_to_end_client_against_hyper`, `wado_uri_against_stub`, `wado_uri_*` param tests, dispatch/multipart tests |
-| FR-WEB-04 | `qido_finds_seeded_instance`, `wado_round_trips_file_metadata_frames`, `stow_lands_and_qido_sees_it`, wadors `frames_parse`, CLI smoke runs against `wadorsd` |
+| FR-NET-09…11 | `wildcard_and_range_match`, `pn_matches_leading_components`, `level_grouping_dedupes`, `responses_echo_requested_keys_only`, `sequence_keys_match_nested`, loopback `find_study_level_groups`, `find_missing_level_fails`, `move_delivers_to_destination`, `get_serves_over_same_association`, `mwl_matches_station`, `mpps_create_then_set_merges`, `mpps_rejects_bad_requests`, `mpps_final_states_reject_updates`, `mpps_reloads_persisted_steps`, `commitment_holds_partition`, `commitment_rejects_bad_requests`, `relational_cross_level_queries_answer`, loopback `loopback_mpps_create_set`, `loopback_storage_commit_push`, CLI `findscp`/`mwlscp`/`mppsscp`/`stgcmtscp` smoke runs |
+| FR-WEB-01…03 | `end_to_end_client_against_hyper`, `wado_uri_against_stub`, `wado_uri_*` param tests, `wado_uri_serves_instances_and_transcodes`, `wado_uri_rejects_loudly`, `store_round_trips_through_reopen`, `scan_skips_garbage_and_counts_it`, `restore_replaces_and_hint_mismatch_writes_nothing`, `traversal_uids_have_no_path`, `invalid_uid_files_are_rejected_without_disk_trace`, dispatch/multipart tests |
+| FR-WEB-04 | `qido_finds_seeded_instance`, `wado_round_trips_file_metadata_frames`, `stow_lands_and_qido_sees_it`, `open_store_memory_and_persist_modes`, `token_file_resolves_trimmed_token`, `token_file_missing_and_empty_fail_loudly`, `token_and_token_file_conflict`, wadors `frames_parse`, CLI smoke runs against `wadorsd` |
 | FR-ECG-01…03 | `vyna-dcm-ecg` tests (25); `ecg_write` example |
 | FR-CLI-01/02 | built + exercised (`echoscu/scp`, `storescu/scp`, `findscu`, `findscp`, `mwlscp`, `movescu`, `getscu`, `mppsscu`, `mppsscp`, `stgcmtscu`, `stgcmtscp`, `qidors`, `wadors`, `stowrs`, `wadorsd`, `dcmdump`, `dcm2json`, `json2dcm`, `dcm2xml`, `xml2dcm`, `dcm2img`, `img2dcm`, `dcmvalidate`, `pdf2dcm`, `dcm2pdf`, `dcmodify`, `dcm2dcm`, `dcmdir`, `deidentify`, `auditsend`); `link_route` example; `cancel_flag_parses`, `sequence_paths_parse`, `sequence_edits_apply_per_item`, `transfer_syntax_names_parse`, `quality_knobs_validate`, `injected_png_survives_lossless_targets`, `exec_template_parses_and_expands`, `exec_hook_runs_and_reports_exit`, `study_uid_prefers_top_level` |
 | FR-IOD-01…03 | `every_iod_accepts_a_valid_fixture` (all 18 IODs), `ct_negative_paths`, `conditional_rules_fire`, `part10_*` round-trips, `dcmvalidate` smoke runs |
 | FR-PDF-01…03 | `build_extract_round_trip`, `built_instance_validates_clean`, `odd_length_pdf_survives_part10`, `round_trips_all_native_syntaxes` (validates each), `non_ascii_patient_adds_utf8_charset`, `extract_*`, CLI `pdf2dcm` → `dcmvalidate` → `dcm2pdf` byte-exact run |
-| FR-DEID-01…03 | `every_action_fires`, `shift_keeps_longitudinal_intervals`, `datetimes_shift_or_dummy_by_vr`, `burned_in_annotation_refuses_before_mutation`, `uid_maps_stay_consistent_across_datasets`, `shifts_cross_month_year_and_leap_day`, profile self-checks, CLI `output_plans_*` + `process_file_round_trip`, `deidentified_ecg_validates_with_identical_samples` |
+| FR-DEID-01…03 | `every_action_fires`, `shift_keeps_longitudinal_intervals`, `datetimes_shift_or_dummy_by_vr`, `burned_in_annotation_refuses_before_mutation`, `burned_in_override_proceeds_warned_and_unmarked`, `uid_maps_stay_consistent_across_datasets`, `shifts_cross_month_year_and_leap_day`, `mono8_all_frames_redacts_inside_only`, `rgb_planar_layouts_redact_all_components`, `mono1_fills_max_and_single_frame_scopes`, `mono16_fills_whole_samples`, `bad_regions_geometries_and_syntaxes_fail_closed`, profile self-checks, CLI `output_plans_*` + `process_file_round_trip` + `process_file_redacts_pixels_before_deidentifying` + `parse_redact_accepts_forms_and_rejects_garbage`, `deidentified_ecg_validates_with_identical_samples` |
 | FR-ATNA-01…04 | `event_code_triples_are_pinned`, `transferred_xml_has_shape_and_roles`, `values_escape`, `urls_parse_with_scheme_defaults`, UDP/TCP/TLS loopbacks (+ untrusted rejection), CLI `flow_messages_*` + `subcommands_parse`, wired `audit_flags_parse` ×11, `statuses_map_to_outcomes`, live UDP/TCP/TLS ARR-stub runs |
 | FR-CHARSET-01…03 | `oracle_vectors_decode`, `oracle_vectors_round_trip` (CPython latin-1/8859-2/8859-5/8859-7/cp1254/cp874/iso2022-jp/iso2022-kr/gb18030 vectors), `jis_x_0201_is_mechanical`, `ascii_and_fallbacks_behave`, `unmappable_encodes_to_question_mark`, `round_trips_latin1_patient_name`, `round_trips_japanese_pn_component_groups`, `sequence_items_inherit_charset`, `decodes_oracle_gb18030_bytes`, `dcmdump` CJK smoke runs |
-| NFR-04 | `rejects_garbage`, `rejects_non_part10`, `rejects_bad_json`, `rejects_missing_boundary`, unknown-route 404 tests |
+| NFR-04 | `rejects_garbage`, `rejects_non_part10`, `rejects_bad_json`, `rejects_missing_boundary`, `truncated_and_mutated_datasets_never_panic`, `truncated_and_mutated_files_never_panic`, `truncated_and_mutated_frames_never_panic`, unknown-route 404 tests |
 | NFR-07 | CI-equivalent gate run per change (see §4) |

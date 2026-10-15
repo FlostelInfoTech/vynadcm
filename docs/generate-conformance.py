@@ -331,6 +331,23 @@ assert "build_dicomdir" in codec_src and "read_dicomdir" in codec_src, (
 web_client = (WORKSPACE / "crates" / "vyna-dcm-web" / "src" / "client.rs").read_text()
 for fn in ("qido", "search_studies", "wado_dataset", "wado_uri_dataset", "stow"):
     assert f"pub async fn {fn}" in web_client, f"conformance: web client {fn} moved"
+dicomdir_src = (WORKSPACE / "crates" / "vyna-dcm-codec" / "src" / "dicomdir.rs").read_text()
+assert "follow_mrdr" in dicomdir_src, "conformance: MRDR following moved"
+filestore_src = (WORKSPACE / "crates" / "vyna-dcm-web" / "src" / "filestore.rs").read_text()
+assert "pub struct FileStore" in filestore_src, "conformance: FileStore moved"
+web_server_src = (WORKSPACE / "crates" / "vyna-dcm-web" / "src" / "server.rs").read_text()
+assert '("GET", ["wado"])' in web_server_src, "conformance: WADO-URI route moved"
+wadorsd_src = (BINS / "wadorsd.rs").read_text()
+assert "FileStore::open" in wadorsd_src, "conformance: wadorsd --persist moved"
+
+# -- relational extended negotiation -------------------------------------------------
+
+pdu_src = (NET / "pdu.rs").read_text()
+assoc_src = (NET / "association.rs").read_text()
+assert "relational_requested" in pdu_src and "0x56" in pdu_src, (
+    "conformance: 0x56 relational codec moved"
+)
+assert "relational: bool" in assoc_src, "conformance: NegotiatedContext.relational moved"
 
 # -- per-tool services -----------------------------------------------------------
 
@@ -407,6 +424,20 @@ for name in bin_names:
         if name == "findscu":
             assert "args.cancel" in src, "conformance: findscu --cancel vanished"
             notes.append("`--cancel N` stops after N matches; a requested FE00 exits 0")
+        if name in ("findscu", "movescu", "getscu"):
+            assert "relational_proposal(" in src, (
+                f"conformance: {name} --relational vanished"
+            )
+            notes.append(
+                "`--relational` proposes relational-queries extended negotiation "
+                "(0x56) for the QR SOP Class; the exchange stays hierarchical "
+                "unless the peer echoes it"
+            )
+            if name == "findscu":
+                assert "args.relational && !is_mwl" in src, (
+                    "conformance: findscu MWL relational exclusion moved"
+                )
+                notes.append("`--relational` is ignored for `--model mwl`")
     elif kind == "SCP":
         for m in re.finditer(r"async fn (on_\w+)", src):
             svc = SCP_HANDLERS.get(m.group(1))
@@ -420,6 +451,17 @@ for name in bin_names:
             notes.append(
                 "N-CREATE inserts a step, N-SET merges over it, final states "
                 "reject updates; steps persist as Part-10 files named by MPPS UID"
+            )
+        if name == "findscp":
+            assert "relational_acceptance" in service_src, (
+                "conformance: findscp relational echo moved"
+            )
+            assert "is_qr_retrieve_sop" in service_src, (
+                "conformance: relational QR gate moved"
+            )
+            notes.append(
+                "echoes relational-queries extended negotiation (0x56) for QR "
+                "C-FIND/C-MOVE/C-GET contexts that propose it"
             )
         if name == "stgcmtscp":
             assert "pub struct StgCommitScp" in qrdb_src, "conformance: StgCommitScp vanished"
@@ -528,9 +570,13 @@ add(f"  accepted incoming PDU is {MAX_INCOMING_H} (`max_incoming_pdu`).")
 add(f"- Timeouts: SCU tools default to a {SCU_TIMEOUT} s per-read timeout,")
 add(f"  SCP tools to {SCP_TIMEOUT} s (`--timeout-secs`).")
 add("- The SCU proposes no Role Selection and no User Identity; the")
-add("  SCP accepts (echoes) any roles the peer proposes. No other")
-add("  extended negotiation (asynchronous operations, SOP Class")
-add("  extended/common negotiation) is offered by either side.")
+add("  SCP accepts (echoes) any roles the peer proposes.")
+add("- SOP Class extended negotiation (0x56) carries relational-queries")
+add("  requests: the QR SCU tools propose it behind `--relational`, the")
+add("  SCP echoes it for QR C-FIND/C-MOVE/C-GET contexts only, and the")
+add("  SCU treats the exchange as relational only when its proposal is")
+add("  echoed. No other extended negotiation (asynchronous operations,")
+add("  SOP Class common negotiation) is offered by either side.")
 add("- SCU tools request release after their service; SCP tools answer")
 add("  release and abort cleanly. Protocol violations abort the")
 add("  association (A-ABORT source 2).")
@@ -577,7 +623,10 @@ add("- Client: QIDO-RS search (`qido`, `search_studies/series/instances`),")
 add("  WADO-RS retrieve (`wado_parts/file/dataset/metadata`), legacy")
 add("  WADO-URI (`wado_uri`, `wado_uri_dataset`), STOW-RS store (`stow`).")
 add("- Server (default `server` feature): framework-agnostic dispatch")
-add("  over an in-memory store, with a hyper front end.")
+add("  over an in-memory store (or a durable `FileStore` directory")
+add("  behind `wadorsd --persist`), with a hyper front end; it also")
+add("  answers legacy WADO-URI `GET /wado` (DICOM-only, with")
+add("  `transferSyntax` transcode; rendering knobs are refused).")
 add("- CLIs: `qidors` (search), `wadors` (retrieve), `stowrs` (store),")
 add("  `wadorsd` (stub server over a directory).")
 add("")
@@ -587,6 +636,9 @@ add("- `read_dicomdir` (File Set Reader) and `build_dicomdir` (File Set")
 add("  Creator) plus the `dcmdir` CLI; directory records are encoded")
 add("  Explicit VR Little Endian. No physical-media handling: file sets")
 add("  live in the filesystem.")
+add("- The reader follows `MRDR` multi-references to their target")
+add("  instance (loop-guarded; unresolvable targets are skipped, never")
+add("  fatal).")
 add("")
 add("## 5. Character sets")
 add("")

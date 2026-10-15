@@ -64,6 +64,8 @@ release/abort, and loop.
   - Modality Worklist — FIND (`1.2.840.10008.5.1.4.31`).
 - Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
 - Note: `--cancel N` stops after N matches; a requested FE00 exits 0.
+- Note: `--relational` proposes relational-queries extended negotiation (0x56) for the QR SOP Class; the exchange stays hierarchical unless the peer echoes it.
+- Note: `--relational` is ignored for `--model mwl`.
 
 #### 3.1.4 `movescu` — C-MOVE retrieve: the peer sends matches to --dest (run storescp there)
 
@@ -73,6 +75,7 @@ release/abort, and loop.
   - Patient Root Q/R — MOVE (`1.2.840.10008.5.1.4.1.2.1.2`).
   - Patient/Study Only Q/R — MOVE (`1.2.840.10008.5.1.4.1.2.3.2`).
 - Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
+- Note: `--relational` proposes relational-queries extended negotiation (0x56) for the QR SOP Class; the exchange stays hierarchical unless the peer echoes it.
 
 #### 3.1.5 `getscu` — C-GET retrieve into a directory (instances arrive on this association)
 
@@ -107,6 +110,7 @@ release/abort, and loop.
   - Encapsulated CDA Storage (`1.2.840.10008.5.1.4.1.1.104.2`).
   - Positron Emission Tomography Image Storage (`1.2.840.10008.5.1.4.1.1.128`).
 - Transfer syntaxes proposed: Explicit VR Little Endian and Implicit VR Little Endian.
+- Note: `--relational` proposes relational-queries extended negotiation (0x56) for the QR SOP Class; the exchange stays hierarchical unless the peer echoes it.
 
 #### 3.1.6 `mppsscu` — Send an MPPS N-CREATE followed by N-SET
 
@@ -135,6 +139,7 @@ release/abort, and loop.
 #### 3.2.3 `findscp` — Serve C-FIND/C-MOVE/C-GET from a directory
 
 - Services handled: C-FIND, C-MOVE, C-GET.
+- Note: echoes relational-queries extended negotiation (0x56) for QR C-FIND/C-MOVE/C-GET contexts that propose it.
 
 #### 3.2.4 `mwlscp` — Serve MWL C-FIND from a directory
 
@@ -169,9 +174,13 @@ authentication unless the embedding application installs the
 - Timeouts: SCU tools default to a 30 s per-read timeout,
   SCP tools to 300 s (`--timeout-secs`).
 - The SCU proposes no Role Selection and no User Identity; the
-  SCP accepts (echoes) any roles the peer proposes. No other
-  extended negotiation (asynchronous operations, SOP Class
-  extended/common negotiation) is offered by either side.
+  SCP accepts (echoes) any roles the peer proposes.
+- SOP Class extended negotiation (0x56) carries relational-queries
+  requests: the QR SCU tools propose it behind `--relational`, the
+  SCP echoes it for QR C-FIND/C-MOVE/C-GET contexts only, and the
+  SCU treats the exchange as relational only when its proposal is
+  echoed. No other extended negotiation (asynchronous operations,
+  SOP Class common negotiation) is offered by either side.
 - SCU tools request release after their service; SCP tools answer
   release and abort cleanly. Protocol violations abort the
   association (A-ABORT source 2).
@@ -217,7 +226,10 @@ authentication unless the embedding application installs the
   WADO-RS retrieve (`wado_parts/file/dataset/metadata`), legacy
   WADO-URI (`wado_uri`, `wado_uri_dataset`), STOW-RS store (`stow`).
 - Server (default `server` feature): framework-agnostic dispatch
-  over an in-memory store, with a hyper front end.
+  over an in-memory store (or a durable `FileStore` directory
+  behind `wadorsd --persist`), with a hyper front end; it also
+  answers legacy WADO-URI `GET /wado` (DICOM-only, with
+  `transferSyntax` transcode; rendering knobs are refused).
 - CLIs: `qidors` (search), `wadors` (retrieve), `stowrs` (store),
   `wadorsd` (stub server over a directory).
 
@@ -227,6 +239,9 @@ authentication unless the embedding application installs the
   Creator) plus the `dcmdir` CLI; directory records are encoded
   Explicit VR Little Endian. No physical-media handling: file sets
   live in the filesystem.
+- The reader follows `MRDR` multi-references to their target
+  instance (loop-guarded; unresolvable targets are skipped, never
+  fatal).
 
 ## 5. Character sets
 
