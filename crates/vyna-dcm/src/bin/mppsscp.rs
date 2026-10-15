@@ -54,7 +54,13 @@ struct MppsScpServer {
 }
 
 impl MppsScpServer {
-    fn audit_mpps(&self, ctx: &RequestContext<'_>, uid: &str, status: u16, ds: Option<&DataSet>) {
+    async fn audit_mpps(
+        &self,
+        ctx: &RequestContext<'_>,
+        uid: &str,
+        status: u16,
+        ds: Option<&DataSet>,
+    ) {
         let Some(audit) = &self.audit else {
             return;
         };
@@ -72,7 +78,7 @@ impl MppsScpServer {
                     &audit.source,
                 );
                 msg.outcome = common::outcome_for_status(status);
-                emit_best_effort(Some(&audit.sender), &msg, "mppsscp");
+                emit_best_effort(Some(&audit.sender), &msg, "mppsscp").await;
             }
             None => eprintln!("mppsscp: skipping audit for {uid}: no Study UID"),
         }
@@ -95,7 +101,7 @@ impl Handlers for MppsScpServer {
             "mpps N-CREATE {uid} from {}: {status:#06X}",
             ctx.association.peer_ae.as_str()
         );
-        self.audit_mpps(ctx, uid, status, dataset.as_ref());
+        self.audit_mpps(ctx, uid, status, dataset.as_ref()).await;
         (status, rsp)
     }
 
@@ -116,7 +122,7 @@ impl Handlers for MppsScpServer {
         );
         // Audit the merged step (carries the scheduled-step linkage).
         let merged = self.inner.get(uid);
-        self.audit_mpps(ctx, uid, status, merged.as_ref());
+        self.audit_mpps(ctx, uid, status, merged.as_ref()).await;
         (status, rsp)
     }
 }
@@ -145,7 +151,7 @@ async fn main() -> Result<()> {
             &audit.source,
             true,
         );
-        emit_best_effort(Some(&audit.sender), &msg, "mppsscp");
+        emit_best_effort(Some(&audit.sender), &msg, "mppsscp").await;
     }
 
     let tls = args.listen.tls_acceptor()?;

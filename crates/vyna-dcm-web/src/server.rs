@@ -9,7 +9,8 @@ use bytes::Bytes;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
 use vyna_dcm_codec::{
-    FileMeta, dataset_to_json, decode_pixels, read_part10, read_part10_header, write_part10,
+    FileMeta, TranscodeOptions, dataset_to_json, decode_pixels, read_part10, read_part10_header,
+    transcode_dataset, write_part10,
 };
 use vyna_dcm_core::{DataSet, Tag, TransferSyntax, Value, Vr, lookup, lookup_keyword, tags};
 
@@ -480,46 +481,13 @@ impl DicomWebStore for MemoryStore {
         file: Bytes,
         study_hint: Option<&str>,
     ) -> std::result::Result<StoredIds, String> {
-        // A single file over the byte cap would evict the whole store
-        // (including itself) and still report success; refuse it.
-        // This also bounds bulk blobs: blobs are extracted from stored
-        // instances, so none can exceed the cap either.
-        if file.len() > MAX_INSTANCE_BYTES {
-            return Err(format!(
-                "instance ({} bytes) exceeds the store cap of {MAX_INSTANCE_BYTES} bytes",
-                file.len()
-            ));
-        }
-        let (meta, dataset) = read_part10(&file).map_err(|e| e.to_string())?;
-        let study = dataset
-            .string(tags::STUDY_INSTANCE_UID)
-            .ok_or("missing Study Instance UID")?
-            .to_string();
-        let series = dataset
-            .string(tags::SERIES_INSTANCE_UID)
-            .ok_or("missing Series Instance UID")?
-            .to_string();
-        let instance = dataset
-            .string(tags::SOP_INSTANCE_UID)
-            .ok_or("missing SOP Instance UID")?
-            .to_string();
-        // File meta always carries the class (`read_part10` requires
-        // it), so the STOW response refs never go without.
-        let sop_class = dataset
-            .string(tags::SOP_CLASS_UID)
-            .map(str::to_string)
-            .unwrap_or_else(|| meta.media_storage_sop_class_uid.clone());
-        if let Some(hint) = study_hint
-            && hint != study
-        {
-            return Err(format!(
-                "STOW study {hint} does not match file study {study}"
-            ));
-        }
-        let ts = meta.transfer_syntax().map_err(|e| e.to_string())?;
+        let parsed = parse_instance(&file, study_hint)?;
         let mut inner = self.lock();
         // Replace on re-store (same SOP Instance UID).
-        if let Some(pos) = inner.instances.iter().position(|i| i.instance == instance)
+        if let Some(pos) = inner
+            .instances
+            .iter()
+            .position(|i| i.instance == parsed.instance)
             && let Some(old) = inner.instances.remove(pos)
         {
             inner.instance_bytes = inner.instance_bytes.saturating_sub(old.file.len());
@@ -528,12 +496,12 @@ impl DicomWebStore for MemoryStore {
         // 32-bit / huge direct-dispatch inputs, corrupting eviction.
         inner.instance_bytes = inner.instance_bytes.saturating_add(file.len());
         inner.instances.push_back(StoredInstance {
-            study: study.clone(),
-            series: series.clone(),
-            instance: instance.clone(),
+            study: parsed.study.clone(),
+            series: parsed.series.clone(),
+            instance: parsed.instance.clone(),
             file,
-            dataset,
-            transfer_syntax: ts,
+            dataset: parsed.dataset,
+            transfer_syntax: parsed.transfer_syntax,
         });
         while inner.instances.len() > MAX_INSTANCES || inner.instance_bytes > MAX_INSTANCE_BYTES {
             let Some(oldest) = inner.instances.pop_front() else {
@@ -542,10 +510,10 @@ impl DicomWebStore for MemoryStore {
             inner.instance_bytes = inner.instance_bytes.saturating_sub(oldest.file.len());
         }
         Ok(StoredIds {
-            study,
-            series,
-            instance,
-            sop_class,
+            study: parsed.study,
+            series: parsed.series,
+            instance: parsed.instance,
+            sop_class: parsed.sop_class,
         })
     }
 
@@ -577,6 +545,71 @@ impl DicomWebStore for MemoryStore {
     fn bulk_data(&self, id: &str) -> Option<(Bytes, String)> {
         self.lock().bulk.get(id).cloned()
     }
+}
+
+/// A Part-10 file parsed and validated for storage, shared by
+/// [`MemoryStore`] and `FileStore` so both accept exactly the same inputs.
+pub(crate) struct ParsedInstance {
+    pub(crate) study: String,
+    pub(crate) series: String,
+    pub(crate) instance: String,
+    pub(crate) sop_class: String,
+    pub(crate) dataset: DataSet,
+    pub(crate) transfer_syntax: TransferSyntax,
+}
+
+/// Validate one file for storage: byte cap first (a huge upload
+/// must fail fast, before parsing), then Part-10 parse, the three
+/// instance UIDs, the STOW study hint, and the transfer syntax.
+pub(crate) fn parse_instance(
+    file: &Bytes,
+    study_hint: Option<&str>,
+) -> std::result::Result<ParsedInstance, String> {
+    // A single file over the byte cap would evict the whole store
+    // (including itself) and still report success; refuse it.
+    // This also bounds bulk blobs: blobs are extracted from stored
+    // instances, so none can exceed the cap either.
+    if file.len() > MAX_INSTANCE_BYTES {
+        return Err(format!(
+            "instance ({} bytes) exceeds the store cap of {MAX_INSTANCE_BYTES} bytes",
+            file.len()
+        ));
+    }
+    let (meta, dataset) = read_part10(file).map_err(|e| e.to_string())?;
+    let study = dataset
+        .string(tags::STUDY_INSTANCE_UID)
+        .ok_or("missing Study Instance UID")?
+        .to_string();
+    let series = dataset
+        .string(tags::SERIES_INSTANCE_UID)
+        .ok_or("missing Series Instance UID")?
+        .to_string();
+    let instance = dataset
+        .string(tags::SOP_INSTANCE_UID)
+        .ok_or("missing SOP Instance UID")?
+        .to_string();
+    // File meta always carries the class (`read_part10` requires
+    // it), so the STOW response refs never go without.
+    let sop_class = dataset
+        .string(tags::SOP_CLASS_UID)
+        .map(str::to_string)
+        .unwrap_or_else(|| meta.media_storage_sop_class_uid.clone());
+    if let Some(hint) = study_hint
+        && hint != study
+    {
+        return Err(format!(
+            "STOW study {hint} does not match file study {study}"
+        ));
+    }
+    let transfer_syntax = meta.transfer_syntax().map_err(|e| e.to_string())?;
+    Ok(ParsedInstance {
+        study,
+        series,
+        instance,
+        sop_class,
+        dataset,
+        transfer_syntax,
+    })
 }
 
 /// Remove bulk elements, returning the extracted blobs.
@@ -1196,6 +1229,7 @@ pub fn dispatch<S: DicomWebStore>(store: &S, public_base: &str, req: &HttpReques
             Some((bytes, ct)) => HttpResponse::bytes(200, ct, bytes),
             None => HttpResponse::text(404, "bulk data not found"),
         },
+        ("GET", ["wado"]) => wado_uri(store, req),
         ("POST", ["studies"]) => stow(store, base, None, req),
         ("POST", ["studies", study]) => stow(store, base, Some(study), req),
         ("GET", _) => HttpResponse::text(404, "unknown DICOMweb resource"),
@@ -1218,6 +1252,91 @@ const MAX_QIDO_QUERY_BYTES: usize = 64 * 1024;
 /// rejected outright (see above); this caps the parse/lookup work of
 /// distinct entries. 10,000 covers any real multiframe object.
 const MAX_WADO_FRAMES: usize = 10_000;
+
+/// WADO-URI (`GET /wado?...`, PS3.18 retired §C.3): full-instance
+/// retrieve by query UIDs. Only `contentType=application/dicom` is
+/// served (rendering is out of scope); any other present parameter
+/// outside the supported set is a 400 — silently ignoring
+/// `anonymize` or sizing knobs would mislead callers.
+fn wado_uri<S: DicomWebStore>(store: &S, req: &HttpRequest) -> HttpResponse {
+    let params = parse_query(&req.query);
+    let get = |key: &str| {
+        params
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    match get("requestType") {
+        Some(t) if t.eq_ignore_ascii_case("wado") => {}
+        _ => return HttpResponse::text(400, "wado needs requestType=WADO"),
+    }
+    for key in ["studyUID", "seriesUID", "objectUID"] {
+        match get(key) {
+            Some(v) if !v.is_empty() => {}
+            _ => return HttpResponse::text(400, format!("wado needs {key}")),
+        }
+    }
+    for (k, _) in &params {
+        if !matches!(
+            k.as_str(),
+            "requestType"
+                | "studyUID"
+                | "seriesUID"
+                | "objectUID"
+                | "contentType"
+                | "transferSyntax"
+        ) {
+            return HttpResponse::text(400, format!("unsupported wado parameter: {k}"));
+        }
+    }
+    if let Some(ct) = get("contentType")
+        && !ct.eq_ignore_ascii_case("application/dicom")
+    {
+        return HttpResponse::text(
+            406,
+            format!("wado serves contentType=application/dicom, not {ct}"),
+        );
+    }
+    let (study, series, instance) = (
+        get("studyUID").unwrap(),
+        get("seriesUID").unwrap(),
+        get("objectUID").unwrap(),
+    );
+    let file = match store.instance_file(study, series, instance) {
+        Some(f) => f,
+        None => return HttpResponse::text(404, "instance not found"),
+    };
+    match get("transferSyntax") {
+        None => HttpResponse::bytes(200, "application/dicom", file),
+        Some(ts_uid) => wado_uri_transcoded(&file, ts_uid),
+    }
+}
+
+/// Re-encode one stored instance to the requested transfer syntax.
+fn wado_uri_transcoded(file: &Bytes, ts_uid: &str) -> HttpResponse {
+    let target = match TransferSyntax::from_uid(ts_uid) {
+        Some(ts) => ts,
+        None => return HttpResponse::text(400, format!("unknown transferSyntax {ts_uid}")),
+    };
+    let (meta, ds) = match read_part10(file) {
+        Ok(v) => v,
+        Err(_) => return HttpResponse::text(500, "stored instance unreadable"),
+    };
+    let stored = match meta.transfer_syntax() {
+        Ok(ts) => ts,
+        Err(_) => return HttpResponse::text(500, "stored instance has unknown transfer syntax"),
+    };
+    let out = match transcode_dataset(&ds, stored, target, &TranscodeOptions::default()) {
+        Ok(ds) => ds,
+        Err(e) => return HttpResponse::text(400, format!("cannot convert to {ts_uid}: {e}")),
+    };
+    let class = meta.media_storage_sop_class_uid.clone();
+    let inst = meta.media_storage_sop_instance_uid.clone();
+    match write_part10(&FileMeta::new(class, inst, target), &out) {
+        Ok(bytes) => HttpResponse::bytes(200, "application/dicom", bytes),
+        Err(e) => HttpResponse::text(500, e.to_string()),
+    }
+}
 
 /// RetrieveStudy/RetrieveSeries body: every instance file as one
 /// `application/dicom` part; empty means the study/series is unknown.
@@ -2471,6 +2590,121 @@ mod tests {
             dispatch(&store, "http://x/wado", &get_accept(&meta, "text/html")).status,
             406
         );
+    }
+
+    #[test]
+    fn wado_uri_serves_instances_and_transcodes() {
+        let store = stored();
+        let base = "http://x";
+        let uri = "/wado?requestType=WADO&studyUID=1.2.3&seriesUID=1.2.3.1&objectUID=1.2.3.1.1";
+        // Plain retrieve: raw Part-10 bytes (not multipart).
+        let r = dispatch(&store, base, &get(uri));
+        assert_eq!(r.status, 200);
+        assert!(
+            r.headers
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "application/dicom"),
+            "{:?}",
+            r.headers
+        );
+        let (_, ds) = read_part10(&r.body).unwrap();
+        assert_eq!(ds.string(tags::SOP_INSTANCE_UID), Some("1.2.3.1.1"));
+        // Explicit contentType + same-syntax transferSyntax.
+        let r = dispatch(
+            &store,
+            base,
+            &get(&format!(
+                "{uri}&contentType=application/dicom&transferSyntax=1.2.840.10008.1.2.1"
+            )),
+        );
+        assert_eq!(r.status, 200);
+        // Cross-syntax transcode (explicit -> implicit LE) needs a
+        // fully-described image; the shared fixture omits Photometric
+        // Interpretation, so store a complete one here.
+        let mut img = DataSet::new();
+        img.put_uid(tags::SOP_CLASS_UID, vyna_dcm_core::sop_class::CT_IMAGE);
+        img.put_uid(tags::SOP_INSTANCE_UID, "1.2.3.9.1");
+        img.put_uid(tags::STUDY_INSTANCE_UID, "1.2.3.9");
+        img.put_uid(tags::SERIES_INSTANCE_UID, "1.2.3.9.1");
+        img.put_u16_single(tags::ROWS, 4);
+        img.put_u16_single(tags::COLUMNS, 4);
+        img.put_u16_single(tags::SAMPLES_PER_PIXEL, 1);
+        img.put_u16_single(tags::BITS_ALLOCATED, 16);
+        img.put_text(tags::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "MONOCHROME2");
+        img.put_bytes(tags::PIXEL_DATA, Vr::Ow, vec![0x11; 32]);
+        let meta = FileMeta::new(
+            vyna_dcm_core::sop_class::CT_IMAGE,
+            "1.2.3.9.1",
+            TransferSyntax::ExplicitVrLittleEndian,
+        );
+        store
+            .store_instance(Bytes::from(write_part10(&meta, &img).unwrap()), None)
+            .unwrap();
+        let r = dispatch(
+            &store,
+            base,
+            &get(
+                "/wado?requestType=WADO&studyUID=1.2.3.9&seriesUID=1.2.3.9.1&objectUID=1.2.3.9.1&transferSyntax=1.2.840.10008.1.2",
+            ),
+        );
+        assert_eq!(r.status, 200);
+        let (meta, back) = read_part10(&r.body).unwrap();
+        assert_eq!(meta.transfer_syntax_uid, "1.2.840.10008.1.2");
+        assert_eq!(back.string(tags::SOP_INSTANCE_UID), Some("1.2.3.9.1"));
+        match &back.get(tags::PIXEL_DATA).unwrap().value {
+            Value::Bytes(px) => assert_eq!(px, &vec![0x11; 32]),
+            other => panic!("pixels lost: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn wado_uri_rejects_loudly() {
+        let store = stored();
+        let base = "http://x";
+        let good = "requestType=WADO&studyUID=1.2.3&seriesUID=1.2.3.1&objectUID=1.2.3.1.1";
+        // Missing/wrong requestType or UIDs.
+        for q in [
+            "studyUID=1.2.3&seriesUID=1.2.3.1&objectUID=1.2.3.1.1",
+            "requestType=WADO&seriesUID=1.2.3.1&objectUID=1.2.3.1.1",
+            "requestType=BAD&studyUID=1.2.3&seriesUID=1.2.3.1&objectUID=1.2.3.1.1",
+            "requestType=WADO&studyUID=&seriesUID=1.2.3.1&objectUID=1.2.3.1.1",
+        ] {
+            assert_eq!(
+                dispatch(&store, base, &get(&format!("/wado?{q}"))).status,
+                400,
+                "{q}"
+            );
+        }
+        // Rendered content: 406, never a silent wrong format.
+        let r = dispatch(
+            &store,
+            base,
+            &get(&format!("/wado?{good}&contentType=image/jpeg")),
+        );
+        assert_eq!(r.status, 406);
+        // Rendering/de-id knobs and unknown params: 400, never ignored.
+        for q in [
+            format!("{good}&anonymize=yes"),
+            format!("{good}&frameNumber=1"),
+            format!("{good}&rows=256"),
+            format!("{good}&bogus=1"),
+        ] {
+            let r = dispatch(&store, base, &get(&format!("/wado?{q}")));
+            assert_eq!(r.status, 400, "{q}");
+        }
+        // Unknown instance and unknown transfer syntax.
+        let r = dispatch(
+            &store,
+            base,
+            &get("/wado?requestType=WADO&studyUID=9.9.9&seriesUID=9.9.9&objectUID=9.9.9"),
+        );
+        assert_eq!(r.status, 404);
+        let r = dispatch(
+            &store,
+            base,
+            &get(&format!("/wado?{good}&transferSyntax=9.9.9.9")),
+        );
+        assert_eq!(r.status, 400);
     }
 
     #[test]

@@ -47,7 +47,7 @@ struct StgCommitScpServer {
 }
 
 impl StgCommitScpServer {
-    fn audit_report(
+    async fn audit_report(
         &self,
         ctx: &RequestContext<'_>,
         status: u16,
@@ -75,7 +75,7 @@ impl StgCommitScpServer {
                         } else {
                             common::outcome_for_status(status)
                         };
-                        emit_best_effort(Some(&audit.sender), &msg, "stgcmtscp");
+                        emit_best_effort(Some(&audit.sender), &msg, "stgcmtscp").await;
                     }
                     None => skipped += 1,
                 }
@@ -104,7 +104,7 @@ impl Handlers for StgCommitScpServer {
                 ok_n += ok.len();
                 failed_n += failed.len();
                 if let Some(audit) = &self.audit {
-                    self.audit_report(ctx, status, ds, audit);
+                    self.audit_report(ctx, status, ds, audit).await;
                 }
             }
         }
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
             &audit.source,
             true,
         );
-        emit_best_effort(Some(&audit.sender), &msg, "stgcmtscp");
+        emit_best_effort(Some(&audit.sender), &msg, "stgcmtscp").await;
     }
 
     let tls = args.listen.tls_acceptor()?;

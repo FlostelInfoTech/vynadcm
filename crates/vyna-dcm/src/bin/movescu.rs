@@ -6,7 +6,7 @@ mod common;
 use clap::Parser;
 use common::{
     AuditArgs, ConnArgs, anyhowish::Result, build_qr_query, emit_best_effort, host_of,
-    outcome_for_status,
+    outcome_for_status, relational_proposal,
 };
 use vyna_dcm::core::sop_class;
 
@@ -28,6 +28,10 @@ struct Args {
     /// Matching keys as KEY=value (keyword or GGGGEEEE tag). Repeatable.
     #[arg(short, long = "key")]
     keys: Vec<String>,
+    /// Propose relational-queries extended negotiation (cross-level
+    /// keys without unique parents).
+    #[arg(long, default_value_t = false)]
+    relational: bool,
     #[command(flatten)]
     audit: AuditArgs,
 }
@@ -49,9 +53,10 @@ async fn main() -> Result<()> {
     let sop = move_sop_for_model(&args.model)?;
     let query = build_qr_query(&args.keys, false)?;
 
+    let extended = relational_proposal(args.relational, sop);
     let mut assoc = args
         .conn
-        .connect(&[sop], &ConnArgs::default_syntaxes())
+        .connect(&[sop], &ConnArgs::default_syntaxes(), extended)
         .await?;
     let r = assoc.move_to(sop, &query, &args.dest, 0).await?;
     println!(
@@ -79,7 +84,7 @@ async fn main() -> Result<()> {
         } else {
             outcome_for_status(r.status)
         };
-        emit_best_effort(Some(&audit.sender), &msg, "movescu");
+        emit_best_effort(Some(&audit.sender), &msg, "movescu").await;
     }
     assoc.release().await?;
     if r.status != 0 {

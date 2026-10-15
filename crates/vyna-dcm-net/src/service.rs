@@ -24,7 +24,10 @@ use crate::{
         NegotiatedContext,
     },
     dimse::{Command, DimseMessage, command_field as CF, priority, status},
-    pdu::{AcceptedContext, AssociateAc, AssociateRj, Pdu, ProposedContext},
+    pdu::{
+        AcceptedContext, AssociateAc, AssociateRj, Pdu, ProposedContext, relational_acceptance,
+        relational_requested,
+    },
 };
 
 /// User-identity check: `Some(response)` accepts (response echoed back when
@@ -166,6 +169,7 @@ pub fn negotiate(
 
     let mut contexts = Vec::new();
     let mut pcs = Vec::new();
+    let mut extended = Vec::new();
     for prop in &rq.presentation_contexts {
         if let Some(only) = &opts.accepted_sop_classes
             && !only.contains(&prop.abstract_syntax)
@@ -186,11 +190,21 @@ pub fn negotiate(
             Some(ts_uid) => {
                 // Parse defensively; our accepted list is known-good.
                 if let Some(ts) = vyna_dcm_core::TransferSyntax::from_uid(&ts_uid) {
+                    // Relational queries are accepted per QR context
+                    // when proposed (bit 0); anything else (non-QR
+                    // SOP, unset bit, absent entry) stays hierarchical
+                    // and gets no echo.
+                    let relational = is_qr_retrieve_sop(&prop.abstract_syntax)
+                        && relational_requested(&rq.extended_negotiation, &prop.abstract_syntax);
+                    if relational {
+                        extended.push(relational_acceptance(&prop.abstract_syntax));
+                    }
                     contexts.push(NegotiatedContext {
                         id: prop.id,
                         abstract_syntax: prop.abstract_syntax.clone(),
                         transfer_syntax: ts,
                         transfer_syntax_uid: ts_uid.clone(),
+                        relational,
                     });
                     pcs.push(AcceptedContext {
                         id: prop.id,
@@ -226,9 +240,27 @@ pub fn negotiate(
             async_ops: None, // synchronous: one outstanding operation per association
             role_selection: rq.role_selection.clone(), // accept proposed roles
             user_identity_response: identity_response,
+            extended_negotiation: extended,
         },
         contexts,
     ))
+}
+
+/// SOP classes whose C-FIND/C-MOVE/C-GET accept relational-queries
+/// extended negotiation (Study/Patient Root + Patient/Study Only).
+fn is_qr_retrieve_sop(sop: &str) -> bool {
+    use vyna_dcm_core::sop_class as sc;
+    matches!(
+        sop,
+        sc::PATIENT_ROOT_FIND
+            | sc::PATIENT_ROOT_MOVE
+            | sc::PATIENT_ROOT_GET
+            | sc::STUDY_ROOT_FIND
+            | sc::STUDY_ROOT_MOVE
+            | sc::STUDY_ROOT_GET
+            | sc::PATIENT_STUDY_ONLY_FIND
+            | sc::PATIENT_STUDY_ONLY_MOVE
+    )
 }
 
 /// Request context handed to [`Handlers`].
@@ -1471,6 +1503,7 @@ mod tests {
             abstract_syntax: sop.to_string(),
             transfer_syntax: TransferSyntax::ExplicitVrLittleEndian,
             transfer_syntax_uid: TransferSyntax::ExplicitVrLittleEndian.uid().to_string(),
+            relational: false,
         };
         let info = AssociationInfo {
             local_ae: AeTitle::new("SCP").unwrap(),
@@ -1686,6 +1719,7 @@ mod tests {
             async_ops: None,
             role_selection: vec![],
             user_identity: None,
+            extended_negotiation: vec![],
         }
     }
 
@@ -1696,6 +1730,41 @@ mod tests {
         assert_eq!(ac.presentation_contexts[0].result, 0);
         assert_eq!(ctxs.len(), 1);
         assert_eq!(ctxs[0].transfer_syntax_uid, "1.2.840.10008.1.2.1");
+    }
+
+    #[test]
+    fn negotiates_relational_for_qr_contexts() {
+        use vyna_dcm_core::sop_class as sc;
+        let opts = AcceptorOptions::default();
+        // QR + bit set: echoed + flagged.
+        let mut rq = sample_rq();
+        rq.presentation_contexts[0].abstract_syntax = sc::STUDY_ROOT_FIND.to_string();
+        rq.extended_negotiation = vec![crate::pdu::ExtendedNegotiation {
+            sop_class_uid: sc::STUDY_ROOT_FIND.to_string(),
+            app_info: vec![1],
+        }];
+        let (ac, ctxs) = negotiate(&rq, &opts).unwrap();
+        assert!(ctxs[0].relational);
+        assert_eq!(ac.extended_negotiation.len(), 1);
+        assert_eq!(
+            ac.extended_negotiation[0].sop_class_uid,
+            sc::STUDY_ROOT_FIND
+        );
+        assert_eq!(ac.extended_negotiation[0].app_info, vec![1]);
+        // Bit unset: no echo, stays hierarchical.
+        rq.extended_negotiation[0].app_info = vec![0];
+        let (ac, ctxs) = negotiate(&rq, &opts).unwrap();
+        assert!(!ctxs[0].relational);
+        assert!(ac.extended_negotiation.is_empty());
+        // Non-QR SOP with bit set: ignored entirely.
+        rq.presentation_contexts[0].abstract_syntax = sc::CT_IMAGE.to_string();
+        rq.extended_negotiation = vec![crate::pdu::ExtendedNegotiation {
+            sop_class_uid: sc::CT_IMAGE.to_string(),
+            app_info: vec![1],
+        }];
+        let (ac, ctxs) = negotiate(&rq, &opts).unwrap();
+        assert!(!ctxs[0].relational);
+        assert!(ac.extended_negotiation.is_empty());
     }
 
     #[test]

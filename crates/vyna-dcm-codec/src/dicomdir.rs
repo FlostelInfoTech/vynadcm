@@ -8,8 +8,9 @@
 //! the standard record keys from their datasets and computing exact
 //! byte offsets in two measured passes.
 //!
-//! Multi-referenced records (`MRDR`) are reported as skipped rather
-//! than followed.
+//! Multi-referenced records (`MRDR`) are followed to their shared
+//! leaf (loop-guarded) and listed under the referencing series with
+//! the `MRDR` record type; unresolvable ones are reported as skipped.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -363,6 +364,13 @@ impl Walker<'_> {
                 series.push(series_of(item));
                 self.walk_chain(lower, Level::Series, dir)?;
             }
+            (Level::Series, "MRDR") => match self.follow_mrdr(idx, item) {
+                Ok(inst) => match last_series_mut(dir).and_then(|s| s.last_mut()) {
+                    Some(series) => series.instances.push(inst),
+                    None => self.skip(idx, item, "MRDR record outside SERIES"),
+                },
+                Err(reason) => self.skip(idx, item, &reason),
+            },
             (Level::Series, t) if t != "PATIENT" && t != "STUDY" && t != "SERIES" => {
                 match (
                     instance_of(item),
@@ -376,6 +384,37 @@ impl Walker<'_> {
             _ => self.skip(idx, item, &format!("{rec_type} record at the wrong level")),
         }
         Ok(())
+    }
+
+    /// Follow an `MRDR` record to its shared leaf: hop through
+    /// chained `MRDR`s (loop-guarded), then clone the target instance
+    /// stamped with the `MRDR` record type (the file, UIDs, and keys
+    /// stay the target's).
+    fn follow_mrdr(&self, idx: usize, item: &DataSet) -> std::result::Result<DirInstance, String> {
+        let mut seen = HashSet::new();
+        seen.insert(idx);
+        let mut target_off = item.uint32(LOWER).unwrap_or(0) as usize;
+        loop {
+            if target_off == 0 {
+                return Err("MRDR record without lower-level reference".to_string());
+            }
+            let target_idx = self.resolve(target_off, LOWER).map_err(|_| {
+                format!("MRDR target offset {target_off} matches no directory record")
+            })?;
+            if !seen.insert(target_idx) {
+                return Err("MRDR reference loop".to_string());
+            }
+            let target = &self.items[target_idx];
+            if record_type_of(target) == Some("MRDR") {
+                target_off = target.uint32(LOWER).unwrap_or(0) as usize;
+                continue;
+            }
+            let Some(mut inst) = instance_of(target) else {
+                return Err("MRDR target without file reference".to_string());
+            };
+            inst.record_type = "MRDR".to_string();
+            return Ok(inst);
+        }
     }
 
     fn skip(&mut self, idx: usize, item: &DataSet, reason: &str) {
@@ -1389,5 +1428,82 @@ mod tests {
         assert!(dir.patients.is_empty());
         assert_eq!(walker.skipped.len(), 1);
         assert!(walker.skipped[0].reason.contains("not in use"));
+    }
+
+    fn dir_with_series() -> DicomDir {
+        let mut dir = DicomDir::default();
+        dir.patients.push(DirPatient {
+            studies: vec![DirStudy {
+                series: vec![DirSeries::default()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        dir
+    }
+
+    #[test]
+    fn mrdr_follows_to_shared_leaf() {
+        // Leaf at 100, MRDR at 200 pointing at it: the referencing
+        // series lists the shared file stamped `MRDR`.
+        let items = vec![wleaf(0), wrec("MRDR", 0, 100)];
+        let abs = vec![100usize, 200];
+        let mut walker = walker_at(&items, &abs);
+        let mut dir = dir_with_series();
+        walker.visit(1, &items[1], Level::Series, &mut dir).unwrap();
+        let insts = &dir.patients[0].studies[0].series[0].instances;
+        assert_eq!(insts.len(), 1);
+        assert_eq!(insts[0].record_type, "MRDR");
+        assert_eq!(insts[0].sop_uid, "1.2.3.1");
+        assert_eq!(insts[0].file_id, vec!["F1".to_string()]);
+        assert!(walker.skipped.is_empty());
+        // Chained MRDR (300 -> 200 -> leaf) resolves through.
+        let items = vec![wleaf(0), wrec("MRDR", 0, 100), wrec("MRDR", 0, 200)];
+        let abs = vec![100usize, 200, 300];
+        let mut walker = walker_at(&items, &abs);
+        let mut dir = dir_with_series();
+        walker.visit(2, &items[2], Level::Series, &mut dir).unwrap();
+        assert_eq!(dir.patients[0].studies[0].series[0].instances.len(), 1);
+        assert!(walker.skipped.is_empty());
+    }
+
+    #[test]
+    fn mrdr_failures_skip_loudly() {
+        // Reference loop: MRDR(200) <-> MRDR(300).
+        let items = vec![wrec("MRDR", 0, 300), wrec("MRDR", 0, 200)];
+        let abs = vec![200usize, 300];
+        let mut walker = walker_at(&items, &abs);
+        let mut dir = dir_with_series();
+        walker.visit(0, &items[0], Level::Series, &mut dir).unwrap();
+        assert_eq!(walker.skipped.len(), 1);
+        assert!(walker.skipped[0].reason.contains("reference loop"));
+        // Dangling target.
+        let items = vec![wrec("MRDR", 0, 999)];
+        let abs = vec![200usize];
+        let mut walker = walker_at(&items, &abs);
+        walker.visit(0, &items[0], Level::Series, &mut dir).unwrap();
+        assert!(
+            walker.skipped[0]
+                .reason
+                .contains("matches no directory record")
+        );
+        // Missing lower reference.
+        let items = vec![wrec("MRDR", 0, 0)];
+        let mut walker = walker_at(&items, &abs);
+        walker.visit(0, &items[0], Level::Series, &mut dir).unwrap();
+        assert!(
+            walker.skipped[0]
+                .reason
+                .contains("without lower-level reference")
+        );
+        // Target without a file reference.
+        let items = vec![wrec("STUDY", 0, 0), wrec("MRDR", 0, 100)];
+        let abs = vec![100usize, 200];
+        let mut walker = walker_at(&items, &abs);
+        walker.visit(1, &items[1], Level::Series, &mut dir).unwrap();
+        assert!(walker.skipped[0].reason.contains("without file reference"));
+        // MRDR above the leaf level.
+        walker.visit(1, &items[1], Level::Study, &mut dir).unwrap();
+        assert!(walker.skipped[1].reason.contains("wrong level"));
     }
 }

@@ -2,7 +2,8 @@
 //!
 //! - [`DicomWebClient`] — QIDO-RS, WADO-RS, STOW-RS, WADO-URI client
 //! - [`server::dispatch`] — framework-agnostic server core over any
-//!   [`server::DicomWebStore`] (plus [`server::MemoryStore`])
+//!   [`server::DicomWebStore`] ([`server::MemoryStore`] or
+//!   [`filestore::FileStore`] for a durable directory archive)
 //! - [`hyper_server`] — hyper HTTP/1.1 front end (feature `server`)
 //! - [`multipart`] — from-scratch `multipart/related` codec
 //!
@@ -22,6 +23,7 @@
 
 pub mod client;
 mod error;
+pub mod filestore;
 #[cfg(feature = "server")]
 pub mod hyper_server;
 pub mod multipart;

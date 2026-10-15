@@ -67,7 +67,7 @@ impl Handlers for FindScp {
                 &audit.source,
             );
             msg.outcome = common::outcome_for_status(status);
-            emit_best_effort(Some(&audit.sender), &msg, "findscp");
+            emit_best_effort(Some(&audit.sender), &msg, "findscp").await;
         }
         (status, matches)
     }
@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
             &audit.source,
             true,
         );
-        emit_best_effort(Some(&audit.sender), &msg, "findscp");
+        emit_best_effort(Some(&audit.sender), &msg, "findscp").await;
     }
 
     let tls = args.listen.tls_acceptor()?;

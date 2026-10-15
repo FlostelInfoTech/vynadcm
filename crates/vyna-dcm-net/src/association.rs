@@ -17,7 +17,10 @@ use vyna_dcm_core::{APPLICATION_CONTEXT_NAME, TransferSyntax};
 use crate::{
     AeTitle, Command, Error, Result,
     dimse::{DimseMessage, decode_command, encode_command},
-    pdu::{AssociateAc, AssociateRq, Pdu, Pdv, ProposedContext},
+    pdu::{
+        AssociateAc, AssociateRq, ExtendedNegotiation, Pdu, Pdv, ProposedContext,
+        relational_requested,
+    },
 };
 
 /// Trait alias for a connected byte stream.
@@ -85,6 +88,9 @@ pub struct AssociationOptions {
     /// without this a slow-drip peer holds [`Association::recv`]
     /// forever. Past it `recv` fails with [`Error::Timeout`].
     pub max_message_duration: Duration,
+    /// SOP-class extended negotiations (`0x56`) to propose, e.g. a
+    /// relational-queries request for a QR SOP class.
+    pub extended_negotiation: Vec<ExtendedNegotiation>,
 }
 
 impl Association {
@@ -121,6 +127,7 @@ impl Default for AssociationOptions {
             max_pending_responses: crate::MAX_PENDING_RESPONSES,
             write_timeout: Duration::from_secs(30),
             max_message_duration: Duration::from_secs(3600),
+            extended_negotiation: Vec::new(),
         }
     }
 }
@@ -136,6 +143,9 @@ pub struct NegotiatedContext {
     pub transfer_syntax: TransferSyntax,
     /// Agreed transfer syntax UID (verbatim).
     pub transfer_syntax_uid: String,
+    /// Relational queries negotiated for this context (QR SOP classes:
+    /// extended negotiation accepted with bit 0 set).
+    pub relational: bool,
 }
 
 /// Snapshot of association identity for SCP handlers.
@@ -284,10 +294,16 @@ impl Association {
             async_ops: None,
             role_selection: Vec::new(),
             user_identity: None,
+            extended_negotiation: opts.extended_negotiation.clone(),
         };
         this.write_pdu(&Pdu::AssociateRq(rq)).await?;
         match this.read_pdu().await? {
-            Pdu::AssociateAc(ac) => this.adopt_ac(ac, &proposed, &opts.application_context)?,
+            Pdu::AssociateAc(ac) => this.adopt_ac(
+                ac,
+                &proposed,
+                &opts.application_context,
+                &opts.extended_negotiation,
+            )?,
             Pdu::AssociateRj(rj) => {
                 return Err(Error::Rejected {
                     result: rj.result,
@@ -322,6 +338,7 @@ impl Association {
         ac: AssociateAc,
         proposed: &[ProposedContext],
         application_context: &str,
+        proposed_extended: &[ExtendedNegotiation],
     ) -> Result<()> {
         if ac.application_context != application_context {
             return Err(Error::BadPdu(format!(
@@ -366,11 +383,19 @@ impl Association {
                     acc.id
                 )));
             };
+            // Relational sticks only when we proposed it and the
+            // acceptor echoed it back: a gratuitous AC entry we never
+            // asked for must not flip query semantics.
+            let proposed_relational =
+                relational_requested(proposed_extended, &prop.abstract_syntax);
+            let relational = proposed_relational
+                && relational_requested(&ac.extended_negotiation, &prop.abstract_syntax);
             self.contexts.push(NegotiatedContext {
                 id: acc.id,
                 abstract_syntax: prop.abstract_syntax.clone(),
                 transfer_syntax: ts,
                 transfer_syntax_uid: ts_uid.clone(),
+                relational,
             });
         }
         if self.contexts.is_empty() {
@@ -954,6 +979,7 @@ mod tests {
             abstract_syntax: vyna_dcm_core::sop_class::CT_IMAGE.to_string(),
             transfer_syntax: TransferSyntax::ExplicitVrLittleEndian,
             transfer_syntax_uid: TransferSyntax::ExplicitVrLittleEndian.uid().to_string(),
+            relational: false,
         };
         let info = |local: &str, peer: &str| AssociationInfo {
             local_ae: AeTitle::new(local).unwrap(),
@@ -1024,6 +1050,7 @@ mod tests {
                 abstract_syntax: vyna_dcm_core::sop_class::CT_IMAGE.to_string(),
                 transfer_syntax: TransferSyntax::ExplicitVrLittleEndian,
                 transfer_syntax_uid: TransferSyntax::ExplicitVrLittleEndian.uid().to_string(),
+                relational: false,
             }],
             &AssociationOptions::default(),
         );
@@ -1043,6 +1070,7 @@ mod tests {
             abstract_syntax: vyna_dcm_core::sop_class::CT_IMAGE.to_string(),
             transfer_syntax: TransferSyntax::ExplicitVrLittleEndian,
             transfer_syntax_uid: TransferSyntax::ExplicitVrLittleEndian.uid().to_string(),
+            relational: false,
         }
     }
 
@@ -1259,6 +1287,7 @@ mod tests {
             async_ops: None,
             role_selection: vec![],
             user_identity_response: None,
+            extended_negotiation: vec![],
         };
         let accepted = |id: u8, ts: Option<&str>| AcceptedContext {
             id,
@@ -1279,6 +1308,7 @@ mod tests {
                 ]),
                 &proposed,
                 &app,
+                &[],
             )
             .unwrap();
         assert_eq!(assoc.contexts.len(), 1);
@@ -1288,7 +1318,7 @@ mod tests {
             Some(TransferSyntax::ExplicitVrLittleEndian.uid()),
         )]);
         bad.application_context = "9.9.9".into();
-        assert!(assoc.adopt_ac(bad, &proposed, &app).is_err());
+        assert!(assoc.adopt_ac(bad, &proposed, &app, &[]).is_err());
         // Duplicate accepted ID.
         assert!(
             assoc
@@ -1299,6 +1329,7 @@ mod tests {
                     ]),
                     &proposed,
                     &app,
+                    &[],
                 )
                 .is_err()
         );
@@ -1312,19 +1343,79 @@ mod tests {
                     )]),
                     &proposed,
                     &app,
+                    &[],
                 )
                 .is_err()
         );
         assert!(
             assoc
-                .adopt_ac(ac(vec![accepted(1, None)]), &proposed, &app)
+                .adopt_ac(ac(vec![accepted(1, None)]), &proposed, &app, &[])
                 .is_err()
         );
         assert!(
             assoc
-                .adopt_ac(ac(vec![accepted(1, Some("9.9.9.9"))]), &proposed, &app)
+                .adopt_ac(ac(vec![accepted(1, Some("9.9.9.9"))]), &proposed, &app, &[])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn adopt_ac_sets_relational_only_when_proposed_and_echoed() {
+        use crate::pdu::AcceptedContext;
+        use vyna_dcm_core::sop_class as sc;
+        let opts = AssociationOptions::default();
+        let (a, _b) = tokio::io::duplex(64);
+        let mut assoc =
+            Association::from_accepted(Box::new(a), loopback_info("SCU", "SCP"), vec![], &opts);
+        let proposed = vec![crate::pdu::ProposedContext {
+            id: 1,
+            abstract_syntax: sc::STUDY_ROOT_FIND.to_string(),
+            transfer_syntaxes: vec![TransferSyntax::ExplicitVrLittleEndian.uid().to_string()],
+        }];
+        let app = opts.application_context.clone();
+        let accepted = AcceptedContext {
+            id: 1,
+            result: 0,
+            transfer_syntax: Some(TransferSyntax::ExplicitVrLittleEndian.uid().to_string()),
+        };
+        let ac_with = |ext: Vec<crate::pdu::ExtendedNegotiation>| crate::pdu::AssociateAc {
+            application_context: app.clone(),
+            presentation_contexts: vec![accepted.clone()],
+            max_pdu_len: 16384,
+            implementation_class_uid: "1.2.9".into(),
+            implementation_version: None,
+            async_ops: None,
+            role_selection: vec![],
+            user_identity_response: None,
+            extended_negotiation: ext,
+        };
+        let rel = crate::pdu::ExtendedNegotiation {
+            sop_class_uid: sc::STUDY_ROOT_FIND.to_string(),
+            app_info: vec![1],
+        };
+        // Proposed + echoed: relational sticks.
+        assoc.contexts.clear();
+        assoc
+            .adopt_ac(
+                ac_with(vec![rel.clone()]),
+                &proposed,
+                &app,
+                std::slice::from_ref(&rel),
+            )
+            .unwrap();
+        assert!(assoc.contexts[0].relational);
+        // Echoed but never proposed: gratuitous entry ignored.
+        assoc.contexts.clear();
+        assoc
+            .adopt_ac(ac_with(vec![rel.clone()]), &proposed, &app, &[])
+            .unwrap();
+        assert!(!assoc.contexts[0].relational);
+        // Proposed but not echoed: stays hierarchical.
+        assoc.contexts.clear();
+        assoc
+            .adopt_ac(ac_with(vec![]), &proposed, &app, std::slice::from_ref(&rel))
+            .unwrap();
+        assert!(!assoc.contexts[0].relational);
     }
 
     #[tokio::test]

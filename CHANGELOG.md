@@ -3,6 +3,69 @@
 All notable changes to VynaDCM are documented here. Versions follow
 the workspace crate version (`Cargo.toml`).
 
+## [Unreleased]
+
+### Added
+
+- CI gains a RustSec `cargo audit` job (GitHub + GitLab) that fails
+  on known vulnerabilities in the locked dependency set.
+- Robustness sweeps: exhaustive truncation plus deterministic
+  mutation tests pin no-panic behavior for dataset decode (all four
+  uncompressed syntaxes), Part-10 reads, and JPEG 2000 frames.
+- Persistent DICOMweb archive: new `web::filestore::FileStore`
+  (same index/search/bulk semantics as `MemoryStore`) writes every
+  accepted instance to `{dir}/{study}/{series}/{instance}.dcm`
+  (atomic temp+rename, strict-UID path mapping) and rescans on
+  open; `wadorsd --persist` serves from it so STOW uploads survive
+  restarts.
+- Pixel redaction: new `codec::redact_regions` paints black
+  rectangles over native 8/16-bit frames (mono/RGB, both planar
+  layouts, all-frames or 1-based single frame); out-of-bounds
+  regions, packed depths, and encapsulated syntaxes fail instead of
+  clamping. `Deidentifier::with_allow_burned_in` admits `YES` files
+  redacted externally (warned, markers withheld), and
+  `deidentify --redact X,Y,W,H[:FRAME]` (repeatable) wires both
+  together per file.
+- Relational C-FIND/C-MOVE/C-GET: SOP Class Extended Negotiation
+  (`0x56`) encode/decode, SCP acceptance per QR context (echoed
+  only for QR SOPs with bit 0 set), `NegotiatedContext.relational`
+  plumbed to both sides (sticks only when proposed and echoed),
+  and `--relational` on `findscu`/`movescu`/`getscu`. Cross-level
+  answering (already level-agnostic) is pinned by tests.
+- DICOMDIR `MRDR` following: multi-referenced records resolve to
+  their shared leaf (chains followed loop-guarded) and list under
+  the referencing series stamped `MRDR`; dangling/looping targets
+  are reported as skipped, never followed.
+- XML `BulkData` resolution: new
+  `dataset_from_xml_with_resolver` fetches `<BulkData uri/>`
+  through a caller callback (missing/empty URIs, resolver
+  failures, wrong-VR and mixed children fail loudly; the plain
+  parser still refuses); `xml2dcm --bulk-data-dir` resolves
+  relative and `file:` URIs under a directory (`..`, absolute
+  bare paths, and network schemes rejected).
+- WADO-URI server side: `GET /wado?requestType=WADO&...` serves
+  full instances as raw `application/dicom` (optional
+  `transferSyntax` transcoded on the fly); rendered content is
+  406 and rendering/de-id knobs or unknown parameters are 400,
+  never silently ignored.
+
+### Fixed
+
+- `wadorsd` accepts `--bearer-token-file` to read the Bearer [REDACTED]
+  a file instead of argv (argv tokens are visible in `ps` output);
+  the two flags conflict and missing/empty files fail loudly.
+- JPEG 2000 decode runs the fork's header/decode/teardown sequence
+  under a panic guard: a hostile codestream surfaces as a typed
+  codec error instead of unwinding into the caller. Exhaustive
+  truncation plus mutation sweeps across four frame shapes pin the
+  no-panic property.
+- Packaging metadata: dropped the redundant `license-file` keys
+  (SPDX `MIT` kept, cargo warnings gone) and added `readme` /
+  `homepage` so crates.io pages render.
+- Audit emission no longer blocks tokio workers: delivery runs on
+  the blocking pool while callers await the outcome, and `getscu`
+  queues per-arrival audits and flushes after retrieval.
+
 ## [0.6.0] — 2026-10-15
 
 ### Fixed

@@ -81,21 +81,44 @@ impl PixelCodec for Jpeg2000Codec {
         // SAFETY: `stream` owns its boxed `Stream`; the borrow is exclusive
         // and never outlives it (see `MemStream`).
         let raw = unsafe { stream.stream() };
-        let mut image = codec
-            .read_header(raw)
-            .ok_or_else(|| PixelCodecError::Codec("jpeg 2000 header unreadable".into()))?;
-        // Pre-validate the SIZ grid before decode(): a tiny frame
-        // claiming huge dimensions must fail fast instead of
-        // triggering SIZ-sized tile allocations.
-        check_component_grid(&image, rows, columns, samples_per_pixel)?;
-        if codec.decode(raw, &mut image) == 0 {
-            return Err(PixelCodecError::Codec("jpeg 2000 decode failed".into()));
-        }
-        if codec.end_decompress(raw) == 0 {
-            return Err(PixelCodecError::Codec(
-                "jpeg 2000 end-of-decompress failed".into(),
-            ));
-        }
+        // The fork is a mechanical C port whose buffer reads use
+        // length-check-then-`expect`: one missed guard on a hostile
+        // codestream would panic the caller. Run the whole
+        // header/decode/teardown sequence under `catch_unwind` and
+        // report a fork panic as a typed codec failure instead.
+        // `AssertUnwindSafe` is sound here: on a caught panic the
+        // `codec`, `stream`, and partial image are dropped without
+        // reuse, so no poisoned state can be observed. (Encode needs
+        // no guard: its inputs are constructed locally from validated
+        // geometry, so a panic there would be our bug and should stay
+        // loud in tests.)
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut image = codec
+                .read_header(raw)
+                .ok_or_else(|| PixelCodecError::Codec("jpeg 2000 header unreadable".into()))?;
+            // Pre-validate the SIZ grid before decode(): a tiny frame
+            // claiming huge dimensions must fail fast instead of
+            // triggering SIZ-sized tile allocations.
+            check_component_grid(&image, rows, columns, samples_per_pixel)?;
+            if codec.decode(raw, &mut image) == 0 {
+                return Err(PixelCodecError::Codec("jpeg 2000 decode failed".into()));
+            }
+            if codec.end_decompress(raw) == 0 {
+                return Err(PixelCodecError::Codec(
+                    "jpeg 2000 end-of-decompress failed".into(),
+                ));
+            }
+            Ok(image)
+        }));
+        let image = match outcome {
+            Ok(Ok(image)) => image,
+            Ok(Err(e)) => return Err(e),
+            Err(_) => {
+                return Err(PixelCodecError::Codec(
+                    "jpeg 2000 decoder rejected the frame (internal failure caught)".into(),
+                ));
+            }
+        };
         pack_image(&image, rows, columns, samples_per_pixel, bits_allocated)
     }
 
@@ -918,6 +941,101 @@ mod tests {
             roundtrip(&flat_rgb, 28, 40, 3, 8, TransferSyntax::Jpeg2000Lossless),
             flat_rgb
         );
+    }
+
+    fn frags_of(bytes: Vec<u8>) -> FragmentSequence {
+        FragmentSequence {
+            basic_offset_table: vec![],
+            fragments: vec![bytes],
+        }
+    }
+
+    #[test]
+    fn garbage_codestreams_error_without_panicking() {
+        // A panic anywhere below fails the test: every corrupt input
+        // must surface as `Err`, never unwind out of `decode_frame`.
+        let codec = Jpeg2000Codec::default();
+        let ts = TransferSyntax::Jpeg2000Lossless;
+        for bytes in [
+            Vec::new(),
+            vec![0xFF],
+            b"not a codestream".to_vec(),
+            vec![0xFF; 64],
+            vec![0xFF, 0x4F, 0xFF, 0x51, 0x00, 0x00],
+        ] {
+            assert!(
+                codec
+                    .decode_frame(ts, &frags_of(bytes), 16, 16, 1, 8)
+                    .is_err(),
+                "garbage must not decode"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_and_mutated_frames_never_panic() {
+        // Encode one real frame per shape, then decode every
+        // truncation plus a deterministic mutation sample: each
+        // attempt must return (`Ok` or `Err`), never panic. The
+        // full-length input pins the sanity baseline (exact lossless
+        // round-trip; lossy only checks it returns).
+        for (rows, cols, samples, bits, ts, exact) in [
+            (
+                16u16,
+                16u16,
+                1u16,
+                8u16,
+                TransferSyntax::Jpeg2000Lossless,
+                true,
+            ),
+            (
+                33u16,
+                17u16,
+                1u16,
+                16u16,
+                TransferSyntax::Jpeg2000Lossless,
+                true,
+            ),
+            (
+                20u16,
+                24u16,
+                3u16,
+                8u16,
+                TransferSyntax::Jpeg2000Lossless,
+                true,
+            ),
+            (64u16, 64u16, 1u16, 8u16, TransferSyntax::Jpeg2000, false),
+        ] {
+            let raw = pattern(cols, rows, samples, bits);
+            let codec = Jpeg2000Codec::default();
+            let full = codec
+                .encode_frame(ts, &raw, rows, cols, samples, bits)
+                .unwrap()
+                .joined();
+            let back = codec
+                .decode_frame(ts, &frags_of(full.clone()), rows, cols, samples, bits)
+                .unwrap();
+            if exact {
+                assert_eq!(back, raw);
+            } else {
+                assert_eq!(back.len(), raw.len());
+            }
+            for len in 0..full.len() {
+                let _ = codec.decode_frame(
+                    ts,
+                    &frags_of(full[..len].to_vec()),
+                    rows,
+                    cols,
+                    samples,
+                    bits,
+                );
+            }
+            for (i, b) in full.iter().enumerate().step_by(7) {
+                let mut mutated = full.clone();
+                mutated[i] = b.wrapping_add(1);
+                let _ = codec.decode_frame(ts, &frags_of(mutated), rows, cols, samples, bits);
+            }
+        }
     }
 
     #[test]

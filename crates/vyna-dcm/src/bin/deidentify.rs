@@ -3,7 +3,9 @@
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
-use vyna_dcm::{Deidentifier, read_part10, write_part10};
+use vyna_dcm::{
+    Deidentifier, RedactFrames, RedactRegion, read_part10, redact_regions, write_part10,
+};
 
 /// De-identification CLI (basic profile, PS3.15 E semantics).
 #[derive(Parser, Debug)]
@@ -38,6 +40,12 @@ struct Args {
     /// Keep private data elements (default: removed).
     #[arg(long, default_value_t = false)]
     retain_private_tags: bool,
+    /// Redact a pixel rectangle, `X,Y,W,H` (all frames),
+    /// `X,Y,W,H:FRAME` (1-based frame), or `X,Y,W,H:all`.
+    /// Repeatable. Native 8/16-bit frames only; out-of-bounds
+    /// regions fail the file instead of clamping.
+    #[arg(long)]
+    redact: Vec<String>,
 }
 
 /// Resolve `(input, destination)` pairs from the output flags.
@@ -114,10 +122,48 @@ fn write_output(dest: &Path, bytes: &[u8]) -> Result<(), String> {
     Err(format!("{}: cannot pick a temporary name", dest.display()))
 }
 
-fn process_file(deid: &mut Deidentifier, input: &Path, dest: &Path) -> Result<String, String> {
+/// Parse one `--redact` spec: `X,Y,W,H`, `X,Y,W,H:FRAME`, or `X,Y,W,H:all`.
+fn parse_redact(spec: &str) -> Result<RedactRegion, String> {
+    let (rect, frame) = match spec.rsplit_once(':') {
+        Some((r, f)) => (r, Some(f)),
+        None => (spec, None),
+    };
+    let nums: Vec<&str> = rect.split(',').collect();
+    let [x, y, w, h] = nums.as_slice() else {
+        return Err(format!("{spec:?} wants X,Y,W,H[:FRAME]"));
+    };
+    let num = |s: &str, what: &str| {
+        s.parse::<u32>()
+            .map_err(|_| format!("{spec:?}: bad {what} {s:?}"))
+    };
+    let frames = match frame {
+        None | Some("all") => RedactFrames::All,
+        Some(f) => RedactFrames::One(num(f, "frame")?),
+    };
+    Ok(RedactRegion {
+        x: num(x, "x")?,
+        y: num(y, "y")?,
+        width: num(w, "width")?,
+        height: num(h, "height")?,
+        frames,
+    })
+}
+
+fn process_file(
+    deid: &mut Deidentifier,
+    input: &Path,
+    dest: &Path,
+    regions: &[RedactRegion],
+) -> Result<String, String> {
     let bytes = std::fs::read(input).map_err(|e| format!("{}: {e}", input.display()))?;
     let (mut meta, mut ds) =
         read_part10(&bytes).map_err(|e| format!("{}: {e}", input.display()))?;
+    if !regions.is_empty() {
+        let ts = meta
+            .transfer_syntax()
+            .map_err(|e| format!("{}: {e}", input.display()))?;
+        redact_regions(&mut ds, ts, regions).map_err(|e| format!("{}: {e}", input.display()))?;
+    }
     let report = deid
         .apply(&mut ds)
         .map_err(|e| format!("{}: {e}", input.display()))?;
@@ -180,6 +226,19 @@ fn run() -> i32 {
         return 1;
     }
     let mut deid = Deidentifier::new().with_retain_private(args.retain_private_tags);
+    let mut regions = Vec::new();
+    for spec in &args.redact {
+        match parse_redact(spec) {
+            Ok(r) => regions.push(r),
+            Err(e) => {
+                eprintln!("deidentify: bad --redact: {e}");
+                return 1;
+            }
+        }
+    }
+    // Override is sound here: `process_file` redacts before every
+    // `apply`, and a failed redaction aborts the file first.
+    deid = deid.with_allow_burned_in(!regions.is_empty());
     if let Some(days) = args.date_offset {
         deid = deid.with_date_offset(days);
     }
@@ -202,7 +261,7 @@ fn run() -> i32 {
         }
     }
     for (input, dest) in &jobs {
-        match process_file(&mut deid, input, dest) {
+        match process_file(&mut deid, input, dest, &regions) {
             Ok(summary) => println!("{summary}"),
             Err(e) => {
                 eprintln!("deidentify: {e}");
@@ -293,7 +352,7 @@ mod tests {
         meta.sending_ae_title = Some("SENDSITE".to_string());
         meta.receiving_ae_title = Some("RECVSITE".to_string());
         std::fs::write(&input, vyna_dcm::write_part10(&meta, &ds).unwrap()).unwrap();
-        let summary = process_file(&mut Deidentifier::new(), &input, &output).unwrap();
+        let summary = process_file(&mut Deidentifier::new(), &input, &output, &[]).unwrap();
         // Patient ID is E.1 `Z`: zeroed (kept but emptied), not dummied.
         assert!(summary.contains("1 zeroed"), "{summary}");
         let (meta2, ds2) = read_part10(&std::fs::read(&output).unwrap()).unwrap();
@@ -313,6 +372,84 @@ mod tests {
         assert_eq!(meta2.receiving_ae_title, None);
         std::fs::remove_file(&input).unwrap();
         std::fs::remove_file(&output).unwrap();
+    }
+
+    #[test]
+    fn parse_redact_accepts_forms_and_rejects_garbage() {
+        let all = parse_redact("10,20,100,50").unwrap();
+        assert_eq!(
+            (all.x, all.y, all.width, all.height, all.frames),
+            (10, 20, 100, 50, RedactFrames::All)
+        );
+        let one = parse_redact("10,20,100,50:3").unwrap();
+        assert_eq!(one.frames, RedactFrames::One(3));
+        let explicit = parse_redact("10,20,100,50:all").unwrap();
+        assert_eq!(explicit.frames, RedactFrames::All);
+        for bad in [
+            "10,20,100",
+            "10,20,100,50,1",
+            "a,20,100,50",
+            "10,20,100,50:x",
+            "",
+        ] {
+            assert!(parse_redact(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn process_file_redacts_pixels_before_deidentifying() {
+        use vyna_dcm::{DataSet, FileMeta, TransferSyntax, Value, Vr, tags};
+        let dir = std::env::temp_dir().join(format!("deid-redact-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = dir.join("in.dcm");
+        let output = dir.join("out.dcm");
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::SOP_CLASS_UID, "1.2.840.10008.5.1.4.1.1.7");
+        ds.put_uid(tags::SOP_INSTANCE_UID, "1.9.9.10");
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "E123");
+        ds.put_text(tags::BURNED_IN_ANNOTATION, Vr::Cs, "YES");
+        ds.put_u16_single(tags::ROWS, 8);
+        ds.put_u16_single(tags::COLUMNS, 8);
+        ds.put_u16_single(tags::SAMPLES_PER_PIXEL, 1);
+        ds.put_u16_single(tags::BITS_ALLOCATED, 8);
+        ds.put_text(tags::PHOTOMETRIC_INTERPRETATION, Vr::Cs, "MONOCHROME2");
+        ds.put_bytes(tags::PIXEL_DATA, Vr::Ob, vec![0xAB; 64]);
+        let meta = FileMeta::new(
+            "1.2.840.10008.5.1.4.1.1.7",
+            "1.9.9.10",
+            TransferSyntax::ExplicitVrLittleEndian,
+        );
+        std::fs::write(&input, vyna_dcm::write_part10(&meta, &ds).unwrap()).unwrap();
+        // Without regions the YES still refuses (override stays off).
+        assert!(process_file(&mut Deidentifier::new(), &input, &output, &[]).is_err());
+        // With regions: pixels redacted, then metadata de-identified.
+        let regions = [parse_redact("2,2,4,4").unwrap()];
+        let mut deid = Deidentifier::new().with_allow_burned_in(true);
+        process_file(&mut deid, &input, &output, &regions).unwrap();
+        let (_, out) = read_part10(&std::fs::read(&output).unwrap()).unwrap();
+        let Value::Bytes(px) = &out.get(tags::PIXEL_DATA).unwrap().value else {
+            panic!("pixel data lost");
+        };
+        for r in 0..8 {
+            for c in 0..8 {
+                let inside = (2..6).contains(&c) && (2..6).contains(&r);
+                assert_eq!(px[r * 8 + c] == 0, inside, "r={r} c={c}");
+            }
+        }
+        assert_eq!(out.string(tags::PATIENT_ID), None);
+        // Out-of-bounds regions fail the file instead of clamping.
+        let bad = [parse_redact("7,7,4,4").unwrap()];
+        assert!(
+            process_file(
+                &mut Deidentifier::new().with_allow_burned_in(true),
+                &input,
+                &output,
+                &bad
+            )
+            .is_err()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(unix)]

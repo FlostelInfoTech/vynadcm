@@ -46,10 +46,10 @@ pub use vyna_dcm_atna::{
     SyslogTarget,
 };
 pub use vyna_dcm_codec::{
-    DicomDir, DirEntry, FileMeta, TranscodeOptions, build_dicomdir, dataset_from_json,
-    dataset_from_xml, dataset_to_json, dataset_to_xml, decode_dataset, decode_pixels, dump_dataset,
-    encode_dataset, frame_to_png, inject_png, read_dicomdir, read_part10, transcode_dataset,
-    write_part10,
+    DicomDir, DirEntry, FileMeta, RedactFrames, RedactRegion, TranscodeOptions, build_dicomdir,
+    dataset_from_json, dataset_from_xml, dataset_from_xml_with_resolver, dataset_to_json,
+    dataset_to_xml, decode_dataset, decode_pixels, dump_dataset, encode_dataset, frame_to_png,
+    inject_png, read_dicomdir, read_part10, redact_regions, transcode_dataset, write_part10,
 };
 pub use vyna_dcm_core::{
     DataElement, DataSet, PersonName, Tag, TransferSyntax, Value, Vr, lookup_keyword, new_uid, tags,

@@ -1445,6 +1445,7 @@ mod tests {
             transfer_syntax_uid: vyna_dcm_core::TransferSyntax::ExplicitVrLittleEndian
                 .uid()
                 .to_string(),
+            relational: false,
         };
         let info_a = crate::association::AssociationInfo {
             local_ae: AeTitle::new("SCU").unwrap(),

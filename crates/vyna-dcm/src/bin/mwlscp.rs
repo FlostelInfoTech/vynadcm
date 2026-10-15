@@ -58,7 +58,7 @@ impl Handlers for MwlScpServer {
                 &audit.source,
             );
             msg.outcome = common::outcome_for_status(status);
-            emit_best_effort(Some(&audit.sender), &msg, "mwlscp");
+            emit_best_effort(Some(&audit.sender), &msg, "mwlscp").await;
         }
         (status, matches)
     }
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
             &audit.source,
             true,
         );
-        emit_best_effort(Some(&audit.sender), &msg, "mwlscp");
+        emit_best_effort(Some(&audit.sender), &msg, "mwlscp").await;
     }
 
     let tls = args.listen.tls_acceptor()?;

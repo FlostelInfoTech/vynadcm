@@ -205,7 +205,7 @@ stgcmtscp --bind 127.0.0.1:11112 ./commit-store
 ### DICOMweb: qidors / wadors / stowrs / wadorsd
 
 ```sh
-# Stub server over a directory (STOW lands in memory)
+# Stub server over a directory (STOW lands in memory unless --persist)
 wadorsd --bind 127.0.0.1:8080 --dir ./store
 
 # Search studies/series/instances
@@ -226,8 +226,17 @@ stowrs --url http://127.0.0.1:8080 a.dcm b.dcm
   `--limit` / `--offset` (paging), and `--json` (DICOM JSON output).
 - `wadorsd` takes `--bearer-token` to require `Authorization:
   Bearer` on every request; without it, keep the loopback bind (PHI
-  travels over plain HTTP otherwise). `--public-base` overrides the
-  `http://{bind}/` prefix stamped into BulkDataURIs.
+  travels over plain HTTP otherwise). `--bearer-token-file` reads
+  the token from a file instead of argv (invisible to `ps`); the
+  two flags conflict. `--persist` stores instances as
+  `{study}/{series}/{instance}.dcm` under `--dir` (rescanned on
+  startup) so uploads survive restarts. `--public-base` overrides
+  the `http://{bind}/` prefix stamped into BulkDataURIs.
+- `wadorsd` also answers WADO-URI (`GET
+  /wado?requestType=WADO&studyUID=&seriesUID=&objectUID=`):
+  `application/dicom` only, optional `transferSyntax` transcoded
+  on the fly; rendered types and knobs (`anonymize`, `rows`,
+  `frameNumber`, …) are refused, not ignored.
 - `--frames` writes one file as given, or `STEM_N.EXT` per frame;
   `--accept` sets the frame media type (default
   `application/octet-stream`). `--metadata`, `--frames`, and
@@ -245,6 +254,7 @@ json2dcm --output implicit.dcm --transfer-syntax 1.2.840.10008.1.2 file.json
 dcm2xml file.dcm > file.xml              # Part-10 → Native DICOM Model XML
 dcm2xml --with-meta file.dcm > full.xml  # include group 0002 meta
 xml2dcm --output roundtrip.dcm file.xml  # XML → Part-10 (explicit LE)
+xml2dcm --output b.dcm f.xml --bulk-data-dir ./bulk  # resolve <BulkData/>
 dcm2img frame.dcm frame.png --frame 1   # render one frame to PNG
 img2dcm frame.png frame.dcm -o inj.dcm  # inject PNG pixels (native TS)
 img2dcm frame.png frame.dcm -o jls.dcm --transfer-syntax jpeg-ls  # encapsulated
@@ -352,10 +362,16 @@ content, and pixels kept):
 deidentify study/*.dcm --output-dir anon/ --date-offset 30
 deidentify one.dcm --output one.anon.dcm --patient-id SUBJ-7
 deidentify old.dcm --in-place   # rewrite via a temp file
+deidentify us.dcm --output us.anon.dcm --redact 8,8,200,40  # burn-in box
 ```
 
 - `--date-offset DAYS` keeps longitudinal intervals across the whole
   batch (one UID map per run); without it, dates become `19000101`.
+- `--redact X,Y,W,H[:FRAME]` paints a black rectangle over native
+  8/16-bit frames first (repeatable; bare form covers all frames),
+  which also admits Burned In Annotation `YES` files that are
+  otherwise refused. Out-of-bounds regions fail the file; the
+  override withholds the conformance markers.
 - `--patient-id` / `--patient-name` set the dummy text stamped
   into `Dummy`-action tags (Patient ID and Patient's Name themselves
   are emptied per E.1 `Z`); `--retain-private-tags` keeps private

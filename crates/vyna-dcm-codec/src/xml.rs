@@ -12,7 +12,9 @@
 //!   `<Value>`s (as in the JSON mapping, not base64).
 //! - Empty attributes are self-closing and parse back as
 //!   [`Value::Empty`] (empty vectors normalize to it).
-//! - `<BulkData>` references are refused: only inline values parse.
+//! - `<BulkData>` references are refused by [`dataset_from_xml`];
+//!   [`dataset_from_xml_with_resolver`] resolves them through a
+//!   caller-supplied fetch callback instead.
 //!   DCMTK's proprietary `<element>` format is out of scope.
 
 use base64::Engine;
@@ -231,12 +233,33 @@ fn escape(s: &str) -> String {
 /// mistyped numbers, `BulkData` references, and children under the
 /// wrong VR are errors.
 pub fn dataset_from_xml(xml: &str) -> Result<DataSet> {
+    dataset_from_xml_inner(xml, None)
+}
+
+/// Parse PS3.19 XML, resolving `<BulkData uri="..."/>` elements
+/// through `resolve` (called with the verbatim `uri`).
+///
+/// Without a resolver ([`dataset_from_xml`]) bulk references are
+/// refused; with one, missing/empty `uri` attributes, resolver
+/// failures, and bulk children under non-bulk VRs are errors.
+pub fn dataset_from_xml_with_resolver(
+    xml: &str,
+    mut resolve: impl FnMut(&str) -> Result<Vec<u8>>,
+) -> Result<DataSet> {
+    dataset_from_xml_inner(xml, Some(&mut resolve))
+}
+
+#[allow(clippy::type_complexity)] // spelled-out trait object keeps object/ref lifetimes unified for inference
+fn dataset_from_xml_inner(
+    xml: &str,
+    resolve: Option<&mut dyn FnMut(&str) -> Result<Vec<u8>>>,
+) -> Result<DataSet> {
     let mut reader = Reader::from_str(xml);
     let mut buf = Vec::new();
     loop {
         match next(&mut reader, &mut buf)? {
             Event::Start(e) if is(&e, b"NativeDicomModel") => {
-                return read_attributes(&mut reader, &mut buf, b"NativeDicomModel", 0);
+                return read_attributes(&mut reader, &mut buf, b"NativeDicomModel", 0, resolve);
             }
             Event::Empty(e) if is(&e, b"NativeDicomModel") => return Ok(DataSet::new()),
             Event::Eof => return Err(Error::Xml("missing NativeDicomModel root".into())),
@@ -260,11 +283,29 @@ fn is(e: &BytesStart<'_>, name: &[u8]) -> bool {
 const MAX_XML_DEPTH: usize = 64;
 
 /// Read `DicomAttribute` children until `</end>`.
+/// Short reborrow of the bulk resolver for one recursive call
+/// (`Option::as_deref_mut` keeps the original lifetime on
+/// `&mut dyn` and will not reborrow inside the read loops).
+// Named lifetimes and the spelled-out trait object are load-bearing: the
+// elided/aliased equivalents fail E0106 / lifetime inference (rustc), so the
+// matching clippy lints are silenced here rather than "fixed".
+#[allow(clippy::needless_lifetimes, clippy::type_complexity)]
+fn reborrow<'a, 'b>(
+    resolve: &'a mut Option<&'b mut dyn FnMut(&str) -> Result<Vec<u8>>>,
+) -> Option<&'a mut dyn FnMut(&str) -> Result<Vec<u8>>> {
+    match resolve {
+        Some(r) => Some(&mut **r),
+        None => None,
+    }
+}
+
+#[allow(clippy::type_complexity)] // as above: aliasing the resolver breaks lifetime inference at call sites
 fn read_attributes(
     reader: &mut Reader<&[u8]>,
     buf: &mut Vec<u8>,
     end: &[u8],
     depth: usize,
+    mut resolve: Option<&mut dyn FnMut(&str) -> Result<Vec<u8>>>,
 ) -> Result<DataSet> {
     if depth > MAX_XML_DEPTH {
         return Err(Error::Xml("nesting too deep".into()));
@@ -274,7 +315,10 @@ fn read_attributes(
         match next(reader, buf)? {
             Event::Start(e) if is(&e, b"DicomAttribute") => {
                 let (tag, vr) = attribute_head(&e)?;
-                insert_unique(&mut ds, read_attribute_body(reader, buf, tag, vr, depth)?)?;
+                insert_unique(
+                    &mut ds,
+                    read_attribute_body(reader, buf, tag, vr, depth, reborrow(&mut resolve))?,
+                )?;
             }
             Event::Empty(e) if is(&e, b"DicomAttribute") => {
                 let (tag, vr) = attribute_head(&e)?;
@@ -328,12 +372,14 @@ fn attribute_head(e: &BytesStart<'_>) -> Result<(Tag, Vr)> {
 }
 
 /// Read one attribute body: values, names, items, or binary.
+#[allow(clippy::type_complexity)] // as above
 fn read_attribute_body(
     reader: &mut Reader<&[u8]>,
     buf: &mut Vec<u8>,
     tag: Tag,
     vr: Vr,
     depth: usize,
+    mut resolve: Option<&mut dyn FnMut(&str) -> Result<Vec<u8>>>,
 ) -> Result<DataElement> {
     let mut texts = Vec::new();
     let mut names = Vec::new();
@@ -359,7 +405,13 @@ fn read_attribute_body(
                 saw.push("PersonName");
             }
             Event::Start(e) if is(&e, b"Item") => {
-                items.push(read_attributes(reader, buf, b"Item", depth + 1)?);
+                items.push(read_attributes(
+                    reader,
+                    buf,
+                    b"Item",
+                    depth + 1,
+                    reborrow(&mut resolve),
+                )?);
                 saw.push("Item");
             }
             Event::Empty(e) if is(&e, b"Item") => {
@@ -377,10 +429,19 @@ fn read_attribute_body(
                 binary = Some(Vec::new());
                 saw.push("InlineBinary");
             }
-            Event::Start(e) | Event::Empty(e) if is(&e, b"BulkData") => {
-                return Err(Error::Xml(format!(
-                    "{tag}: BulkData references are not resolved"
-                )));
+            Event::Start(e) if is(&e, b"BulkData") => {
+                let uri = bulk_data_uri(&e, tag)?;
+                let text = leaf_text(reader, buf, b"BulkData", tag)?;
+                if !text.chars().all(|c| c.is_whitespace()) {
+                    return Err(Error::Xml(format!("{tag}: BulkData must be empty")));
+                }
+                binary = Some(resolve_bulk(reborrow(&mut resolve), &uri, tag)?);
+                saw.push("BulkData");
+            }
+            Event::Empty(e) if is(&e, b"BulkData") => {
+                let uri = bulk_data_uri(&e, tag)?;
+                binary = Some(resolve_bulk(reborrow(&mut resolve), &uri, tag)?);
+                saw.push("BulkData");
             }
             Event::End(e) if e.name().as_ref() == b"DicomAttribute" => {
                 let value = build_value(tag, vr, texts, names, items, binary, &saw)?;
@@ -454,6 +515,40 @@ fn check_ws(e: &quick_xml::events::BytesText<'_>) -> Result<()> {
         Ok(())
     } else {
         Err(Error::Xml("unexpected text content".into()))
+    }
+}
+
+/// Required `uri` attribute of a `<BulkData>` element.
+fn bulk_data_uri(e: &quick_xml::events::BytesStart<'_>, tag: Tag) -> Result<String> {
+    for attr in e.attributes() {
+        let attr = attr.map_err(|e| Error::Xml(e.to_string()))?;
+        if attr.key.as_ref() == b"uri" {
+            let uri = attr
+                .unescape_value()
+                .map_err(|e| Error::Xml(e.to_string()))?
+                .into_owned();
+            if uri.is_empty() {
+                break;
+            }
+            return Ok(uri);
+        }
+    }
+    Err(Error::Xml(format!("{tag}: BulkData without uri")))
+}
+
+/// Fetch one bulk reference: without a resolver this is the historic
+/// refusal; with one, resolver failures propagate verbatim.
+#[allow(clippy::type_complexity)] // as above
+fn resolve_bulk(
+    resolve: Option<&mut dyn FnMut(&str) -> Result<Vec<u8>>>,
+    uri: &str,
+    tag: Tag,
+) -> Result<Vec<u8>> {
+    match resolve {
+        Some(resolve) => resolve(uri),
+        None => Err(Error::Xml(format!(
+            "{tag}: BulkData references are not resolved"
+        ))),
     }
 }
 
@@ -573,11 +668,12 @@ fn build_value(
 ) -> Result<Value> {
     let bad = |m: &str| Error::Xml(format!("{tag}: {m}"));
     if let Some(bytes) = binary {
+        let kind = saw.first().copied().unwrap_or("InlineBinary");
         if saw.len() != 1 {
-            return Err(bad("InlineBinary must be the only child"));
+            return Err(bad(&format!("{kind} must be the only child")));
         }
         if !allows_inline_binary(vr) {
-            return Err(bad("InlineBinary not allowed for this VR"));
+            return Err(bad(&format!("{kind} not allowed for this VR")));
         }
         // Fragments arrive joined (as in the JSON mapping); callers
         // re-fragment for encapsulated syntaxes.
@@ -896,6 +992,87 @@ mod tests {
         ));
         let err = dataset_from_xml(&bad).unwrap_err();
         assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    #[test]
+    fn bulk_data_resolves_through_callback() {
+        use std::collections::HashMap;
+        let wrap = |body: &str| format!("<NativeDicomModel>{body}</NativeDicomModel>");
+        let mut store = HashMap::new();
+        store.insert("px.bin".to_string(), vec![9u8; 16]);
+        store.insert("nested/frame.bin".to_string(), vec![7u8; 4]);
+        let mut resolve = |uri: &str| {
+            store
+                .get(uri)
+                .cloned()
+                .ok_or_else(|| crate::Error::Xml(format!("no such bulk object: {uri}")))
+        };
+        // Top-level bulk attribute lands as bytes.
+        let xml = wrap(
+            r#"<DicomAttribute tag="7FE00010" vr="OW"><BulkData uri="px.bin"/></DicomAttribute>"#,
+        );
+        let ds = dataset_from_xml_with_resolver(&xml, &mut resolve).unwrap();
+        assert_eq!(
+            ds.get(vyna_dcm_core::tags::PIXEL_DATA).unwrap().value,
+            vyna_dcm_core::Value::Bytes(vec![9u8; 16])
+        );
+        // Bulk inside a sequence item resolves too (threading check).
+        let xml = wrap(concat!(
+            r#"<DicomAttribute tag="00081140" vr="SQ"><Item number="1">"#,
+            r#"<DicomAttribute tag="7FE00010" vr="OB"><BulkData uri="nested/frame.bin"></BulkData></DicomAttribute>"#,
+            r#"</Item></DicomAttribute>"#,
+        ));
+        let ds = dataset_from_xml_with_resolver(&xml, &mut resolve).unwrap();
+        let items = match &ds
+            .get(vyna_dcm_core::tags::REFERENCED_IMAGE_SEQUENCE)
+            .unwrap()
+            .value
+        {
+            vyna_dcm_core::Value::Sequence(items) => items.clone(),
+            other => panic!("expected sequence, got {other:?}"),
+        };
+        assert_eq!(
+            items[0].get(vyna_dcm_core::tags::PIXEL_DATA).unwrap().value,
+            vyna_dcm_core::Value::Bytes(vec![7u8; 4])
+        );
+        // Unknown uri: resolver failure propagates.
+        let xml = wrap(
+            r#"<DicomAttribute tag="7FE00010" vr="OW"><BulkData uri="missing.bin"/></DicomAttribute>"#,
+        );
+        let err = dataset_from_xml_with_resolver(&xml, &mut resolve).unwrap_err();
+        assert!(err.to_string().contains("no such bulk object"), "{err}");
+        // Missing/empty uri never reaches the resolver.
+        for body in [
+            r#"<DicomAttribute tag="7FE00010" vr="OW"><BulkData/></DicomAttribute>"#,
+            r#"<DicomAttribute tag="7FE00010" vr="OW"><BulkData uri=""/></DicomAttribute>"#,
+        ] {
+            let err = dataset_from_xml_with_resolver(&wrap(body), &mut resolve).unwrap_err();
+            assert!(err.to_string().contains("without uri"), "{err}");
+        }
+        // Bulk under a non-bulk VR is refused, like InlineBinary.
+        let xml = wrap(
+            r#"<DicomAttribute tag="00280010" vr="US"><BulkData uri="px.bin"/></DicomAttribute>"#,
+        );
+        let err = dataset_from_xml_with_resolver(&xml, &mut resolve).unwrap_err();
+        assert!(err.to_string().contains("not allowed for this VR"), "{err}");
+        // Bulk with a Value sibling is refused (single-child rule).
+        let xml = wrap(
+            r#"<DicomAttribute tag="7FE00010" vr="OW"><Value number="1">1</Value><BulkData uri="px.bin"/></DicomAttribute>"#,
+        );
+        let err = dataset_from_xml_with_resolver(&xml, &mut resolve).unwrap_err();
+        assert!(err.to_string().contains("must be the only child"), "{err}");
+        // Non-empty Start/End form is refused.
+        let xml = wrap(
+            r#"<DicomAttribute tag="7FE00010" vr="OW"><BulkData uri="px.bin">junk</BulkData></DicomAttribute>"#,
+        );
+        let err = dataset_from_xml_with_resolver(&xml, &mut resolve).unwrap_err();
+        assert!(err.to_string().contains("must be empty"), "{err}");
+        // Without a resolver the historic refusal stands.
+        let xml = wrap(
+            r#"<DicomAttribute tag="7FE00010" vr="OW"><BulkData uri="px.bin"/></DicomAttribute>"#,
+        );
+        let err = dataset_from_xml(&xml).unwrap_err();
+        assert!(err.to_string().contains("not resolved"), "{err}");
     }
 
     #[test]

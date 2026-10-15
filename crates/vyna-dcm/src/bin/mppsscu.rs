@@ -147,7 +147,7 @@ async fn main() -> Result<()> {
     let sop = sop_class::MODALITY_PERFORMED_PROCEDURE_STEP;
     let mut assoc = args
         .conn
-        .connect(&[sop], &ConnArgs::default_syntaxes())
+        .connect(&[sop], &ConnArgs::default_syntaxes(), vec![])
         .await?;
     let (cs, _) = assoc
         .n_create(sop, &mpps_uid, Some(&data.to_create_dataset()))
@@ -178,7 +178,7 @@ async fn main() -> Result<()> {
                 );
                 let status = if cs != 0 { cs } else { ss };
                 msg.outcome = outcome_for_status(status);
-                emit_best_effort(Some(&audit.sender), &msg, "mppsscu");
+                emit_best_effort(Some(&audit.sender), &msg, "mppsscu").await;
             }
             None => eprintln!("mppsscu: skipping audit: no --study-uid"),
         }

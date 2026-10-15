@@ -20,7 +20,11 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     let mut assoc = args
         .conn
-        .connect(&[sop_class::VERIFICATION], &ConnArgs::default_syntaxes())
+        .connect(
+            &[sop_class::VERIFICATION],
+            &ConnArgs::default_syntaxes(),
+            vec![],
+        )
         .await?;
     let status = assoc.echo(sop_class::VERIFICATION).await?;
     println!("C-ECHO-RSP status {status:#06X}");

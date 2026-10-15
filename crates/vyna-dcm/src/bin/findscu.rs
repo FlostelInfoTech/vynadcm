@@ -6,7 +6,7 @@ mod common;
 use clap::Parser;
 use common::{
     AuditArgs, ConnArgs, anyhowish::Result, build_qr_query, emit_best_effort, host_of,
-    outcome_for_status,
+    outcome_for_status, relational_proposal,
 };
 use vyna_dcm::core::sop_class;
 use vyna_dcm::dump_dataset;
@@ -31,6 +31,10 @@ struct Args {
     /// to completion). A requested cancel exits 0 with status FE00.
     #[arg(long, default_value_t = 0)]
     cancel: u32,
+    /// Propose relational-queries extended negotiation (cross-level
+    /// keys without unique parents; ignored for MWL).
+    #[arg(long, default_value_t = false)]
+    relational: bool,
     #[command(flatten)]
     audit: AuditArgs,
 }
@@ -64,9 +68,10 @@ async fn main() -> Result<()> {
     let is_mwl = sop == sop_class::MODALITY_WORKLIST_FIND;
     let query = build_qr_query(&args.keys, is_mwl)?;
 
+    let extended = relational_proposal(args.relational && !is_mwl, sop);
     let mut assoc = args
         .conn
-        .connect(&[sop], &ConnArgs::default_syntaxes())
+        .connect(&[sop], &ConnArgs::default_syntaxes(), extended)
         .await?;
     let mut count = 0u32;
     let json = args.json;
@@ -104,7 +109,7 @@ async fn main() -> Result<()> {
         } else {
             outcome_for_status(status)
         };
-        emit_best_effort(Some(&audit.sender), &msg, "findscu");
+        emit_best_effort(Some(&audit.sender), &msg, "findscu").await;
     }
     assoc.release().await?;
     if status != 0 && !requested_cancel(status, args.cancel > 0) {

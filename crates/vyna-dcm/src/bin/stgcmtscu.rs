@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     let sop = sop_class::STORAGE_COMMITMENT_PUSH;
     let mut assoc = args
         .conn
-        .connect(&[sop], &ConnArgs::default_syntaxes())
+        .connect(&[sop], &ConnArgs::default_syntaxes(), vec![])
         .await?;
     println!("N-ACTION sent, transaction {txn}; waiting for N-EVENT-REPORT...");
     let (action_status, report) = assoc.storage_commit(sop, &request_uid, &request).await?;
@@ -138,7 +138,7 @@ async fn main() -> Result<()> {
                         } else {
                             vyna_dcm::Outcome::MajorFailure
                         };
-                        emit_best_effort(Some(&audit.sender), &msg, "stgcmtscu");
+                        emit_best_effort(Some(&audit.sender), &msg, "stgcmtscu").await;
                     }
                     None => skipped += 1,
                 }

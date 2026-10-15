@@ -201,7 +201,7 @@ impl Handlers for StoreScp {
                         &audit.source,
                     );
                     msg.outcome = outcome_for_status(status);
-                    emit_best_effort(Some(&audit.sender), &msg, "storescp");
+                    emit_best_effort(Some(&audit.sender), &msg, "storescp").await;
                 }
                 None => eprintln!("storescp: skipping audit for {inst}: no Study UID"),
             }
@@ -231,7 +231,7 @@ async fn main() -> Result<()> {
             &audit.source,
             true,
         );
-        emit_best_effort(Some(&audit.sender), &msg, "storescp");
+        emit_best_effort(Some(&audit.sender), &msg, "storescp").await;
     }
 
     let tls = args.listen.tls_acceptor()?;

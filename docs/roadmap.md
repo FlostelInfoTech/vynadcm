@@ -110,14 +110,16 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
   two-pass offsets) plus the `dcmdir` create/`--list` CLI.
   Accepted: every emitted link verified to point at an item tag,
   10 dicomdir tests, 171/171 tests, clippy clean. Out of scope
-  (documented): `MRDR` following, pydicom cross-read (no
-  independent reader available here).
+  (documented): pydicom cross-read (no independent reader
+  available here). Follow-up: `MRDR` following (loop-guarded,
+  stamped with the `MRDR` record type, unresolvable ones skipped).
 - **WADO-URI client** — DONE: shipped `WadoUriRequest` +
   `wado_uri`/`wado_uri_dataset` (validated UIDs/ranges, verbatim
   rendering knobs, `application/dicom` gate on the parsed form).
   Accepted: param unit tests + stub-server e2e (DICOM parse,
   rendered passthrough, 404 surfacing), 176/176 tests, clippy
-  clean. Out of scope (documented): WADO-URI server side.
+  clean. Follow-up: WADO-URI server side (`GET /wado`, DICOM-only
+  with `transferSyntax` transcode; rendering knobs refused).
 - **Missing SCU tools** (`movescu`, `getscu`, `mppsscu`,
   `stgcmtscu`) — DONE: shipped all four (shared `-k` query builder
   with `findscu`, generated UIDs/dates where sensible) plus the
@@ -150,7 +152,9 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
   identical samples post-run, 211/211 tests, clippy clean. Out of
   scope (documented): full E.1 transcription, coded profile
   claims, free-text scrubbing, charset conversion, UID-map
-  persistence, pixel redaction.
+  persistence. Follow-up: native-frame pixel redaction
+  (`codec::redact_regions` + `deidentify --redact` with a
+  warned burned-in override).
 - **ATNA audit-trail emission** (dcm4che `audit`/syslog) — DONE:
   shipped `vyna-dcm-atna` (RFC 3881 message builders with pinned
   code triples, `udp`/`tcp`/`tls` syslog delivery) plus the
@@ -178,8 +182,9 @@ rejects non-PDF bytes (`Error::NotPdf`, `%PDF-` magic check).
   (`--with-meta`) / `xml2dcm` (`--transfer-syntax`, encapsulated
   re-fragment) CLIs. Accepted: 4 round-trip/rejection tests, JP
   CJK round-trip identical, 246/246 tests, clippy clean. Out of
-  scope (documented): `BulkData` resolution, DCMTK `<element>`
-  format.
+  scope (documented): DCMTK `<element>` format. Follow-up:
+  `BulkData` resolution (`dataset_from_xml_with_resolver` +
+  `xml2dcm --bulk-data-dir`, traversal-safe).
 - **UPS / IAN** — EVALUATED (2026-10-12): demand gate not met,
   no code shipped. Verified reusable on adoption day: SCU
   `n_create`/`n_set`/`n_get`/`n_action`/`n_delete`/

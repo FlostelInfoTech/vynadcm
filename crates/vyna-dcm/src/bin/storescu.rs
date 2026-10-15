@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     let class_refs: Vec<&str> = classes.iter().map(String::as_str).collect();
     let audit = args.audit.sender(&args.conn.calling)?;
     let peer_ip = host_of(&args.conn.connect).to_string();
-    let mut assoc = args.conn.connect(&class_refs, &syntaxes).await?;
+    let mut assoc = args.conn.connect(&class_refs, &syntaxes, vec![]).await?;
     let mut failed = 0;
     for (file, class, inst, ds) in &jobs {
         // The association re-encodes into the negotiated transfer syntax;
@@ -106,7 +106,7 @@ async fn main() -> Result<()> {
                     msg.outcome = status
                         .map(outcome_for_status)
                         .unwrap_or(vyna_dcm::Outcome::MajorFailure);
-                    emit_best_effort(Some(&audit.sender), &msg, "storescu");
+                    emit_best_effort(Some(&audit.sender), &msg, "storescu").await;
                 }
                 None => eprintln!(
                     "storescu: skipping audit for {}: no Study UID",

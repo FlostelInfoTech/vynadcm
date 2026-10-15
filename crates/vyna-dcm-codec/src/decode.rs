@@ -1189,4 +1189,46 @@ mod tests {
             }
         }
     }
+
+    fn sweep_corpus() -> DataSet {
+        let mut item = DataSet::new();
+        item.put_text(tags::CODE_VALUE, Vr::Sh, "1234-5");
+        item.put_u16_single(tags::ROWS, 64);
+        let mut ds = DataSet::new();
+        ds.put_uid(tags::SOP_INSTANCE_UID, "1.2.3.4.5");
+        ds.put_text(tags::MODALITY, Vr::Cs, "CT");
+        ds.put_person_name(tags::PATIENT_NAME, vec![PersonName::parse("Doe^Jane")]);
+        ds.put_u16(tags::PIXEL_REPRESENTATION, vec![0, 1]);
+        ds.put_u32_single(tags::NUMBER_OF_FRAMES, 1);
+        ds.put_sequence(tags::REFERENCED_SERIES_SEQUENCE, vec![item]);
+        ds.put_null(tags::STUDY_ID, Vr::Sh);
+        ds
+    }
+
+    #[test]
+    fn truncated_and_mutated_datasets_never_panic() {
+        // Exhaustive truncation plus a deterministic mutation sample
+        // across the uncompressed transfer syntaxes: every attempt
+        // must return (`Ok` or `Err`), never panic. The full-length
+        // input pins the sanity baseline (clean round-trip).
+        use TransferSyntax as Ts;
+        let ds = sweep_corpus();
+        for ts in [
+            Ts::ExplicitVrLittleEndian,
+            Ts::ImplicitVrLittleEndian,
+            Ts::ExplicitVrBigEndian,
+            Ts::DeflatedExplicitVrLittleEndian,
+        ] {
+            let bytes = crate::encode_dataset(&ds, ts).unwrap();
+            assert!(decode_dataset(&bytes, ts).is_ok(), "{ts:?}");
+            for len in 0..bytes.len() {
+                let _ = decode_dataset(&bytes[..len], ts);
+            }
+            for (i, b) in bytes.iter().enumerate().step_by(11) {
+                let mut mutated = bytes.clone();
+                mutated[i] = b.wrapping_add(1);
+                let _ = decode_dataset(&mutated, ts);
+            }
+        }
+    }
 }

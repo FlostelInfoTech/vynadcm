@@ -33,3 +33,11 @@ features:
     - cargo check -p vyna-dcm-net --no-default-features --all-targets
     - cargo check -p vyna-dcm-web --no-default-features --all-targets
     - cargo check -p vyna-dcm-atna --no-default-features --all-targets
+
+# RustSec advisory scan over Cargo.lock (fails on known
+# vulnerabilities in the locked dependency set).
+audit:
+  stage: lint
+  script:
+    - cargo install cargo-audit --locked
+    - cargo audit

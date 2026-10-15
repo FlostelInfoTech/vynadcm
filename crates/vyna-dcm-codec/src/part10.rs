@@ -310,4 +310,23 @@ mod tests {
         assert!(!complete);
         assert_eq!(partial.string(tags::MODALITY), Some("ECG"));
     }
+
+    #[test]
+    fn truncated_and_mutated_files_never_panic() {
+        // Exhaustive truncation plus a deterministic mutation sample
+        // over a real Part-10 file: every attempt must return (`Ok`
+        // or `Err`), never panic. The full-length input pins the
+        // sanity baseline (clean round-trip).
+        let (meta, ds) = sample();
+        let bytes = write_part10(&meta, &ds).unwrap();
+        assert!(read_part10(&bytes).is_ok());
+        for len in 0..bytes.len() {
+            let _ = read_part10(&bytes[..len]);
+        }
+        for (i, b) in bytes.iter().enumerate().step_by(11) {
+            let mut mutated = bytes.clone();
+            mutated[i] = b.wrapping_add(1);
+            let _ = read_part10(&mutated);
+        }
+    }
 }

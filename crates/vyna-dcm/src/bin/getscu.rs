@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use clap::Parser;
 use common::{
     AuditArgs, ConnArgs, anyhowish::Result, build_qr_query, emit_best_effort, host_of,
-    outcome_for_status, safe_instance_filename,
+    outcome_for_status, relational_proposal, safe_instance_filename,
 };
 use vyna_dcm::core::sop_class;
 use vyna_dcm::{FileMeta, TransferSyntax};
@@ -33,6 +33,10 @@ struct Args {
     /// Output directory for retrieved instances.
     #[arg(long, default_value = ".")]
     output_dir: PathBuf,
+    /// Propose relational-queries extended negotiation (cross-level
+    /// keys without unique parents).
+    #[arg(long, default_value_t = false)]
+    relational: bool,
     #[command(flatten)]
     audit: AuditArgs,
 }
@@ -47,10 +51,12 @@ fn get_sop_for_model(model: &str) -> Result<&'static str> {
     }
 }
 
-/// Best-effort per-arrival audit; silent when auditing is off or the
-/// arrival carries no Study UID.
+/// Build a per-arrival audit message (`None` when auditing is off
+/// or the arrival carries no Study UID). Messages queue in the
+/// store closure and flush after retrieval: emission is async and
+/// the closure is sync.
 #[allow(clippy::too_many_arguments)]
-fn audit_arrival(
+fn audit_arrival_msg(
     audit: &Option<common::SenderWithId>,
     patient: Option<&str>,
     study: Option<&str>,
@@ -59,7 +65,7 @@ fn audit_arrival(
     conn: &ConnArgs,
     peer_ip: &str,
     outcome: vyna_dcm::Outcome,
-) {
+) -> Option<vyna_dcm::AuditMessage> {
     if let (Some(audit), Some(study)) = (audit, study) {
         let mut msg = vyna_dcm::AuditMessage::instances_transferred(
             patient,
@@ -72,7 +78,9 @@ fn audit_arrival(
             &audit.source,
         );
         msg.outcome = outcome;
-        emit_best_effort(Some(&audit.sender), &msg, "getscu");
+        Some(msg)
+    } else {
+        None
     }
 }
 
@@ -86,15 +94,18 @@ async fn main() -> Result<()> {
     // Q/R context plus every storage class we can receive back.
     let mut sops = vec![sop];
     sops.extend(sop_class::DEFAULT_STORAGE_CLASSES.iter().copied());
+    // Relational is proposed for the Q/R SOP only, never storage.
+    let extended = relational_proposal(args.relational, sop);
     let mut assoc = args
         .conn
-        .connect(&sops, &ConnArgs::default_syntaxes())
+        .connect(&sops, &ConnArgs::default_syntaxes(), extended)
         .await?;
 
     let mut count = 0u32;
     let dir = &args.output_dir;
     let audit = args.audit.sender(&args.conn.calling)?;
     let peer_ip = host_of(&args.conn.connect).to_string();
+    let mut pending: Vec<vyna_dcm::AuditMessage> = Vec::new();
     let r = assoc
         .get_with(sop, &query, 0, |class: String, inst: String, ds, ts| {
             let patient = ds.string(vyna_dcm::tags::PATIENT_ID).map(str::to_string);
@@ -112,7 +123,7 @@ async fn main() -> Result<()> {
                     Ok(ds) => ds,
                     Err(e) => {
                         println!("transcode failed for {inst}: {e}");
-                        audit_arrival(
+                        pending.extend(audit_arrival_msg(
                             &audit,
                             patient.as_deref(),
                             study.as_deref(),
@@ -121,7 +132,7 @@ async fn main() -> Result<()> {
                             &args.conn,
                             &peer_ip,
                             vyna_dcm::Outcome::MajorFailure,
-                        );
+                        ));
                         return 0xA900; // dataset does not match SOP class
                     }
                 }
@@ -147,7 +158,7 @@ async fn main() -> Result<()> {
                     0xA900 // dataset does not match SOP class
                 }
             };
-            audit_arrival(
+            pending.extend(audit_arrival_msg(
                 &audit,
                 patient.as_deref(),
                 study.as_deref(),
@@ -156,10 +167,13 @@ async fn main() -> Result<()> {
                 &args.conn,
                 &peer_ip,
                 outcome_for_status(status),
-            );
+            ));
             status
         })
         .await?;
+    for msg in &pending {
+        emit_best_effort(audit.as_ref().map(|a| &a.sender), msg, "getscu").await;
+    }
     println!(
         "C-GET complete: {count} file(s), {} failed, status {:#06X}",
         r.failed, r.status

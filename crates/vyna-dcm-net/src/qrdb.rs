@@ -903,6 +903,30 @@ mod tests {
     }
 
     #[test]
+    fn relational_cross_level_queries_answer() {
+        // Relational semantics: keys may sit at any level regardless
+        // of unique parents (hierarchical would demand the Study UID
+        // for the SERIES query below).
+        let index = index();
+        // STUDY level filtered by a study key: one group.
+        let mut q = DataSet::new();
+        q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "STUDY");
+        q.put_text(tags::STUDY_DATE, Vr::Da, "20240320");
+        q.put_null(tags::STUDY_INSTANCE_UID, Vr::Ui);
+        let (code, out) = find_matches(&index, &q, false);
+        assert_eq!(code, status::SUCCESS);
+        assert_eq!(out.len(), 1);
+        // SERIES level with NO Study UID (relational-only shape).
+        let mut q = DataSet::new();
+        q.put_text(tags::QUERY_RETRIEVE_LEVEL, Vr::Cs, "SERIES");
+        q.put_text(tags::MODALITY, Vr::Cs, "CT");
+        q.put_null(tags::SERIES_INSTANCE_UID, Vr::Ui);
+        let (code, out) = find_matches(&index, &q, false);
+        assert_eq!(code, status::SUCCESS);
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
     fn match_flood_fails_out_of_resources() {
         let mut records = Vec::new();
         for i in 0..=MAX_QR_MATCHES {

@@ -19,6 +19,7 @@ pub struct Deidentifier {
     date_offset: Option<i64>,
     retain_private: bool,
     custom_profile: bool,
+    allow_burned_in: bool,
     uid_map: HashMap<String, String>,
 }
 
@@ -32,6 +33,7 @@ impl std::fmt::Debug for Deidentifier {
             .field("date_offset", &self.date_offset)
             .field("retain_private", &self.retain_private)
             .field("custom_profile", &self.custom_profile)
+            .field("allow_burned_in", &self.allow_burned_in)
             .field("uid_map_len", &self.uid_map.len())
             .finish_non_exhaustive()
     }
@@ -54,6 +56,7 @@ impl Deidentifier {
             date_offset: None,
             retain_private: false,
             custom_profile: false,
+            allow_burned_in: false,
             uid_map: HashMap::new(),
         }
     }
@@ -138,10 +141,28 @@ impl Deidentifier {
         self
     }
 
+    /// Proceed when Burned In Annotation is `YES` instead of refusing
+    /// (default: refuse).
+    ///
+    /// The engine still never alters pixels: set this only when the
+    /// caller redacts them separately first (e.g.
+    /// `vyna_dcm_codec::redact_regions`). Overridden runs record a
+    /// warning, which withholds the `YES` / `113100` conformance
+    /// markers — an override the engine cannot verify must not claim
+    /// them.
+    #[must_use]
+    pub fn with_allow_burned_in(mut self, allow: bool) -> Self {
+        self.allow_burned_in = allow;
+        self
+    }
+
     /// De-identify `ds` in place, returning what changed.
     ///
     /// Refuses with [`Error::BurnedInAnnotation`] when Burned In
-    /// Annotation is `YES` (pixels are never altered). UID remaps stay
+    /// Annotation is `YES` (pixels are never altered), unless
+    /// [`with_allow_burned_in`](Self::with_allow_burned_in) was set —
+    /// in which case the run proceeds with a recorded warning (and
+    /// withheld conformance markers). UID remaps stay
     /// consistent across every `apply` call on this `Deidentifier`.
     ///
     /// Only the dataset is touched: callers that persist file meta
@@ -158,7 +179,10 @@ impl Deidentifier {
     pub fn apply(&mut self, ds: &mut DataSet) -> Result<DeidReport> {
         let mut report = DeidReport::default();
         match burned_in_status(ds) {
-            BurnedIn::Yes => return Err(Error::BurnedInAnnotation),
+            BurnedIn::Yes if !self.allow_burned_in => return Err(Error::BurnedInAnnotation),
+            BurnedIn::Yes => report.warnings.push(
+                "Burned In Annotation is YES: caller attested external pixel redaction".to_string(),
+            ),
             BurnedIn::Unknown => report
                 .warnings
                 .push("Burned In Annotation present but unparseable: kept as-is".to_string()),
@@ -875,6 +899,32 @@ mod tests {
         ds.put_sequence(tags::REQUEST_ATTRIBUTES_SEQUENCE, vec![item]);
         let err = Deidentifier::new().apply(&mut ds).unwrap_err();
         assert!(matches!(err, Error::BurnedInAnnotation));
+    }
+
+    #[test]
+    fn burned_in_override_proceeds_warned_and_unmarked() {
+        let mut ds = DataSet::new();
+        ds.put_text(tags::BURNED_IN_ANNOTATION, Vr::Cs, "YES");
+        ds.put_text(tags::PATIENT_ID, Vr::Lo, "E123");
+        let report = Deidentifier::new()
+            .with_allow_burned_in(true)
+            .apply(&mut ds)
+            .unwrap();
+        assert_eq!(report.warnings.len(), 2, "{:?}", report.warnings);
+        assert!(report.warnings[0].contains("attested external pixel redaction"));
+        assert!(report.warnings[1].contains("markers withheld"));
+        // Metadata still processed…
+        assert_ne!(ds.string(tags::PATIENT_ID), Some("E123"));
+        // …but the unverifiable override withholds the markers.
+        assert_ne!(
+            ds.string(tags::PATIENT_IDENTITY_REMOVED),
+            Some("YES"),
+            "override must not claim the Basic Profile markers"
+        );
+        assert!(
+            ds.sequence(tags::DEIDENTIFICATION_METHOD_CODE_SEQUENCE)
+                .is_none()
+        );
     }
 
     #[test]

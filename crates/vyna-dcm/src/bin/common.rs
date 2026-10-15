@@ -12,6 +12,7 @@ use vyna_dcm::core::{Tag, lookup_keyword};
 /// drops new connections with a warning instead of spawning
 /// unbounded tasks (slow-loris on the association count).
 pub const MAX_SCP_ASSOCIATIONS: usize = 1024;
+use vyna_dcm::net::pdu::ExtendedNegotiation;
 use vyna_dcm::net::service::propose;
 use vyna_dcm::net::{AeTitle, Association, AssociationOptions};
 use vyna_dcm::{DataSet, Vr};
@@ -104,12 +105,17 @@ impl ConnArgs {
     }
 
     /// Connect (plain or TLS) and request an association.
+    ///
+    /// `extended` carries SOP-class extended negotiations (`0x56`,
+    /// e.g. relational-queries proposals for QR SOP classes).
     pub async fn connect(
         &self,
         sop_classes: &[&str],
         syntaxes: &[TransferSyntax],
+        extended: Vec<ExtendedNegotiation>,
     ) -> anyhowish::Result<Association> {
-        let opts = self.assoc_options();
+        let mut opts = self.assoc_options();
+        opts.extended_negotiation = extended;
         let calling = AeTitle::new(self.calling.clone())?;
         let called = AeTitle::new(self.called.clone())?;
         let proposed = propose(sop_classes, syntaxes)?;
@@ -323,15 +329,26 @@ pub struct SenderWithId {
 
 /// Emit an audit message without ever failing the caller: transport
 /// problems print a warning and the clinical path continues.
-pub fn emit_best_effort(
+/// Best-effort audit emission that never blocks a runtime worker:
+/// [`SyslogSender`](vyna_dcm::SyslogSender) delivery is blocking I/O
+/// (TCP connect up to the sender timeout, unbounded DNS), so it runs
+/// on the blocking pool while the caller awaits the outcome for its
+/// warning.
+pub async fn emit_best_effort(
     sender: Option<&vyna_dcm::SyslogSender>,
     msg: &vyna_dcm::AuditMessage,
     tool: &str,
 ) {
-    if let Some(sender) = sender
-        && let Err(e) = sender.emit(msg)
-    {
-        eprintln!("{tool}: audit emission failed (continuing): {e}");
+    let Some(sender) = sender else {
+        return;
+    };
+    let sender = sender.clone();
+    let msg = msg.clone();
+    let tool = tool.to_string();
+    match tokio::task::spawn_blocking(move || sender.emit(&msg)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("{tool}: audit emission failed (continuing): {e}"),
+        Err(e) => eprintln!("{tool}: audit task failed (continuing): {e}"),
     }
 }
 
@@ -416,9 +433,33 @@ pub mod anyhowish {
     }
 }
 
+/// Relational-queries `0x56` proposal for `sop` when the caller
+/// asked for it (QR tools' `--relational`); empty otherwise.
+#[must_use]
+pub fn relational_proposal(relational: bool, sop: &str) -> Vec<ExtendedNegotiation> {
+    if relational {
+        vec![ExtendedNegotiation {
+            sop_class_uid: sop.to_string(),
+            app_info: vec![1],
+        }]
+    } else {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::host_of;
+    use super::{host_of, relational_proposal};
+
+    #[test]
+    fn relational_proposal_builds_bit_set_entry() {
+        let sop = "1.2.840.10008.5.1.4.1.2.2.1";
+        let out = relational_proposal(true, sop);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].sop_class_uid, sop);
+        assert_eq!(out[0].app_info, vec![1]);
+        assert!(relational_proposal(false, sop).is_empty());
+    }
 
     #[test]
     fn host_parsing_covers_ipv6() {

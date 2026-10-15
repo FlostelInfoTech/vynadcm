@@ -38,6 +38,7 @@ pub mod jpeg_lossless;
 pub mod jpeg_ls;
 mod json;
 mod part10;
+mod redact;
 pub mod rle;
 pub mod transcode;
 mod xml;
@@ -63,9 +64,10 @@ pub use part10::{
     FileMeta, META_VERSION, PREFIX_LEN, read_part10, read_part10_header,
     read_part10_header_complete, write_part10,
 };
+pub use redact::{RedactFrames, RedactRegion, redact_regions};
 pub use transcode::{TranscodeOptions, transcode_dataset};
 pub use vyna_dcm_core::TransferSyntax;
-pub use xml::{dataset_from_xml, dataset_to_xml};
+pub use xml::{dataset_from_xml, dataset_from_xml_with_resolver, dataset_to_xml};
 
 use vyna_dcm_core::{DataSet, FragmentSequence};
 

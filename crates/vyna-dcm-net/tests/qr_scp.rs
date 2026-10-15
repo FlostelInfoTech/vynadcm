@@ -353,6 +353,7 @@ async fn move_outbound_death_fails_fast_with_processing_failure() {
             async_ops: None,
             role_selection: vec![],
             user_identity_response: None,
+            extended_negotiation: vec![],
         };
         write_pdu(&mut tcp, &Pdu::AssociateAc(ac)).await.unwrap();
         // First P-DATA (a C-STORE-RQ): abort instead of answering.

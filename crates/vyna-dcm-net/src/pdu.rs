@@ -40,6 +40,33 @@ pub struct RoleSelection {
     pub scp_role: bool,
 }
 
+/// SOP Class Extended Negotiation sub-item (`0x56`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtendedNegotiation {
+    /// SOP Class UID the negotiation applies to.
+    pub sop_class_uid: String,
+    /// Service-class application information (for QR relational
+    /// queries: one byte, bit 0 = relational requested/accepted).
+    pub app_info: Vec<u8>,
+}
+
+/// True when `list` carries a relational-queries proposal (`0x56`
+/// with bit 0 set) for `sop`.
+#[must_use]
+pub fn relational_requested(list: &[ExtendedNegotiation], sop: &str) -> bool {
+    list.iter()
+        .any(|e| e.sop_class_uid == sop && e.app_info.first().is_some_and(|b| b & 1 == 1))
+}
+
+/// Acceptance echo for a negotiated relational SOP class.
+#[must_use]
+pub fn relational_acceptance(sop: &str) -> ExtendedNegotiation {
+    ExtendedNegotiation {
+        sop_class_uid: sop.to_string(),
+        app_info: vec![1],
+    }
+}
+
 /// User Identity Negotiation (RQ item `0x58`).
 #[derive(Clone, PartialEq, Eq)]
 pub struct UserIdentity {
@@ -92,6 +119,8 @@ pub struct AssociateRq {
     pub role_selection: Vec<RoleSelection>,
     /// Proposed user identity.
     pub user_identity: Option<UserIdentity>,
+    /// Proposed SOP-class extended negotiations (`0x56`).
+    pub extended_negotiation: Vec<ExtendedNegotiation>,
 }
 
 /// A-ASSOCIATE-AC PDU (`0x02`).
@@ -113,6 +142,8 @@ pub struct AssociateAc {
     pub role_selection: Vec<RoleSelection>,
     /// Server user-identity response bytes.
     pub user_identity_response: Option<Vec<u8>>,
+    /// Accepted SOP-class extended negotiations (`0x56`).
+    pub extended_negotiation: Vec<ExtendedNegotiation>,
 }
 
 /// A-ASSOCIATE-RJ PDU (`0x03`).
@@ -421,6 +452,7 @@ fn decode_assoc_rq(p: &[u8]) -> Result<AssociateRq> {
         async_ops: None,
         role_selection: Vec::new(),
         user_identity: None,
+        extended_negotiation: Vec::new(),
     };
     let mut items = Items::new(&p[68..]);
     while let Some((typ, v)) = items.next()? {
@@ -456,6 +488,7 @@ fn decode_assoc_ac(p: &[u8]) -> Result<AssociateAc> {
         async_ops: None,
         role_selection: Vec::new(),
         user_identity_response: None,
+        extended_negotiation: Vec::new(),
     };
     let mut items = Items::new(&p[68..]);
     while let Some((typ, v)) = items.next()? {
@@ -545,6 +578,7 @@ fn decode_user_info_rq(v: &[u8], rq: &mut AssociateRq) -> Result<()> {
                 rq.implementation_version =
                     Some(std::str::from_utf8(sv).unwrap_or("").trim().to_string())
             }
+            0x56 => rq.extended_negotiation.push(decode_extended(sv)?),
             0x58 => rq.user_identity = Some(decode_user_identity(sv)?),
             _ => {}
         }
@@ -577,6 +611,7 @@ fn decode_user_info_ac(v: &[u8], ac: &mut AssociateAc) -> Result<()> {
                 ac.implementation_version =
                     Some(std::str::from_utf8(sv).unwrap_or("").trim().to_string())
             }
+            0x56 => ac.extended_negotiation.push(decode_extended(sv)?),
             0x58 => {
                 if sv.len() < 4 {
                     return Err(Error::BadPdu("user identity AC too short".into()));
@@ -591,6 +626,30 @@ fn decode_user_info_ac(v: &[u8], ac: &mut AssociateAc) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn decode_extended(sv: &[u8]) -> Result<ExtendedNegotiation> {
+    if sv.len() < 4 {
+        return Err(Error::BadPdu("extended negotiation item too short".into()));
+    }
+    let uid_len = u16::from_be_bytes([sv[0], sv[1]]) as usize;
+    if 2 + uid_len + 2 > sv.len() {
+        return Err(Error::BadPdu(
+            "extended negotiation UID out of range".into(),
+        ));
+    }
+    let sop_class_uid = uid_str(&sv[2..2 + uid_len])?;
+    let info_at = 2 + uid_len;
+    let info_len = u16::from_be_bytes([sv[info_at], sv[info_at + 1]]) as usize;
+    if info_at + 2 + info_len > sv.len() {
+        return Err(Error::BadPdu(
+            "extended negotiation app info out of range".into(),
+        ));
+    }
+    Ok(ExtendedNegotiation {
+        sop_class_uid,
+        app_info: sv[info_at + 2..info_at + 2 + info_len].to_vec(),
+    })
 }
 
 fn decode_role(sv: &[u8]) -> Result<RoleSelection> {
@@ -681,6 +740,9 @@ fn encode_user_info_rq(rq: &AssociateRq) -> Result<Vec<u8>> {
     for r in &rq.role_selection {
         put_item(&mut u, 0x54, &encode_role(r)?)?;
     }
+    for e in &rq.extended_negotiation {
+        put_item(&mut u, 0x56, &encode_extended(e)?)?;
+    }
     if let Some(id) = &rq.user_identity {
         let mut v = vec![id.identity_type, id.positive_response_requested as u8];
         v.extend_from_slice(&item_len(id.primary.len(), "user identity primary")?.to_be_bytes());
@@ -700,6 +762,17 @@ fn encode_role(r: &RoleSelection) -> Result<Vec<u8>> {
     v.extend_from_slice(r.sop_class_uid.as_bytes());
     v.push(r.scu_role as u8);
     v.push(r.scp_role as u8);
+    Ok(v)
+}
+
+fn encode_extended(e: &ExtendedNegotiation) -> Result<Vec<u8>> {
+    let mut v = Vec::new();
+    v.extend_from_slice(
+        &item_len(e.sop_class_uid.len(), "extended negotiation UID")?.to_be_bytes(),
+    );
+    v.extend_from_slice(e.sop_class_uid.as_bytes());
+    v.extend_from_slice(&item_len(e.app_info.len(), "extended negotiation info")?.to_be_bytes());
+    v.extend_from_slice(&e.app_info);
     Ok(v)
 }
 
@@ -730,6 +803,9 @@ fn encode_assoc_ac(ac: &AssociateAc) -> Result<Vec<u8>> {
     }
     for r in &ac.role_selection {
         put_item(&mut u, 0x54, &encode_role(r)?)?;
+    }
+    for e in &ac.extended_negotiation {
+        put_item(&mut u, 0x56, &encode_extended(e)?)?;
     }
     if let Some(resp) = &ac.user_identity_response {
         let mut v = Vec::new();
@@ -770,6 +846,10 @@ mod tests {
                 primary: b"user".to_vec(),
                 secondary: vec![],
             }),
+            extended_negotiation: vec![ExtendedNegotiation {
+                sop_class_uid: "1.2.840.10008.5.1.4.1.2.2.1".into(),
+                app_info: vec![1],
+            }],
         }
     }
 
@@ -812,9 +892,46 @@ mod tests {
             async_ops: Some((1, 1)),
             role_selection: vec![],
             user_identity_response: Some(b"ok".to_vec()),
+            extended_negotiation: vec![relational_acceptance("1.2.840.10008.5.1.4.1.2.2.1")],
         };
         let (_, bytes) = encode_pdu(&Pdu::AssociateAc(ac.clone())).unwrap();
         assert_eq!(decode_pdu(0x02, &bytes).unwrap(), Pdu::AssociateAc(ac));
+    }
+
+    #[test]
+    fn extended_negotiation_malformed_rejected() {
+        assert!(decode_extended(&[]).is_err());
+        assert!(decode_extended(&[0, 1]).is_err());
+        // UID length overruns the item.
+        assert!(decode_extended(&[0, 5, b'1', b'.', b'2']).is_err());
+        // App-info length overruns the item.
+        assert!(decode_extended(&[0, 3, b'1', b'.', b'2', 0, 9, 1]).is_err());
+        // Valid entry decodes.
+        let e = decode_extended(&[0, 3, b'1', b'.', b'2', 0, 1, 1]).unwrap();
+        assert_eq!(e.sop_class_uid, "1.2");
+        assert_eq!(e.app_info, vec![1]);
+    }
+
+    #[test]
+    fn relational_requested_matches_bit_and_sop() {
+        let sop = "1.2.840.10008.5.1.4.1.2.2.1";
+        let on = ExtendedNegotiation {
+            sop_class_uid: sop.to_string(),
+            app_info: vec![1],
+        };
+        assert!(relational_requested(std::slice::from_ref(&on), sop));
+        assert!(!relational_requested(&[], sop));
+        let off = ExtendedNegotiation {
+            sop_class_uid: sop.to_string(),
+            app_info: vec![0],
+        };
+        assert!(!relational_requested(&[off], sop));
+        let empty = ExtendedNegotiation {
+            sop_class_uid: sop.to_string(),
+            app_info: vec![],
+        };
+        assert!(!relational_requested(&[empty], sop));
+        assert!(!relational_requested(&[on], "1.2.3"));
     }
 
     #[test]
