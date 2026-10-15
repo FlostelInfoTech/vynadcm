@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | Roadmap (living) |
-| Version | 0.6.0 |
+| Version | 0.6.1 |
 | Date | 2026-10-15 |
 | Status | Living — reprioritized as VynaECG/VynaLink needs evolve |
-| Applies to | VynaDCM workspace v0.6.0 |
+| Applies to | VynaDCM workspace v0.6.1 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, from comparison
 with dcm4che, DCMTK, pydicom (+pynetdicom), and fo-dicom;
@@ -16,8 +16,9 @@ comparison rounds DONE;
 0.4.0 (2026-10-13) — review-fix batch DONE, first public release;
 0.5.0 (2026-10-13) — version bump to match workspace;
 0.6.0 (2026-10-15) — version bump to match workspace;
-Unreleased — post-0.6.0 batch (relational QR, MRDR, BulkData,
-WADO-URI server, redaction, FileStore, ATNA async) folded in.
+0.6.1 (2026-10-15) — post-0.6.0 batch (relational QR, MRDR,
+BulkData, WADO-URI server, redaction, FileStore, ATNA async)
+folded in.
 
 ## Contents
 

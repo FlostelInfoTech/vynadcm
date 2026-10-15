@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | SDS (living) |
-| Version | 0.6.0 |
+| Version | 0.6.1 |
 | Date | 2026-10-15 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.6.0 |
+| Applies to | VynaDCM workspace v0.6.1 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue; full-dictionary
 (P0.1) update applied same day (generated tables, private dict, `SV`);
@@ -15,7 +15,8 @@ Revision history: 0.1.0 (2026-10-11) — initial issue; full-dictionary
 TCP_NODELAY design notes;
 0.4.0 (2026-10-13) — security/correctness batch notes folded in;
 0.5.0 (2026-10-13) — version bump; §8 CI-ladder wording aligned;
-0.6.0 (2026-10-15) — version bump to match workspace.
+0.6.0 (2026-10-15) — version bump to match workspace;
+0.6.1 (2026-10-15) — version bump to match workspace.
 
 ## Contents
 

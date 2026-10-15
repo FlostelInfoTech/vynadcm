@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | Integration guide (living) |
-| Version | 0.6.0 |
+| Version | 0.6.1 |
 | Date | 2026-10-15 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.6.0 |
+| Applies to | VynaDCM workspace v0.6.1 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue. Every snippet
 below is compile-checked against the workspace (see §12);
@@ -14,7 +14,8 @@ below is compile-checked against the workspace (see §12);
 0.3.0 (2026-10-12) — documents MppsScp/StgCommitScp/ScpFollowUp;
 0.4.0 (2026-10-13) — GitHub links, `propose`/`HttpRequest` API notes;
 0.5.0 (2026-10-13) — version bump to match workspace;
-0.6.0 (2026-10-15) — version bump to match workspace.
+0.6.0 (2026-10-15) — version bump to match workspace;
+0.6.1 (2026-10-15) — version bump to match workspace.
 
 Audience: Rust developers embedding VynaDCM in VynaECG and VynaLink.
 Operators should start with `docs/user-guide.md`.

@@ -3,7 +3,10 @@
 All notable changes to VynaDCM are documented here. Versions follow
 the workspace crate version (`Cargo.toml`).
 
-## [Unreleased]
+## [0.6.1] — 2026-10-15
+
+Note: `vyna-dcm-core` stays at 0.6.0 (published first, identical
+content); the other nine workspace crates ship this batch as 0.6.1.
 
 ### Added
 

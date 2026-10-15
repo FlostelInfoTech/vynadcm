@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | User guide (living) |
-| Version | 0.6.0 |
+| Version | 0.6.1 |
 | Date | 2026-10-15 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.6.0, `vyna-dcm` CLI tools |
+| Applies to | VynaDCM workspace v0.6.1, `vyna-dcm` CLI tools |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue. Flag
 reference below is transcribed from `--help` output;
@@ -14,7 +14,8 @@ reference below is transcribed from `--help` output;
 0.3.0 (2026-10-12) — 32 CLI tools + cancel/exec/paths/syntax flags;
 0.4.0 (2026-10-13) — `--bearer-token`/`--verbose` flags, GitHub links;
 0.5.0 (2026-10-13) — version bump to match workspace;
-0.6.0 (2026-10-15) — version bump to match workspace.
+0.6.0 (2026-10-15) — version bump to match workspace;
+0.6.1 (2026-10-15) — version bump to match workspace.
 
 Audience: operators and support engineers running connectivity checks,
 storage, queries, and file conversions. Developers embedding the

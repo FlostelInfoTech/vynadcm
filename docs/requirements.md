@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | SRS (living) |
-| Version | 0.6.0 |
+| Version | 0.6.1 |
 | Date | 2026-10-15 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.6.0 (crates `vyna-dcm-*`) |
+| Applies to | VynaDCM workspace v0.6.1 (crates `vyna-dcm-*`) |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue, describing the
 implemented baseline (176 tests green, IOD validator + PDF helpers
@@ -18,8 +18,8 @@ charset/XML/img requirements folded in since 0.1.0;
 0.4.0 (2026-10-13) — MIT license (NFR-03), quality-gate wording;
 0.5.0 (2026-10-13) — version bump; FR-CORE-05 default-TS clarification;
 0.6.0 (2026-10-15) — version bump to match workspace;
-Unreleased — relational QR, MRDR, BulkData resolution, WADO-URI
-server, pixel redaction, FileStore, ATNA async folded in.
+0.6.1 (2026-10-15) — relational QR, MRDR, BulkData resolution,
+WADO-URI server, pixel redaction, FileStore, ATNA async folded in.
 
 ## Contents
 

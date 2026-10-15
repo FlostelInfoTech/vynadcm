@@ -1,6 +1,6 @@
 # VynaDCM DICOM Conformance Statement
 
-Product: VynaDCM `0.6.0` (workspace crates `vyna-dcm-*`).
+Product: VynaDCM `0.6.1` (workspace crates `vyna-dcm-*`).
 Generated from the implemented capabilities by
 `docs/generate-conformance.py` — do not hand-edit; rerun the script.
 
