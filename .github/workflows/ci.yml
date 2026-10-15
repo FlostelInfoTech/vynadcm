@@ -59,6 +59,8 @@ jobs:
   # vulnerabilities in the locked dependency set).
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      checks: write # audit-check reports via the Checks API
     steps:
       - uses: actions/checkout@v4
       - uses: rustsec/audit-check@v2

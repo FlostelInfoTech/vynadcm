@@ -3,7 +3,7 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-10-15T00:41:56Z",
+    "timestamp": "2026-10-15T02:07:21Z",
     "tools": {
       "components": [
         {
@@ -2169,12 +2169,12 @@
       ]
     },
     {
-      "bom-ref": "pkg:cargo/quick-xml@0.38.4",
+      "bom-ref": "pkg:cargo/quick-xml@0.41.0",
       "type": "library",
       "name": "quick-xml",
-      "version": "0.38.4",
+      "version": "0.41.0",
       "scope": "required",
-      "purl": "pkg:cargo/quick-xml@0.38.4",
+      "purl": "pkg:cargo/quick-xml@0.41.0",
       "licenses": [
         {
           "license": {
@@ -2185,7 +2185,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+          "content": "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
         }
       ]
     },
@@ -2323,12 +2323,12 @@
       ]
     },
     {
-      "bom-ref": "pkg:cargo/rustls@0.23.45",
+      "bom-ref": "pkg:cargo/rustls@0.23.46",
       "type": "library",
       "name": "rustls",
-      "version": "0.23.45",
+      "version": "0.23.46",
       "scope": "required",
-      "purl": "pkg:cargo/rustls@0.23.45",
+      "purl": "pkg:cargo/rustls@0.23.46",
       "licenses": [
         {
           "expression": "Apache-2.0 OR ISC OR MIT"
@@ -2337,7 +2337,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+          "content": "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
         }
       ]
     },
@@ -2357,25 +2357,6 @@
         {
           "alg": "SHA-256",
           "content": "dab5152771c58876a2146916e53e35057e1a4dfa2b9df0f0305b07f611fdea4d"
-        }
-      ]
-    },
-    {
-      "bom-ref": "pkg:cargo/rustls-pemfile@2.2.0",
-      "type": "library",
-      "name": "rustls-pemfile",
-      "version": "2.2.0",
-      "scope": "required",
-      "purl": "pkg:cargo/rustls-pemfile@2.2.0",
-      "licenses": [
-        {
-          "expression": "Apache-2.0 OR ISC OR MIT"
-        }
-      ],
-      "hashes": [
-        {
-          "alg": "SHA-256",
-          "content": "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
         }
       ]
     },

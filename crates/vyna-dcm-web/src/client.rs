@@ -1,6 +1,8 @@
 //! DICOMweb client: QIDO-RS, WADO-RS, STOW-RS (NEMA PS3.18 §8).
 
 use bytes::Bytes;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use vyna_dcm_codec::{FileMeta, dataset_from_json, read_part10};
 use vyna_dcm_core::DataSet;
 
@@ -277,7 +279,6 @@ impl DicomWebClient {
     /// Mozilla roots rather than the OS store (the platform verifier
     /// exposes no extra-roots hook).
     fn custom_tls_config(tls: &ClientTls) -> Result<rustls::ClientConfig> {
-        use std::io::BufReader;
         let ca_pem = tls
             .ca_pem
             .as_deref()
@@ -287,7 +288,7 @@ impl DicomWebClient {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
         let mut added = 0u32;
-        for cert in rustls_pemfile::certs(&mut BufReader::new(ca_pem)) {
+        for cert in CertificateDer::pem_slice_iter(ca_pem) {
             let cert = cert.map_err(|e| Error::Tls(format!("CA PEM: {e}")))?;
             roots
                 .add(cert)
@@ -318,14 +319,15 @@ impl DicomWebClient {
         Vec<rustls::pki_types::CertificateDer<'static>>,
         rustls::pki_types::PrivateKeyDer<'static>,
     )> {
-        use std::io::BufReader;
-        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem))
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem)
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| Error::Tls(format!("client identity certs: {e}")))?;
         if certs.is_empty() {
             return Err(Error::Tls("client identity holds no certificates".into()));
         }
-        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem))
+        let key = PrivateKeyDer::pem_slice_iter(key_pem)
+            .next()
+            .transpose()
             .map_err(|e| Error::Tls(format!("client identity key: {e}")))?
             .ok_or_else(|| Error::Tls("client identity holds no private key".into()))?;
         Ok((certs, key))
@@ -1648,12 +1650,13 @@ mod tests {
         key_pem: &[u8],
         client_ca_pem: Option<&[u8]>,
     ) -> Arc<rustls::ServerConfig> {
-        use std::io::BufReader;
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem))
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem)
             .collect::<std::result::Result<_, _>>()
             .unwrap();
-        let key = rustls_pemfile::private_key(&mut BufReader::new(key_pem))
+        let key = PrivateKeyDer::pem_slice_iter(key_pem)
+            .next()
+            .transpose()
             .unwrap()
             .unwrap();
         let config = match client_ca_pem {
@@ -1663,7 +1666,7 @@ mod tests {
                 .unwrap(),
             Some(ca) => {
                 let mut roots = rustls::RootCertStore::empty();
-                for cert in rustls_pemfile::certs(&mut BufReader::new(ca)) {
+                for cert in CertificateDer::pem_slice_iter(ca) {
                     roots.add(cert.unwrap()).unwrap();
                 }
                 let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))

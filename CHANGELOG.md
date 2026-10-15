@@ -65,6 +65,12 @@ the workspace crate version (`Cargo.toml`).
 - Audit emission no longer blocks tokio workers: delivery runs on
   the blocking pool while callers await the outcome, and `getscu`
   queues per-arrival audits and flushes after retrieval.
+- Dependency security: `rustls` 0.23.46 (4 low/medium advisories),
+  `quick-xml` 0.41 (2 high DoS advisories, small API migration),
+  and `rustls-pemfile` replaced by maintained `rustls-pki-types`
+  (same PEM semantics, error messages unchanged); `cargo audit`
+  is green and the CI audit job gains the Checks-API permission
+  it needs to report.
 
 ## [0.6.0] — 2026-10-15
 

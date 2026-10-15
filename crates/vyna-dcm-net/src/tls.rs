@@ -5,7 +5,8 @@
 //!
 //! [`accept`]: crate::service::accept
 
-use std::io::BufReader;
+use rustls_pki_types::pem::PemObject;
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::rustls::{self, ClientConfig, RootCertStore, ServerConfig};
@@ -59,7 +60,7 @@ impl TlsConnector {
         client_identity: Option<(&[u8], &[u8])>,
     ) -> Result<Self> {
         if let Some(pem) = extra_ca_pem {
-            for cert in rustls_pemfile::certs(&mut BufReader::new(pem)) {
+            for cert in CertificateDer::pem_slice_iter(pem) {
                 let cert = cert.map_err(|e| Error::Tls(e.to_string()))?;
                 roots.add(cert).map_err(|e| Error::Tls(e.to_string()))?;
             }
@@ -68,7 +69,7 @@ impl TlsConnector {
         let config = match client_identity {
             None => builder.with_no_client_auth(),
             Some((cert_pem, key_pem)) => {
-                let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_pem))
+                let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_pem)
                     .collect::<std::result::Result<_, _>>()
                     .map_err(|e| Error::Tls(e.to_string()))?;
                 let key = private_key(key_pem)?;
@@ -159,7 +160,7 @@ impl TlsAcceptor {
         key_pem: &[u8],
         client_ca_pem: Option<&[u8]>,
     ) -> Result<Self> {
-        let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_chain_pem))
+        let certs: Vec<_> = CertificateDer::pem_slice_iter(cert_chain_pem)
             .collect::<std::result::Result<_, _>>()
             .map_err(|e| Error::Tls(e.to_string()))?;
         if certs.is_empty() {
@@ -168,7 +169,7 @@ impl TlsAcceptor {
         let key = private_key(key_pem)?;
         let builder = if let Some(ca_pem) = client_ca_pem {
             let mut roots = RootCertStore::empty();
-            for cert in rustls_pemfile::certs(&mut BufReader::new(ca_pem)) {
+            for cert in CertificateDer::pem_slice_iter(ca_pem) {
                 let cert = cert.map_err(|e| Error::Tls(e.to_string()))?;
                 roots.add(cert).map_err(|e| Error::Tls(e.to_string()))?;
             }
@@ -213,8 +214,10 @@ impl TlsAcceptor {
     }
 }
 
-fn private_key(key_pem: &[u8]) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    rustls_pemfile::private_key(&mut BufReader::new(key_pem))
+fn private_key(key_pem: &[u8]) -> Result<PrivateKeyDer<'static>> {
+    PrivateKeyDer::pem_slice_iter(key_pem)
+        .next()
+        .transpose()
         .map_err(|e| Error::Tls(e.to_string()))?
         .ok_or_else(|| Error::Tls("no private key found in PEM".into()))
 }

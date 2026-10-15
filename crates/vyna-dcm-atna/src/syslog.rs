@@ -11,6 +11,10 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::message::{AuditMessage, Outcome};
+#[cfg(feature = "tls")]
+use rustls_pki_types::pem::PemObject;
+#[cfg(feature = "tls")]
+use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Syslog transport.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -352,7 +356,6 @@ impl SyslogSender {
 
     #[cfg(feature = "tls")]
     fn send_tls(&self, frame: &str) -> Result<()> {
-        use std::io::BufReader;
         use std::sync::Arc;
 
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -361,19 +364,21 @@ impl SyslogSender {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
         if let Some(pem) = &self.ca_pem {
-            for cert in rustls_pemfile::certs(&mut BufReader::new(&pem[..])) {
+            for cert in CertificateDer::pem_slice_iter(pem) {
                 let cert = cert.map_err(|e| Error::Tls(e.to_string()))?;
                 roots.add(cert).map_err(|e| Error::Tls(e.to_string()))?;
             }
         }
         let config = if let Some((cert_pem, key_pem)) = &self.client_cert {
-            let chain: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(&cert_pem[..]))
+            let chain: Vec<_> = CertificateDer::pem_slice_iter(cert_pem)
                 .collect::<std::result::Result<_, _>>()
                 .map_err(|e| Error::Tls(format!("client cert: {e}")))?;
             if chain.is_empty() {
                 return Err(Error::Tls("client cert: no certificates".to_string()));
             }
-            let key = rustls_pemfile::private_key(&mut BufReader::new(&key_pem[..]))
+            let key = PrivateKeyDer::pem_slice_iter(key_pem)
+                .next()
+                .transpose()
                 .map_err(|e| Error::Tls(format!("client key: {e}")))?
                 .ok_or_else(|| Error::Tls("client key: no private key".to_string()))?;
             rustls::ClientConfig::builder()

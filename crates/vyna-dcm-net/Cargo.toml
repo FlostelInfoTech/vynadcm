@@ -14,7 +14,7 @@ categories = ["network-programming", "multimedia"]
 
 [features]
 default = ["tls"]
-tls = ["tokio-rustls", "rustls", "rustls-pemfile", "webpki-roots"]
+tls = ["tokio-rustls", "rustls", "rustls-pki-types", "webpki-roots"]
 
 [dependencies]
 vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.6" }
@@ -25,7 +25,7 @@ tokio = { workspace = true, features = ["fs", "net", "io-util", "rt", "rt-multi-
 tracing.workspace = true
 tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
 webpki-roots = { workspace = true, optional = true }
 
 [dev-dependencies]

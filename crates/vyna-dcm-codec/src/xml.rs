@@ -18,6 +18,7 @@
 //!   DCMTK's proprietary `<element>` format is out of scope.
 
 use base64::Engine;
+use quick_xml::XmlVersion;
 use quick_xml::events::{BytesStart, Event};
 use quick_xml::reader::Reader;
 use vyna_dcm_core::{DataElement, DataSet, NameComponents, PersonName, Tag, Value, Vr, lookup};
@@ -354,7 +355,7 @@ fn attribute_head(e: &BytesStart<'_>) -> Result<(Tag, Vr)> {
     for attr in e.attributes() {
         let attr = attr.map_err(|e| Error::Xml(e.to_string()))?;
         let value = attr
-            .unescape_value()
+            .normalized_value(XmlVersion::Implicit1_0)
             .map_err(|e| Error::Xml(e.to_string()))?;
         match attr.key.as_ref() {
             b"tag" => tag = Some(value.into_owned()),
@@ -470,9 +471,10 @@ fn leaf_text(
     let mut out = String::new();
     loop {
         match next(reader, buf)? {
-            Event::Text(e) => {
-                out.push_str(&e.xml_content().map_err(|e| Error::Xml(e.to_string()))?)
-            }
+            Event::Text(e) => out.push_str(
+                &e.xml_content(XmlVersion::Implicit1_0)
+                    .map_err(|e| Error::Xml(e.to_string()))?,
+            ),
             Event::GeneralRef(e) => out.push_str(&resolve_entity(e.as_ref(), tag)?),
             Event::CData(e) => out.push_str(
                 std::str::from_utf8(e.as_ref())
@@ -524,7 +526,7 @@ fn bulk_data_uri(e: &quick_xml::events::BytesStart<'_>, tag: Tag) -> Result<Stri
         let attr = attr.map_err(|e| Error::Xml(e.to_string()))?;
         if attr.key.as_ref() == b"uri" {
             let uri = attr
-                .unescape_value()
+                .normalized_value(XmlVersion::Implicit1_0)
                 .map_err(|e| Error::Xml(e.to_string()))?
                 .into_owned();
             if uri.is_empty() {
