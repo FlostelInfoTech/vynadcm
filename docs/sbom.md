@@ -3,10 +3,10 @@
 | Field | Value |
 |---|---|
 | Document | Software bill of materials (living) |
-| Version | 0.5.0 |
-| Date | 2026-10-13 |
+| Version | 0.6.0 |
+| Date | 2026-10-15 |
 | Status | Living — regenerated on every dependency change |
-| Applies to | VynaDCM workspace v0.5.0 |
+| Applies to | VynaDCM workspace v0.6.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue (201
 components); Unreleased — bundled JPEG codecs + IOD validator + PDF
@@ -27,7 +27,9 @@ dependency set unchanged;
 store (direct `rustls-platform-verifier`, already in the graph via
 `reqwest`, so the set stays 229 components: 11 workspace, 218
 third-party); `vyna-dcm-web` no-`server` builds drop the direct
-`tokio` dependency.
+`tokio` dependency;
+0.6.0 (2026-10-15) — version bump to match workspace, dependency set
+unchanged (229 components: 11 workspace, 218 third-party).
 
 ## 1. Artifact
 

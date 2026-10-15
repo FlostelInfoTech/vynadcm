@@ -3,21 +3,21 @@
   "specVersion": "1.5",
   "version": 1,
   "metadata": {
-    "timestamp": "2026-10-14T01:05:10Z",
+    "timestamp": "2026-10-15T00:41:56Z",
     "tools": {
       "components": [
         {
           "type": "application",
           "name": "VynaDCM generate-sbom.py",
-          "version": "0.5.0"
+          "version": "0.6.0"
         }
       ]
     },
     "component": {
-      "bom-ref": "pkg:cargo/vyna-dcm@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm@0.6.0",
       "type": "application",
       "name": "vyna-dcm",
-      "version": "0.5.0"
+      "version": "0.6.0"
     }
   },
   "components": [
@@ -3528,12 +3528,12 @@
       ]
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm@0.6.0",
       "type": "library",
       "name": "vyna-dcm",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3544,12 +3544,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-atna@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-atna@0.6.0",
       "type": "library",
       "name": "vyna-dcm-atna",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-atna@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-atna@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3560,12 +3560,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-codec@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-codec@0.6.0",
       "type": "library",
       "name": "vyna-dcm-codec",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-codec@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-codec@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3576,12 +3576,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-core@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-core@0.6.0",
       "type": "library",
       "name": "vyna-dcm-core",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-core@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-core@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3592,12 +3592,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-deid@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-deid@0.6.0",
       "type": "library",
       "name": "vyna-dcm-deid",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-deid@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-deid@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3608,12 +3608,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-ecg@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-ecg@0.6.0",
       "type": "library",
       "name": "vyna-dcm-ecg",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-ecg@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-ecg@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3624,12 +3624,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-iod@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-iod@0.6.0",
       "type": "library",
       "name": "vyna-dcm-iod",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-iod@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-iod@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3640,12 +3640,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-net@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-net@0.6.0",
       "type": "library",
       "name": "vyna-dcm-net",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-net@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-net@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3656,12 +3656,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-pdf@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-pdf@0.6.0",
       "type": "library",
       "name": "vyna-dcm-pdf",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-pdf@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-pdf@0.6.0",
       "licenses": [
         {
           "license": {
@@ -3672,12 +3672,12 @@
       "description": "VynaDCM workspace member (MIT)"
     },
     {
-      "bom-ref": "pkg:cargo/vyna-dcm-web@0.5.0",
+      "bom-ref": "pkg:cargo/vyna-dcm-web@0.6.0",
       "type": "library",
       "name": "vyna-dcm-web",
-      "version": "0.5.0",
+      "version": "0.6.0",
       "scope": "required",
-      "purl": "pkg:cargo/vyna-dcm-web@0.5.0",
+      "purl": "pkg:cargo/vyna-dcm-web@0.6.0",
       "licenses": [
         {
           "license": {

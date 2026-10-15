@@ -3,17 +3,18 @@
 | Field | Value |
 |---|---|
 | Document | Integration guide (living) |
-| Version | 0.5.0 |
-| Date | 2026-10-13 |
+| Version | 0.6.0 |
+| Date | 2026-10-15 |
 | Status | Living draft — updated with every release |
-| Applies to | VynaDCM workspace v0.5.0 |
+| Applies to | VynaDCM workspace v0.6.0 |
 
 Revision history: 0.1.0 (2026-10-11) — initial issue. Every snippet
 below is compile-checked against the workspace (see §12);
 0.2.0 (2026-10-12) — version bump, snippets re-checked;
 0.3.0 (2026-10-12) — documents MppsScp/StgCommitScp/ScpFollowUp;
 0.4.0 (2026-10-13) — GitHub links, `propose`/`HttpRequest` API notes;
-0.5.0 (2026-10-13) — version bump to match workspace.
+0.5.0 (2026-10-13) — version bump to match workspace;
+0.6.0 (2026-10-15) — version bump to match workspace.
 
 Audience: Rust developers embedding VynaDCM in VynaECG and VynaLink.
 Operators should start with `docs/user-guide.md`.
@@ -37,7 +38,7 @@ Operators should start with `docs/user-guide.md`.
 
 ```toml
 [dependencies]
-vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.5" }
+vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.6" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 ```
 

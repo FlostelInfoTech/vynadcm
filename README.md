@@ -125,7 +125,7 @@ their features.
 
 ```toml
 # Minimal embed: model + codec only
-vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.5", default-features = false }
+vyna-dcm = { git = "https://github.com/FlostelInfoTech/vynadcm", version = "0.6", default-features = false }
 # VynaECG: features = ["ecg", "net"]. VynaLink: features = ["net", "web"].
 ```
 

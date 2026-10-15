@@ -1,6 +1,6 @@
 [package]
 name = "vyna-dcm-ecg"
-version = "0.5.0"
+version = "0.6.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -12,9 +12,9 @@ keywords = ["dicom", "ecg", "waveform"]
 categories = ["science", "multimedia"]
 
 [dependencies]
-vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.5" }
-vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.5" }
+vyna-dcm-core = { path = "../vyna-dcm-core", version = "0.6" }
+vyna-dcm-codec = { path = "../vyna-dcm-codec", version = "0.6" }
 thiserror.workspace = true
 
 [dev-dependencies]
-vyna-dcm-iod = { path = "../vyna-dcm-iod", version = "0.5" }
+vyna-dcm-iod = { path = "../vyna-dcm-iod", version = "0.6" }

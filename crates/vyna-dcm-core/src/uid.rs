@@ -46,7 +46,7 @@ pub fn new_uid() -> String {
 pub const VYNA_IMPLEMENTATION_CLASS_UID: &str = "2.25.46417651854989365804951432447169401540";
 
 /// VynaDCM implementation version name (file meta `SH`, ≤ 16 chars).
-pub const VYNA_IMPLEMENTATION_VERSION_NAME: &str = "VYNA_DCM_050";
+pub const VYNA_IMPLEMENTATION_VERSION_NAME: &str = "VYNA_DCM_060";
 
 /// DICOM application context name (`1.2.840.10008.3.1.1.1`).
 pub const APPLICATION_CONTEXT_NAME: &str = "1.2.840.10008.3.1.1.1";
